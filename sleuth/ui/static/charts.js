@@ -12,7 +12,7 @@ export function tokens() {
   return {
     ink: g("--ink"), ink2: g("--ink-2"), muted: g("--muted"), grid: g("--grid"), axis: g("--axis"),
     surface: g("--surface"), series: [g("--series-1"), g("--series-2"), g("--series-3")],
-    seq: list("--seq"), ordinal: list("--ordinal"),
+    seq: list("--seq"), ordinal: list("--ordinal"), div: list("--div"),
   };
 }
 
@@ -263,15 +263,22 @@ export function heatmap(el, matrix, opts = {}) {
   const T = tokens();
   const fmt = opts.format || fmtNum;
   const flat = matrix.flat().filter(Number.isFinite);
-  const [lo, hi] = opts.domain || [Math.min(...flat), Math.max(...flat)];
-  const { canvas, ctx, W, H } = setup(el, [{ ramp: T.seq, lo: fmt(lo), hi: fmt(hi), label: opts.legendLabel }]);
+  if (!flat.length) return emptyState(el, opts.empty || "No values to show");
+  // Diverging (e.g. "change vs. baseline"): symmetric around 0, two hues with
+  // a neutral middle. Sequential (magnitudes): one hue, light -> dark.
+  let [lo, hi] = opts.domain || [Math.min(...flat), Math.max(...flat)];
+  if (opts.diverging && !opts.domain) { const a = Math.max(Math.abs(lo), Math.abs(hi)) || 1; lo = -a; hi = a; }
+  const ramp = opts.diverging ? T.div : T.seq;
+  const { canvas, ctx, W, H } = setup(el, [{ ramp, lo: fmt(lo), hi: fmt(hi), label: opts.legendLabel }]);
   const nr = matrix.length, nc = matrix[0].length;
   const rowLabels = opts.rowLabels || matrix.map((_, i) => String(i));
   const colLabels = opts.colLabels || matrix[0].map((_, i) => String(i));
-  const m = { l: 44, r: 10, t: 6, b: opts.xLabel ? 36 : 22 };
+  const m = { l: opts.marginLeft || 44, r: 10, t: 6, b: opts.xLabel ? 36 : 22 };
   const pw = W - m.l - m.r, ph = H - m.t - m.b;
   const cw = pw / nc, rh = ph / nr;
   const t = (v) => (hi > lo ? (v - lo) / (hi - lo) : 0.5);
+  const missing = hexToRgb(T.grid.startsWith("#") ? T.grid : "#888888");
+  const color = (v) => (Number.isFinite(v) ? rampRgb(ramp, t(v)) : missing);  // no value -> neutral grid tone
   const sparse = cw >= 6 && rh >= 6;  // big cells get a surface gap and an outline on hover
 
   // Render cells once into an offscreen image, then reuse it while hovering.
@@ -282,7 +289,7 @@ export function heatmap(el, matrix, opts = {}) {
   ictx.scale(dpr, dpr);
   if (sparse) {
     for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) {
-      ictx.fillStyle = rgbStr(rampRgb(T.seq, t(matrix[r][c])));
+      ictx.fillStyle = rgbStr(color(matrix[r][c]));
       ictx.fillRect(m.l + c * cw + 1, m.t + r * rh + 1, cw - 2, rh - 2);
     }
   } else {
@@ -292,7 +299,7 @@ export function heatmap(el, matrix, opts = {}) {
     const pctx = px.getContext("2d");
     const data = pctx.createImageData(nc, nr);
     for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) {
-      const [R, G, B] = rampRgb(T.seq, t(matrix[r][c]));
+      const [R, G, B] = color(matrix[r][c]);
       const o = 4 * (r * nc + c);
       data.data[o] = R; data.data[o + 1] = G; data.data[o + 2] = B; data.data[o + 3] = 255;
     }
@@ -337,7 +344,16 @@ export function heatmap(el, matrix, opts = {}) {
     if (c < 0 || c >= nc || row < 0 || row >= nr) { draw(); hideTip(); return; }
     draw(row, c);
     const title = opts.tipTitle ? opts.tipTitle(row, c) : `${rowLabels[row]}, ${colLabels[c]}`;
-    showTip(evt, title, [{ value: fmt(matrix[row][c]), label: opts.legendLabel || "value" }]);
+    const rows = opts.tipRows ? opts.tipRows(row, c) : [{ value: fmt(matrix[row][c]), label: opts.legendLabel || "value" }];
+    showTip(evt, title, rows);
   });
   canvas.addEventListener("pointerleave", () => { draw(); hideTip(); });
+  if (opts.onClick) {
+    canvas.style.cursor = "pointer";
+    canvas.addEventListener("click", (evt) => {
+      const r = canvas.getBoundingClientRect();
+      const c = Math.floor((evt.clientX - r.left - m.l) / cw), row = Math.floor((evt.clientY - r.top - m.t) / rh);
+      if (c >= 0 && c < nc && row >= 0 && row < nr) opts.onClick(row, c);
+    });
+  }
 }

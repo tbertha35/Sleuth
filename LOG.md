@@ -187,3 +187,41 @@ are now git-ignored and personal/machine identifiers were scrubbed from the docs
 At the owner's request the branch history was then rewritten (`git filter-branch`)
 so no earlier commit contains the node names or the LAN IP either, and force-pushed.
 Commit SHAs changed; the final file tree is byte-identical.
+
+**2026-10-23: Repository reset.** The owner deleted and re-created the GitHub repo so no
+history would contain personal details. The re-upload was an older copy that still had the
+node names and a LAN IP, so it was replaced with one clean commit holding the latest files
+(audited: no host names, usernames, emails, home paths, GPU IDs or LAN IPs). The new repo
+wasn't yet visible to the Claude GitHub App (HTTP 403 on push), so the clean commit was
+handed over as a git bundle for the owner's machine to push.
+
+**2026-10-23: Milestone 3 built: analyzer core (CPU-tested).**
+New views, each run on every checkpoint, each a dashboard tab with timelines + detail:
+- *Attention heads*: per-head share of attention to <|bos|> (sink), previous token, self,
+  normalized entropy; **induction score** on repeated random tokens ([bos] + R tokens + the
+  same R again), plus a model-level *induction gain* (loss on the first copy minus the
+  repeat). Pattern viewer for one suite prompt (click a head to open it).
+- *Logit lens*: final norm + unembedding applied after every layer; per-layer loss and
+  top-1 accuracy by category; a layer × position grid for one prompt. A test checks that
+  the last row equals the model's real loss.
+- *Ablation*: mean (default) or zero replacement of each head (`attn.z` tap), each
+  layer's attention and MLP; Δ loss, Δ expected-answer loss and Δ exact match per
+  category. BOS position left untouched. Tests check that the model is unmodified
+  afterwards, and that ablating a component whose output never varies changes nothing.
+- *Scoring* (`analyzer/common.py`): teacher-forced; prompt and expected answer encoded
+  separately so the answer tokens are known exactly.
+- New suite `suites/stories` (names / objects / dialogue / narrative) for TinyStories models.
+- Timeline format generalized: every view emits named *series* (one value per row: layer,
+  head, or "model"), so the dashboard draws any view without view-specific timeline code.
+
+First observations (1M synthetic CPU model, so tiny and out of its depth):
+- **No induction yet**: every head scores < 4% induction attention, and the induction
+  gain is ≈ 0 (−0.2 at step 300: it's *worse* on the repeat). That's consistent with it
+  mixing up names. Expect a clear jump for the 10M TinyStories model.
+- Logit lens (stories suite, step 300): top-1 accuracy 0% (emb) → 5% → 12% → 14% → 14%;
+  layers 1–2 do most of the work.
+- Ablation, a nice lesson: on its own synthetic suite, removing layer 0's MLP costs
+  **+2.4 nats**. On the unfamiliar stories suite, removing MLPs *lowers* the loss (blue):
+  the model is confidently wrong there, and ablation just reduces its confidence.
+  "Ablation helps" on out-of-distribution data usually means overconfidence, not
+  that the part is harmful.

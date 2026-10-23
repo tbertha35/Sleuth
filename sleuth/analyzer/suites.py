@@ -9,6 +9,7 @@ from pathlib import Path
 
 @dataclass
 class TestCase:
+    __test__ = False  # tells pytest this isn't a test class despite the name
     id: str
     category: str
     prompt: str

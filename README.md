@@ -16,8 +16,9 @@ decisions and results: [LOG.md](LOG.md) · training data and licences: [docs/DAT
 
 ## Status
 
-**Milestone 1 (tokenizer → 10M model → checkpoints → generation → first analyzer view)
-is built and tested on CPU.** The first GPU run happens on your machines (steps below).
+**M1** (tokenizer → 10M model → checkpoints → generation) is done and has run on an
+RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is built and
+CPU-tested; next it gets checked on a TinyStories model.
 
 | Piece | Where |
 |---|---|
@@ -28,7 +29,7 @@ is built and tested on CPU.** The first GPU run happens on your machines (steps 
 | Trainer (bf16, grad accumulation, cosine/WSD, snapshots, exact resume) | `sleuth/forge/train/` |
 | Generation (KV cache, temperature/top-k/top-p/min-p, tok/s) | `sleuth/forge/infer/` |
 | Our own `.safetensors` reader/writer | `sleuth/formats/safetensors.py` |
-| Analyzer: neuron stats across checkpoints | `sleuth/analyzer/` |
+| Analyzer: neurons, attention heads, logit lens, ablation, across checkpoints | `sleuth/analyzer/` |
 | Local dashboard | `sleuth/ui/` |
 | Hardware probe | `scripts/probe_hardware.py` |
 
@@ -79,7 +80,7 @@ python -m sleuth demo
 python -m sleuth info configs/tiny-10m.toml             # params, FLOPs, token budget
 python -m sleuth train configs/tiny-10m.toml --set data.shards=data/shards/synthetic
 python -m sleuth generate runs/<run-id> --prompt "Once upon a time"
-python -m sleuth analyze runs/<run-id>
+python -m sleuth analyze runs/<run-id>                   # all views, suites/basic
 python -m sleuth ui                                      # http://127.0.0.1:8765
 ```
 
@@ -89,6 +90,22 @@ Then the TinyStories model (download and prepare the data first: see `docs/DATA.
 python -m sleuth train configs/tinystories-10m.toml
 python -m sleuth generate runs/<run-id> --prompt "Once upon a time" --samples 3
 ```
+
+## The analyzer (Milestone 3)
+
+`python -m sleuth analyze runs/<run-id> --suite suites/stories` runs four views on every
+checkpoint, and the dashboard shows each as a tab:
+
+| View | Question it answers |
+|---|---|
+| **Neurons** | How often and how strongly does each MLP neuron fire, and on which kinds of text? |
+| **Attention heads** | What does each head look at (the previous token, the first token, …)? Which heads *copy* earlier text (induction heads)? Includes a pattern viewer. |
+| **Logit lens** | If the model stopped after layer N, what would it predict? Which layers do the work? |
+| **Ablation** | Remove one head or layer: how much worse does the model get, per test category? |
+
+Options: `--views attention,logit_lens` (a subset), `--steps 0,500,6000` (some
+checkpoints), `--ablation zero` (instead of mean), `--force` (recompute). Re-running
+skips finished checkpoints, so you can analyze while training is still going.
 
 Training writes `runs/<run-id>/` with the config, the environment, metrics, weight
 snapshots (log-spaced: steps 0, 1, 2, 4, … plus every 500) and resumable checkpoints.

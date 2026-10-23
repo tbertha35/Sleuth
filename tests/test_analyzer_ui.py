@@ -51,12 +51,19 @@ def test_neuron_stats_shapes_and_ranges(tiny_data):
         assert 0 <= lay["frac_selective"] <= 1 and lay["act_rms"] > 0
 
 
-def test_timeline_covers_every_snapshot(analyzed_run):
-    root = analyzed_run / "analysis" / "neuron_stats" / "basic"
+@pytest.mark.parametrize("view", ["neuron_stats", "attention", "logit_lens", "ablation"])
+def test_timeline_covers_every_snapshot(analyzed_run, view):
+    root = analyzed_run / "analysis" / view / "basic"
     t = json.loads((root / "timeline.json").read_text())
     assert t["steps"] == [s for s, _ in list_snapshots(analyzed_run)]
-    assert len(t["metrics"]["frac_selective"]) == len(t["steps"])
-    assert len(t["metrics"]["frac_selective"][0]) == t["n_layers"]
+    assert t["series"]
+    for name, ser in t["series"].items():
+        assert len(ser["values"]) == len(t["steps"]), name
+        assert all(len(v) == len(ser["rows"]) for v in ser["values"]), name
+
+
+def test_timeline_skips_finished_checkpoints(analyzed_run):
+    root = analyzed_run / "analysis" / "neuron_stats" / "basic"
     # Re-running skips finished checkpoints (so it's cheap to call during training).
     mtime = (root / "step_0000000" / "summary.json").stat().st_mtime
     run_timeline(analyzed_run, SUITE, log=lambda s: None)
@@ -84,9 +91,12 @@ def test_api_endpoints(server, analyzed_run):
     assert detail["analyses"][0]["suite"] == "basic" and detail["params"]["total"] > 0
     metrics = json.loads(get(f"{server}/api/runs/{rid}/metrics")[1])
     assert metrics["train"] and metrics["val"]
-    tl = json.loads(get(f"{server}/api/runs/{rid}/analysis/neuron_stats/basic/timeline")[1])
-    ck = json.loads(get(f"{server}/api/runs/{rid}/analysis/neuron_stats/basic/step_{tl['steps'][-1]:07d}")[1])
-    assert len(ck["arrays"]["fire_rate"]) == tl["n_layers"]
+    for view in ("neuron_stats", "attention", "logit_lens", "ablation"):
+        tl = json.loads(get(f"{server}/api/runs/{rid}/analysis/{view}/basic/timeline")[1])
+        status, body = get(f"{server}/api/runs/{rid}/analysis/{view}/basic/step_{tl['steps'][-1]:07d}")
+        assert b"NaN" not in body  # JSON has no NaN; the browser would reject the response
+        ck = json.loads(body)
+        assert ck["summary"]["view"] == view and ck["arrays"]
 
 
 def test_static_and_path_traversal(server):

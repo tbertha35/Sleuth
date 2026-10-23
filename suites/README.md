@@ -14,3 +14,13 @@ ablations change it.
 `basic/` matches the synthetic training corpus (stories, arithmetic, small
 Python functions), plus a few out-of-distribution prompts in each category.
 Add your own categories by dropping in more `.jsonl` files.
+
+`stories/` targets TinyStories-style models:
+- `names`: the answer is a name that appeared earlier (tests copying, i.e. induction)
+- `objects`: remember which object or attribute was mentioned
+- `dialogue`: quoted-speech conventions
+- `narrative`: plain sentences without answers (for loss and activation statistics)
+
+Some answers are one plausible continuation among several (e.g. "Yes, you" →
+" can"), so exact-match scores are noisy. Compare *changes* (across checkpoints,
+or with/without an ablation) rather than absolute values.

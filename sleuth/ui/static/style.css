@@ -16,6 +16,8 @@
   --critical: #d03b3b;
   --seq: #cde2fb,#b7d3f6,#9ec5f4,#86b6ef,#6da7ec,#5598e7,#3987e5,#2a78d6,#256abf,#1c5cab,#184f95,#104281,#0d366b;
   --ordinal: #86b6ef,#6da7ec,#5598e7,#3987e5,#2a78d6,#256abf,#1c5cab,#184f95,#104281,#0d366b;
+  /* diverging: blue (negative) - neutral gray (0) - red (positive) */
+  --div: #184f95,#3987e5,#9ec5f4,#f0efec,#f2b0af,#e34948,#a3302f;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -34,6 +36,7 @@
     --accent: #3987e5;
     --seq: #0d366b,#104281,#184f95,#1c5cab,#256abf,#2a78d6,#3987e5,#5598e7,#6da7ec,#86b6ef,#9ec5f4,#b7d3f6,#cde2fb;
     --ordinal: #184f95,#1c5cab,#256abf,#2a78d6,#3987e5,#5598e7,#6da7ec,#86b6ef,#9ec5f4,#b7d3f6,#cde2fb;
+  --div: #b7d3f6,#5598e7,#1c5cab,#383835,#8c2f2e,#e66767,#f6c1c0;
   }
 }
 :root[data-theme="dark"] {
@@ -52,6 +55,7 @@
   --accent: #3987e5;
   --seq: #0d366b,#104281,#184f95,#1c5cab,#256abf,#2a78d6,#3987e5,#5598e7,#6da7ec,#86b6ef,#9ec5f4,#b7d3f6,#cde2fb;
   --ordinal: #184f95,#1c5cab,#256abf,#2a78d6,#3987e5,#5598e7,#6da7ec,#86b6ef,#9ec5f4,#b7d3f6,#cde2fb;
+  --div: #b7d3f6,#5598e7,#1c5cab,#383835,#8c2f2e,#e66767,#f6c1c0;
 }
 
 * { box-sizing: border-box; }
@@ -121,3 +125,14 @@ table { border-collapse: collapse; margin-top: 8px; font-size: 12px; font-varian
 th, td { padding: 4px 10px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 th { color: var(--ink-2); font-weight: 500; }
 th:first-child, td:first-child { text-align: left; }
+
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--border); }
+.tab {
+  border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none;
+  color: var(--ink-2); padding: 8px 12px; font-weight: 500;
+}
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.tab:disabled { color: var(--muted); cursor: default; }
+.facts { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 4px 0 8px; color: var(--ink-2); font-size: 13px; }
+.facts strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+.chart.square { height: 420px; }

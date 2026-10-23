@@ -152,7 +152,12 @@ def cmd_analyze(a):
     from .analyzer.timeline import run_timeline
     from .forge.train.trainer import resolve_device
 
-    run_timeline(a.run, a.suite, device=str(resolve_device(a.device)), k=a.k, force=a.force)
+    views = [v.strip() for v in a.views.split(",")] if a.views else None
+    steps = [int(s) for s in a.steps.split(",")] if a.steps else None
+    options = {"neuron_stats": {"k": a.k}, "ablation": {"method": a.ablation}}
+    for suite in a.suite or ["suites/basic"]:
+        run_timeline(a.run, suite, device=str(resolve_device(a.device)), views=views, force=a.force,
+                     steps=steps, options=options)
 
 
 def cmd_ui(a):
@@ -272,11 +277,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tokenizer", default=None)
     s.set_defaults(fn=cmd_generate)
 
-    s = sub.add_parser("analyze", help="run the neuron-stats view over every checkpoint of a run")
+    s = sub.add_parser("analyze", help="run analyzer views over every checkpoint of a run")
     s.add_argument("run")
-    s.add_argument("--suite", default="suites/basic")
+    s.add_argument("--suite", action="append", default=None,
+                   help="test suite directory (repeatable; default suites/basic). "
+                        "For TinyStories models also try suites/stories")
+    s.add_argument("--views", default=None,
+                   help="comma-separated: neuron_stats,attention,logit_lens,ablation (default: all)")
+    s.add_argument("--steps", default=None, help="only these checkpoints, e.g. 0,500,5000 (default: all)")
     s.add_argument("--device", default="auto")
-    s.add_argument("--k", type=float, default=1.0, help="firing threshold, in units of the layer's RMS")
+    s.add_argument("--k", type=float, default=1.0, help="neuron firing threshold, in units of the layer's RMS")
+    s.add_argument("--ablation", choices=["mean", "zero"], default="mean", help="how ablated parts are replaced")
     s.add_argument("--force", action="store_true", help="redo checkpoints that were already analyzed")
     s.set_defaults(fn=cmd_analyze)
 

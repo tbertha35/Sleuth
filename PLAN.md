@@ -5,8 +5,9 @@ while they run (**ANALYZER**), and running controlled experiments to make small
 models faster and better (**LAB**). An optional **ASSISTANT** explains things
 along the way.
 
-> Status: **M0 done; M1 built and CPU-verified, waiting on the first GPU run**
-> (see README). Sections marked ❓ still need a decision from you
+> Status: **M0 and M1 done** (M1 trained on an RTX 5060 Ti); **M3 (analyzer core)
+> built and CPU-tested**, waiting for a TinyStories model to look at. M2 (multi-GPU,
+> 125M) waits on the GX10s being set up. Sections marked ❓ still need a decision from you
 > (collected in [Open questions](#10-open-questions-for-you)).
 
 ---
@@ -475,7 +476,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 | **M0** ✅ | Skeleton, PLAN, hardware probe | probe run on both GX10s, the 5060 Ti and the 3060 Ti (results stay local; summaries in LOG.md) | your machines |
 | **M1** ✅ (CPU) | Tokenizer + 10M model end-to-end | BPE trains on your data; round-trip tests; 10M model trains on 1 GPU; snapshot + resume checkpoints; `generate` prints text + tok/s; **one analyzer view (per-layer activation stats over checkpoints) in the dashboard** | code + CPU tests here; real run on 5060 Ti or GB10 |
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
-| M3 | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
+| **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |
 | M5 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model | any GPU |
 | M6 | LAB harness | experiment runner, noise floor, compare report, synthetic tasks, μP | GB10 |
