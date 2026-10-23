@@ -1,0 +1,12 @@
+{"id": "math-00", "prompt": "Q: What is 2 + 3?\nA:", "expected": " 5"}
+{"id": "math-01", "prompt": "Q: What is 14 + 27?\nA:", "expected": " 41"}
+{"id": "math-02", "prompt": "Q: What is 9 - 4?\nA:", "expected": " 5"}
+{"id": "math-03", "prompt": "Q: What is 7 * 8?\nA:", "expected": " 56"}
+{"id": "math-04", "prompt": "Q: What is 120 + 305?\nA:", "expected": " 425"}
+{"id": "math-05", "prompt": "Q: What is 63 - 18?\nA:", "expected": " 45"}
+{"id": "math-06", "prompt": "Q: Sam has 5 apples. He gets 3 more apples. How many apples does Sam have now?\nA:", "expected": " 8"}
+{"id": "math-07", "prompt": "Q: Lily has 12 stickers. She gives 4 stickers to a friend. How many stickers does Lily have left?\nA:", "expected": " 8"}
+{"id": "math-08", "prompt": "Q: Tom has 3 bags. Each bag has 4 marbles. How many marbles does Tom have in total?\nA:", "expected": " 12"}
+{"id": "math-09", "prompt": "Count by 2 from 10:", "expected": " 10, 12, 14, 16"}
+{"id": "math-10", "prompt": "Count by 5 from 20:", "expected": " 20, 25, 30, 35"}
+{"id": "math-11", "prompt": "Q: Which is bigger, 345 or 354?\nA:", "expected": " 354"}

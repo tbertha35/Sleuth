@@ -1,0 +1,29 @@
+# Smoke test: a ~1M-parameter model that trains on CPU in about a minute.
+# Proves the whole pipeline works; not meant to be good.
+#
+#   python -m sleuth train configs/smoke-cpu.toml
+name = "smoke-cpu"
+
+[data]
+shards = "data/shards/synthetic"
+
+[model]
+vocab_size = 0          # 0 = take it from the shards' tokenizer
+d_model = 128
+n_layers = 4
+n_heads = 4
+n_kv_heads = 2
+max_seq_len = 256
+
+[train]
+device = "auto"
+micro_batch_size = 16
+seq_len = 128
+max_steps = 300
+lr = 3e-3               # tiny models tolerate (and want) a high learning rate
+warmup_steps = 30
+log_every = 10
+eval_every = 50
+eval_batches = 10
+snapshot_every = 50
+resume_every = 100

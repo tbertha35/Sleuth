@@ -1,0 +1,165 @@
+"""Analyzer view: neuron and layer activation statistics.
+
+For one checkpoint, run every test in a suite through the model and measure,
+per layer and per MLP neuron:
+
+  * how strongly neurons respond (mean |activation|, max |activation|)
+  * how often each neuron "fires", overall and per test category
+  * how big each layer's contributions to the residual stream are
+    (attention output, MLP output, and the stream itself)
+
+What does "fires" mean for SwiGLU? ReLU neurons are exactly zero or not,
+so "fired" is obvious. SwiGLU's silu(gate)·up is smooth and almost never
+exactly zero, so we need a threshold. We use a *relative* one:
+
+    neuron fires on a token  <=>  |activation| > k × (that layer's RMS activation)
+
+with k = 1 by default, i.e. "noticeably above this layer's typical size".
+A relative threshold keeps the numbers comparable across layers and across
+checkpoints, even though raw activation scales drift during training. It
+needs two passes over the suite (first measure each layer's RMS, then
+count), which is cheap for suite-sized inputs.
+
+Derived per-layer summaries (all heuristics, defined here in one place):
+  * fire_rate_mean:     average fraction of tokens a neuron fires on
+  * frac_low_activity:  neurons that fire on < 1% of tokens ("nearly dead")
+  * frac_high_activity: neurons that fire on > 50% of tokens ("always on")
+  * frac_selective:     neurons whose firing concentrates in one category:
+                        selectivity = (r_top - mean of other categories' r) / r_top > 0.5,
+                        and r_top > 5%. Watch this rise over training as
+                        neurons specialize (e.g. code-only neurons).
+
+The <|bos|> position is excluded: models use the first token as an
+"attention sink" with huge, unrepresentative activations.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from ..forge.model.taps import listen
+from .suites import TestCase
+
+LOW, HIGH, SELECTIVE_MIN_RATE, SELECTIVITY = 0.01, 0.5, 0.05, 0.5
+
+
+def _encode_cases(tokenizer, cases: list[TestCase], max_len: int) -> list[tuple[str, torch.Tensor]]:
+    out = []
+    for c in cases:
+        ids = [tokenizer.bos_id] + tokenizer.encode(c.text)
+        out.append((c.category, torch.tensor([ids[:max_len]])))
+    return out
+
+
+@torch.no_grad()
+def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device: str | torch.device = "cpu") -> dict:
+    """Returns {"summary": json-able dict, "arrays": dict of numpy arrays}."""
+    model.eval().to(device)
+    L = model.cfg.n_layers
+    H = model.cfg.hidden
+    cats = sorted({c.category for c in cases})
+    inputs = _encode_cases(tokenizer, cases, model.cfg.max_seq_len)
+
+    # ---- pass 1: per-layer RMS of the MLP activations, plus residual-stream sizes
+    sq_sum = torch.zeros(L, dtype=torch.float64)
+    n_tok = 0
+    comp = {name: torch.zeros(L, dtype=torch.float64) for name in ("attn_out", "mlp_out", "resid_post")}
+
+    def layer_of(name: str) -> int:
+        return int(name.split(".")[1])
+
+    def p1_act(name, t):
+        sq_sum[layer_of(name)] += t[0, 1:].double().pow(2).mean(-1).sum().cpu()
+
+    def p1_comp(name, t):
+        comp[name.split(".")[-1]][layer_of(name)] += t[0, 1:].double().pow(2).mean(-1).sum().cpu()
+
+    with listen(model, {"blocks.*.mlp.act": p1_act, "blocks.*.attn_out": p1_comp,
+                        "blocks.*.mlp_out": p1_comp, "blocks.*.resid_post": p1_comp}):
+        for _, ids in inputs:
+            model(ids.to(device))
+            n_tok += ids.shape[1] - 1
+    if n_tok == 0:
+        raise ValueError("suite produced no tokens")
+    rms = (sq_sum / n_tok).sqrt()
+
+    # ---- pass 2: per-neuron counts, per category
+    ci = {c: i for i, c in enumerate(cats)}
+    fire = torch.zeros(L, len(cats), H, dtype=torch.float64)
+    abs_sum = torch.zeros(L, H, dtype=torch.float64)
+    abs_max = torch.zeros(L, H, dtype=torch.float64)
+    tok_per_cat = torch.zeros(len(cats), dtype=torch.float64)
+    current = {"cat": 0}
+
+    def p2_act(name, t):
+        li = layer_of(name)
+        a = t[0, 1:].double().abs().cpu()           # [T, H]
+        fire[li, current["cat"]] += (a > k * rms[li]).sum(0)
+        abs_sum[li] += a.sum(0)
+        abs_max[li] = torch.maximum(abs_max[li], a.max(0).values)
+
+    with listen(model, {"blocks.*.mlp.act": p2_act}):
+        for cat, ids in inputs:
+            current["cat"] = ci[cat]
+            tok_per_cat[ci[cat]] += ids.shape[1] - 1
+            model(ids.to(device))
+
+    rate_by_cat = fire / tok_per_cat.clamp(min=1)[None, :, None]   # [L, C, H]
+    rate = fire.sum(1) / n_tok                                     # [L, H]
+    mean_abs = abs_sum / n_tok
+
+    top = rate_by_cat.max(1).values                                # [L, H]
+    if len(cats) > 1:
+        others = (rate_by_cat.sum(1) - top) / (len(cats) - 1)
+        selectivity = (top - others) / top.clamp(min=1e-12)
+        selective = (selectivity > SELECTIVITY) & (top > SELECTIVE_MIN_RATE)
+        preferred = rate_by_cat.argmax(1)
+    else:
+        selective = torch.zeros_like(top, dtype=torch.bool)
+        preferred = torch.zeros_like(top, dtype=torch.long)
+
+    layers = []
+    for li in range(L):
+        layers.append({
+            "layer": li,
+            "act_rms": float(rms[li]),
+            "act_mean_abs": float(mean_abs[li].mean()),
+            "fire_rate_mean": float(rate[li].mean()),
+            "frac_low_activity": float((rate[li] < LOW).double().mean()),
+            "frac_high_activity": float((rate[li] > HIGH).double().mean()),
+            "frac_selective": float(selective[li].double().mean()),
+            "selective_by_category": {c: int((selective[li] & (preferred[li] == i)).sum()) for c, i in ci.items()},
+            "fire_rate_by_category": {c: float(rate_by_cat[li, i].mean()) for c, i in ci.items()},
+            "attn_out_rms": float((comp["attn_out"][li] / n_tok).sqrt()),
+            "mlp_out_rms": float((comp["mlp_out"][li] / n_tok).sqrt()),
+            "resid_rms": float((comp["resid_post"][li] / n_tok).sqrt()),
+        })
+    summary = {
+        "view": "neuron_stats",
+        "threshold_k": k,
+        "categories": cats,
+        "tokens_by_category": {c: int(tok_per_cat[i]) for c, i in ci.items()},
+        "n_tokens": n_tok,
+        "n_cases": len(cases),
+        "n_layers": L,
+        "n_neurons": H,
+        "layers": layers,
+    }
+    arrays = {
+        "fire_rate": rate.float().numpy(),                   # [L, H]
+        "fire_rate_by_category": rate_by_cat.float().numpy(),  # [L, C, H]
+        "mean_abs": mean_abs.float().numpy(),                # [L, H]
+        "max_abs": abs_max.float().numpy(),                  # [L, H]
+    }
+    return {"summary": summary, "arrays": arrays}
+
+
+def save_result(result: dict, out_dir: Path, extra: dict | None = None) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = {**result["summary"], **(extra or {})}
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
+    np.savez_compressed(out_dir / "neurons.npz", **result["arrays"])

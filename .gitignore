@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Data, runs and model files: large, local-only. Point SLEUTH_DATA / SLEUTH_RUNS at NVMe.
+/data/
+/runs/
+*.bin
+*.idx.npy
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+
+# Hardware probe results stay on the machine (they contain host names and paths);
+# anonymized summaries go in LOG.md instead.
+hardware/*.json
+hardware/sleuth_disk_probe_*
+
+# Secrets: API keys belong in environment variables, never in files in this repo
+.env
+.env.*
+sleuth.local.toml
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

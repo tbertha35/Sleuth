@@ -1,0 +1,40 @@
+# The same ~10M model as tiny-10m.toml, trained on TinyStories (see docs/DATA.md
+# for the download and preparation commands).
+#
+# Sized so the model sees the data *less* than once: 6000 x 64 x 512 = 197M tokens,
+# from roughly 500M available. That avoids the overfitting the synthetic run showed
+# (5.3M tokens read 31 times). On the RTX 5060 Ti (~145k tok/s for this model on
+# Windows) that's about 25 minutes.
+#
+#   python -m sleuth train configs/tinystories-10m.toml
+name = "tinystories-10m"
+
+[data]
+shards = "data/shards/tinystories"
+
+[model]
+vocab_size = 0          # from the shards (tokenizer trained with --vocab-size 8192)
+d_model = 384
+n_layers = 6
+n_heads = 6
+n_kv_heads = 2
+max_seq_len = 512
+
+[train]
+device = "auto"
+precision = "bf16"
+micro_batch_size = 64
+seq_len = 512
+max_steps = 6000
+lr = 1e-3
+min_lr_ratio = 0.1
+warmup_steps = 200
+schedule = "cosine"
+weight_decay = 0.1
+grad_clip = 1.0
+log_every = 25
+eval_every = 250
+eval_batches = 40
+snapshot_every = 500
+resume_every = 500
+peak_tflops = 42.0      # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sleuth"
+version = "0.0.1"
+description = "A fully local lab for building and understanding LLMs"
+readme = "README.md"
+requires-python = ">=3.11"   # tomllib (config files) is stdlib from 3.11
+# PyTorch is deliberately NOT listed: the right build differs per machine
+# (aarch64 + CUDA 13 on the GB10s, x86 + CUDA on the RTX boxes), so each
+# machine installs its own. See README.md.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+sleuth = "sleuth.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sleuth*"]
+
+[tool.setuptools.package-data]
+"sleuth.ui" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs a CUDA GPU (run with: pytest -m gpu)"]
+addopts = "-m 'not gpu'"

@@ -1,0 +1,38 @@
+"""Rotary position embeddings (RoPE).
+
+Instead of adding a position vector to the input, RoPE *rotates* each
+query and key vector by an angle proportional to its position. Channel
+pairs rotate at different speeds (frequencies theta^(-2i/d)), like the
+hands of a clock. The dot product q·k then depends only on the
+*difference* of positions, so attention becomes naturally relative.
+
+Layout convention: we pair channel i with channel i + d/2 ("rotate half",
+as in GPT-NeoX and Hugging Face's Llama code), not adjacent channels
+(Meta's original Llama code). The two are the same up to a fixed
+permutation of the q/k weight rows; external-model adapters must apply it
+when loading weights stored in the other convention (e.g. GGUF).
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def rope_tables(head_dim: int, max_len: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin tables of shape [max_len, head_dim], computed in float32."""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    pos = torch.arange(max_len, dtype=torch.float32)
+    angles = torch.outer(pos, inv_freq)            # [max_len, head_dim/2]
+    angles = torch.cat([angles, angles], dim=-1)   # duplicate for the two halves
+    return angles.cos(), angles.sin()
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """x: [B, H, T, head_dim]; cos/sin: [T, head_dim] for the positions of x.
+    Per channel pair (a, b): (a, b) -> (a·cos - b·sin, b·cos + a·sin)."""
+    return (x.float() * cos + _rotate_half(x.float()) * sin).to(x.dtype)

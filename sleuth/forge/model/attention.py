@@ -1,0 +1,113 @@
+"""Causal self-attention with grouped-query attention (GQA) and a KV cache.
+
+Shapes: B batch, T new tokens, S total key length (cache + new), H query
+heads, K key/value heads (K divides H), hd head dim.
+
+GQA: H query heads share K key/value heads (each group of H/K query heads
+reads the same K/V). With K = H this is ordinary multi-head attention;
+with K = 1 it's multi-query attention. Fewer KV heads mean a smaller KV
+cache, which is the main memory and bandwidth cost of decoding long
+sequences.
+
+Two code paths compute the same thing:
+  * fused: F.scaled_dot_product_attention picks a FlashAttention-style
+    kernel that never materializes the [T, S] attention matrix. Fast and
+    memory-light, but it can't show us the attention pattern.
+  * explicit: softmax(q·kᵀ/√hd + mask)·v, written out. It's used only when
+    the analyzer listens to the `pattern` tap.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from .config import ModelConfig
+from .norm import RMSNorm
+from .rope import apply_rope
+from .taps import Tap
+
+# SDPA can broadcast K/V heads itself from PyTorch 2.5; before that we
+# repeat them explicitly (same result, a little more memory traffic).
+_SDPA_HAS_GQA = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 5)
+
+
+class Attention(nn.Module):
+    def __init__(self, cfg: ModelConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_heads, self.n_kv, self.hd = cfg.n_heads, cfg.kv_heads, cfg.head_dim
+        self.use_rope = cfg.pos_type == "rope"
+        self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.hd, bias=cfg.bias)
+        self.k_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=cfg.bias)
+        self.v_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=cfg.bias)
+        self.o_proj = nn.Linear(self.n_heads * self.hd, cfg.d_model, bias=cfg.bias)
+        self.q_norm = RMSNorm(self.hd, cfg.norm_eps) if cfg.qk_norm else None
+        self.k_norm = RMSNorm(self.hd, cfg.norm_eps) if cfg.qk_norm else None
+        self.tap_q = Tap()
+        self.tap_k = Tap()
+        self.tap_pattern = Tap()
+        self.tap_z = Tap()
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache=None) -> torch.Tensor:
+        B, T, _ = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.hd).transpose(1, 2)  # [B, H, T, hd]
+        k = self.k_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)     # [B, K, T, hd]
+        v = self.v_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        if self.use_rope:
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        q, k = self.tap_q(q), self.tap_k(k)
+
+        if cache is not None:
+            k, v = cache.update(self.layer_idx, k, v)  # now [B, K, S, hd]
+        S = k.shape[2]
+        offset = S - T  # how many earlier tokens are in the cache
+
+        if self.tap_pattern.active:
+            y = self._explicit(q, k, v, offset)
+        else:
+            y = self._fused(q, k, v, offset)
+
+        y = y.transpose(1, 2)            # [B, T, H, hd]
+        y = self.tap_z(y)                # per-head outputs (head ablation hooks in here)
+        return self.o_proj(y.reshape(B, T, self.n_heads * self.hd))
+
+    # ------------------------------------------------------------------ #
+    def _causal_mask(self, T: int, S: int, offset: int, device) -> torch.Tensor:
+        """Boolean [T, S] mask, True = may attend. Query i (absolute position
+        offset+i) sees keys at positions <= offset+i."""
+        qpos = torch.arange(T, device=device)[:, None] + offset
+        kpos = torch.arange(S, device=device)[None, :]
+        return kpos <= qpos
+
+    def _fused(self, q, k, v, offset):
+        T, S = q.shape[2], k.shape[2]
+        kwargs = {}
+        if self.n_kv != self.n_heads:
+            if _SDPA_HAS_GQA:
+                kwargs["enable_gqa"] = True
+            else:
+                k = k.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+                v = v.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+        if offset == 0:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, **kwargs)
+        if T == 1:
+            # One new token attends to everything cached: no mask needed.
+            return F.scaled_dot_product_attention(q, k, v, **kwargs)
+        mask = self._causal_mask(T, S, offset, q.device)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **kwargs)
+
+    def _explicit(self, q, k, v, offset):
+        T, S = q.shape[2], k.shape[2]
+        rep = self.n_heads // self.n_kv
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+        scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(self.hd)  # [B, H, T, S]
+        scores = scores.masked_fill(~self._causal_mask(T, S, offset, q.device), float("-inf"))
+        probs = self.tap_pattern(scores.softmax(dim=-1))
+        return (probs @ v.float()).to(q.dtype)
