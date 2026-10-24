@@ -1,0 +1,10 @@
+{"id": "facts-00", "prompt": "Q: What is the capital of France?\nA:", "expected": " Paris"}
+{"id": "facts-01", "prompt": "Q: What is the capital of Japan?\nA:", "expected": " Tokyo"}
+{"id": "facts-02", "prompt": "Q: What is the capital of Italy?\nA:", "expected": " Rome"}
+{"id": "facts-03", "prompt": "Q: What is the largest planet in our solar system?\nA:", "expected": " Jupiter"}
+{"id": "facts-04", "prompt": "Q: Which planet is known as the Red Planet?\nA:", "expected": " Mars"}
+{"id": "facts-05", "prompt": "Q: Who wrote Romeo and Juliet?\nA:", "expected": " William Shakespeare"}
+{"id": "facts-06", "prompt": "Q: What is the chemical formula for water?\nA:", "expected": " H2O"}
+{"id": "facts-07", "prompt": "Q: At what temperature in degrees Celsius does water freeze?\nA:", "expected": " 0"}
+{"id": "facts-08", "prompt": "Q: In which country are the pyramids of Giza?\nA:", "expected": " Egypt"}
+{"id": "facts-09", "prompt": "Q: What gas do plants take in from the air to make food?\nA:", "expected": " Carbon dioxide"}

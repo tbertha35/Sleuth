@@ -19,8 +19,8 @@ decisions and results: [LOG.md](LOG.md) · training data and licences: [docs/DAT
 **M1** (tokenizer → 10M model → checkpoints → generation) is done and has run on an
 RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is built and
 CPU-tested. **M5** (external models: safetensors + GGUF) is partly built: Llama/Qwen-family
-models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) loads in tests,
-waiting for its first real run.
+models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) runs and matches
+llama.cpp's perplexity; with Triton, its 4-bit weights are unpacked inside a fused GPU kernel.
 
 | Piece | Where |
 |---|---|
@@ -56,15 +56,19 @@ you'll see:
 - PyTorch's Windows builds have no FlashAttention kernel, so attention falls back to
   the memory-efficient, cuDNN or plain kernels. That's fine for small models, and the
   probe records which ones work.
-- `torch.compile` needs Triton, which isn't bundled on Windows, so keep `compile = false`.
-  (A community `triton-windows` package exists; it would be a new dependency, so ask first.)
+- Triton (GPU kernels written in Python) isn't bundled with PyTorch on Windows. Install
+  the community build with `pip install -e ".[triton]"` (approved 2026-10-24; it pins
+  `triton-windows` 3.8.x, the series that matches PyTorch 2.14/2.15). Sleuth uses it for
+  fused quantized matmuls (big GGUF models), and it should also make `torch.compile` work.
 - No NCCL, so no multi-GPU training on Windows. That only matters on the GX10s (Linux).
 - Environment variables in PowerShell: `$env:SLEUTH_DATA = "D:\sleuth\data"`.
 - WSL2 (Linux on Windows) would get FlashAttention and Triton. It's optional and can come later.
 
 ```bash
 pip install -e ".[dev]"        # numpy + pytest, and the `sleuth` command
-pytest -q                      # ~80 CPU tests, ~10 s
+pip install -e ".[data]"       # optional: pyarrow, to read Parquet datasets (FineWeb-Edu, Wikipedia, ...)
+pip install -e ".[triton]"     # optional, Windows: triton-windows (Linux PyTorch already has Triton)
+pytest -q                      # ~190 CPU tests, under a minute
 python scripts/probe_hardware.py --disk-path /path/to/your/nvme   # saves hardware/<host>.json (stays local)
 ```
 
@@ -131,7 +135,16 @@ python -m sleuth analyze path/to/model.gguf --suite suites/stories --views atten
 python -m sleuth compare path/to/hf-folder path/to/model-Q8_0.gguf   # same model, two formats: should agree
 python -m sleuth compare path/to/hf-folder path/to/hf-folder --requant q4_1   # what 4-bit rounding alone costs
 python -m sleuth tokenize --tokenizer path/to/model.gguf "any text"   # how that model splits text
+python -m sleuth generate path/to/model.gguf --chat --prompt "What is the capital of France?"
+python -m sleuth next path/to/model.gguf --prompt "The capital of France is"   # top next tokens + probabilities
+python -m sleuth perplexity path/to/model.gguf --file some.txt --ctx 256 --chunks 20   # like llama-perplexity
+python -m sleuth analyze path/to/model.gguf --suite suites/stories --views attention,logit_lens --chat
 ```
+
+Instruction-tuned ("chat", "it") models only behave inside their chat format: `--chat`
+wraps a prompt as a user turn (Gemma 4 and ChatML/Qwen formats). For `analyze`/`compare`,
+`--chat` makes every test the model's reply to "Continue this text." and scores only the
+test's own tokens; results appear as a separate `<suite>-chat` suite.
 
 `analyze` on an external model puts the results in `runs/ext-<name>-<hash>/` (the hash
 comes from the model's path, so two models in folders with the same name don't collide),

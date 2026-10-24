@@ -30,7 +30,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from .common import encode_cases
+from .common import analysis_prefix, encode_cases
 
 
 @torch.no_grad()
@@ -70,10 +70,13 @@ def requantize_model(model, type_name: str, pattern: str = "*") -> dict:
     return {"n_tensors": len(errors), "rel_error_mean": sum(errors) / len(errors), "rel_error_max": max(errors)}
 
 
-def compare_models(load_a: Callable, load_b: Callable, cases, device="cpu", log=print) -> dict:
-    """load_a / load_b: zero-argument functions returning (model, tokenizer)."""
+def compare_models(load_a: Callable, load_b: Callable, cases, device="cpu", log=print,
+                   chat_instruction: str | None = None) -> dict:
+    """load_a / load_b: zero-argument functions returning (model, tokenizer).
+    chat_instruction: wrap every test in a chat turn first (see analysis_prefix)."""
     model, tok_a = load_a()
-    enc = encode_cases(tok_a, cases, model.cfg.max_seq_len)
+    prefix = analysis_prefix(tok_a, chat_instruction) if chat_instruction else None
+    enc = encode_cases(tok_a, cases, model.cfg.max_seq_len, prefix)
     vocab = min(tok_a.vocab_size, model.cfg.padded_vocab)
     lp_a = _log_probs(model, enc, vocab, device)
     del model
@@ -92,8 +95,8 @@ def compare_models(load_a: Callable, load_b: Callable, cases, device="cpu", log=
 
     stats: dict[str, dict[str, float]] = {}
     for e, a, b in zip(enc, lp_a, lp_b):
-        a, b = a[:, :vocab].float(), b[:, :vocab].float()
-        targets = e.ids[0, 1:]
+        a, b = a[e.scored, :vocab].float(), b[e.scored, :vocab].float()
+        targets = e.ids[0, e.scored.start + 1: e.scored.stop + 1]
         kl = (a.exp() * (a - b)).sum(-1)                   # KL(A || B) per position
         s = stats.setdefault(e.category, {"n": 0, "agree": 0, "kl": 0.0, "kl_max": 0.0, "loss_a": 0.0, "loss_b": 0.0})
         s["n"] += targets.numel()

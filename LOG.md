@@ -376,3 +376,75 @@ downloaded into the repo), which is the reference for how GGUF files run.
   the main model's hidden state + a token embedding, to 1,024), and the mmproj file
   (`block_count = 0`: only patch/position embeddings and projections, no encoder layers).
   Both belong with speculative decoding (M9) and multimodal input, later.
+
+**2026-10-24: Round 3: Qwen's 4-bit loss is real, the Gemma 4 forward pass matches llama.cpp, chat formats.**
+- *Qwen3-0.6B is simply sensitive to 4-bit.* Rounding the original weights through our
+  plain Q4_1 quantizer (8.0% weight error) costs KL 0.93 and 69% top-1 agreement:
+  *worse* than bartowski's Q4_K_M (KL 0.66, 78%), as it should be, since K-quants with an
+  imatrix are smarter. Nearly all of it comes from the block weights (KL 0.86); the
+  embedding alone costs 0.08. Q8_0 rounding: KL 0.009. So the K-quant decoders are
+  confirmed end to end, and "0.6B models hate 4-bit" goes in the notebook. The tied
+  output fix works: Qwen3-0.6B Q8_0 loads as 596M params.
+- *Gemma 4 forward pass, checked against llama.cpp by the owner.* Same tokenization, and
+  `llama-perplexity -c 256` on TinyStories text: llama.cpp 22.59, ours 20.98 (0.07 nats/token
+  apart; per position within 0.3–0.4 nats). Not identical, and not expected to be: llama.cpp
+  rounds activations to 8 bits for its quantized matmuls and keeps the KV cache in f16; we
+  run bf16 activations. A run of ours in fp32 will show how much is our own rounding.
+  Greedy text is the same degenerate "111…" in both on raw prompts.
+- *Gemma 4 IT on raw text is bad at the start of a sequence, in both implementations:*
+  ~19 nats/token at positions 1–7, ~3 by positions 128–255. Inside its chat format it
+  answers properly (llama.cpp: "Paris"). So the analyzer suites, which are short raw
+  prompts, measured nothing useful for Gemma (logit-lens final loss 12.0 vs uniform 12.5).
+  New: chat formats written out from the GGUF's template (formats/chat.py; Gemma 4 and
+  ChatML), `generate/next --chat`, and `analyze/compare --chat`: each test becomes the
+  model's reply to a user turn ("Continue this text."), only the test's own tokens are
+  scored, and results go to a separate "<suite>-chat" suite.
+- *Gemma 4 attention (raw prompts, so provisional):* induction gain 14.0 nats/token on
+  random suite tokens (18.1 → 4.1); top induction heads L41H14 (0.67), L17H0 (0.59).
+- *TinyStories induction: my hypothesis was wrong.* Drawing the random tokens from the
+  suite's own 258 tokens instead of the whole vocabulary changed almost nothing (gain 1.04
+  vs 1.03 at step 6000, top head still L3H2 at 0.08). The model is confidently wrong on
+  random sequences (first copy 11.5 nats, above uniform-over-the-vocabulary 9.0) and the
+  repeat only helps a little. New measure: each suite text fed twice ("repeated text"),
+  i.e. copying in the setting the model was trained on, with per-head scores.
+- *Bug:* `train()` switched fp32 matmuls to TF32 for the whole process and never switched
+  back, so a later exactness test in the same pytest run failed (diff 0.03). It now
+  restores the setting. Found by the owner's agent.
+- *Gemma's "emb" row top-1 is the current token in 0% of positions* (Qwen and TinyStories:
+  100%). Tied embeddings make self-prediction likely, not certain: Gemma's final norm has
+  per-channel gains that reshape the vector first (my guess at the reason). The dashboard
+  note no longer claims it always happens.
+- *Speed:* Gemma decodes at 0.7 tok/s vs llama.cpp's 46. Every token dequantized all 12B
+  weights through int64 temporaries (~50 bytes of memory traffic per weight). New lean
+  Q4_0/Q8_0 path: unpack straight into bf16 and scale in one pass, same values exactly;
+  2.3× faster on the CPU, GPU still to be measured. The logit lens now unembeds many layers
+  per call (it was dequantizing Gemma's 1B-weight output layer 49 times per test). Matching
+  llama.cpp needs a fused dequantize-and-multiply GPU kernel: an owner decision (Triton or a
+  small CUDA extension), see PLAN §4.5.1.
+- New tools: `perplexity` (llama-perplexity's chunking, plus bits/byte and loss by
+  position) and `next` (top next-token candidates with probabilities).
+
+**2026-10-24: Triton kernel for quantized models; data for a scaling ladder.**
+- *Owner decisions:* Triton for fused GPU kernels (`triton-windows` 3.8.x on Windows, matching
+  PyTorch 2.14; Linux PyTorch ships Triton). And: build a model ladder bigger than 10M on
+  general knowledge, Python, math and sports, to see how answers improve with size.
+- *Fused Q4_0/Q8_0 matmul* (`forge/model/triton_kernels.py`): each program loads a slice of
+  activations and the matching raw weight bytes, unpacks and scales them in registers
+  (fp32, rounded once to bf16, the same values as the plain path), and accumulates with
+  `tl.dot`. Each weight byte is read once and nothing is written back, against ~30 GB of
+  memory traffic per token before. Checked on CPU with Triton's interpreter
+  (TRITON_INTERPRET=1): matches dequantize+matmul to fp32 rounding, also through a whole tiny
+  Gemma 4. The interpreter has no bfloat16, so bf16 is checked on the GPU only: a
+  self-check on first use compares the kernel with the plain path and silently falls back
+  if they disagree (or Triton fails to compile). `SLEUTH_NO_TRITON=1` forces the plain path.
+- *Data:* Parquet ingest (pyarrow, approved earlier) and per-source caps `path@MB`, which set
+  a mix's proportions for both the tokenizer and the shards; `meta.json` records the actual
+  mix. Sources and licences in docs/DATA.md §2a: FineWeb-Edu 40%, Cosmopedia v2 15%,
+  Wikipedia 12%, Python-Edu 15%, FineMath-4+ 10%, OnlySports 8% (optional: CC BY-NC-SA).
+  One surprise from the research: SmolLM's own `python-edu` subset holds only file IDs (the
+  code must be fetched from Software Heritage's S3), so we use a community copy with the
+  code included (`Avelina/python-edu-cleaned`, ODC-By).
+- *Ladder:* `mix-20m` (22M params, 0.5B tokens, ~2 h estimated), `mix-60m` (64M, 1.0B, ~9 h),
+  `mix-100m` (101M, 1.57B, ~20 h): same 32k tokenizer, data and 1024-token context, so only
+  size differs. New `suites/knowledge` (facts, sports, math, python; 40 short questions) and
+  a `score` command (loss, answer loss, exact match per category) to compare them.

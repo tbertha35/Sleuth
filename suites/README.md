@@ -24,3 +24,14 @@ Add your own categories by dropping in more `.jsonl` files.
 Some answers are one plausible continuation among several (e.g. "Yes, you" →
 " can"), so exact-match scores are noisy. Compare *changes* (across checkpoints,
 or with/without an ablation) rather than absolute values.
+
+`knowledge/` asks short questions with one clear answer, for comparing models of
+different sizes trained on general data (the `mix-*` configs):
+- `facts`: capitals, planets, science basics
+- `sports`: rules and numbers that don't change from year to year
+- `math`: arithmetic and one-step word problems
+- `python`: complete a line of Python, or say what it prints
+
+A base model (no chat tuning) only *continues* text, so the questions use a
+"Q: ... A:" format it will have seen in web text. Watch "expected loss" fall as
+models grow: it moves long before exact matches start appearing.

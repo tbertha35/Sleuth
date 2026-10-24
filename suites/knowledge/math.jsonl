@@ -1,0 +1,10 @@
+{"id": "math-00", "prompt": "Q: What is 12 times 12?\nA:", "expected": " 144"}
+{"id": "math-01", "prompt": "Q: What is 100 divided by 4?\nA:", "expected": " 25"}
+{"id": "math-02", "prompt": "Q: What is 15 + 27?\nA:", "expected": " 42"}
+{"id": "math-03", "prompt": "Q: What is half of 90?\nA:", "expected": " 45"}
+{"id": "math-04", "prompt": "Q: What is 7 squared?\nA:", "expected": " 49"}
+{"id": "math-05", "prompt": "Q: Tom has 5 apples and buys 3 more. How many apples does he have now?\nA:", "expected": " 8"}
+{"id": "math-06", "prompt": "Q: A train travels 60 miles in one hour. How many miles does it travel in 3 hours?\nA:", "expected": " 180"}
+{"id": "math-07", "prompt": "Q: What is the square root of 81?\nA:", "expected": " 9"}
+{"id": "math-08", "prompt": "Q: What is 1000 - 1?\nA:", "expected": " 999"}
+{"id": "math-09", "prompt": "Q: How many sides does a hexagon have?\nA:", "expected": " 6"}

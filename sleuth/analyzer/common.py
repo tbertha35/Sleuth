@@ -7,6 +7,12 @@ between documents in training: `tokenizer.start_id`.) Prompt and expected text a
 encoded separately so we know exactly which tokens are "the answer" (encoding
 them together could merge a token across the boundary).
 
+Chat models: with a `prefix` (e.g. Gemma's "<bos><|turn>user\n...<turn|>\n<|turn>model\n"),
+every test becomes  prefix + prompt tokens + expected tokens. The prefix is the
+same for every test, so views skip it: losses count only predictions *of the
+test's own tokens* (`scored`), and statistics only positions after the prefix
+(`n_prefix`). Without a prefix, the prefix is just [<|bos|>] and nothing changes.
+
 Scoring is *teacher-forced*: we feed the full sequence once and read off, at
 every position, the probability the model gave to the true next token. This
 is how loss is measured during training too, and it's cheap: one forward pass
@@ -31,7 +37,13 @@ from .suites import TestCase
 class EncodedCase:
     case: TestCase
     ids: torch.Tensor   # [1, T] on CPU
-    n_prompt: int       # tokens before the answer, including <|bos|>
+    n_prompt: int       # tokens before the answer, including <|bos|> (and any prefix)
+    n_prefix: int = 1   # tokens before the test's own text: just <|bos|>, or a chat prefix
+
+    @property
+    def scored(self) -> slice:
+        """Positions whose next-token prediction is one of the test's own tokens."""
+        return slice(self.n_prefix - 1, self.ids.shape[1] - 1)
 
     @property
     def category(self) -> str:
@@ -43,14 +55,30 @@ class EncodedCase:
         return slice(self.n_prompt - 1, self.ids.shape[1] - 1)
 
 
-def encode_cases(tokenizer, cases: list[TestCase], max_len: int) -> list[EncodedCase]:
+def encode_cases(tokenizer, cases: list[TestCase], max_len: int, prefix: list[int] | None = None) -> list[EncodedCase]:
+    """prefix: token IDs to put before every test (default: [start token])."""
+    prefix = list(prefix) if prefix else [tokenizer.start_id]
+    if len(prefix) >= max_len - 1:
+        raise ValueError(f"the prefix ({len(prefix)} tokens) leaves no room in max_seq_len {max_len}")
     out = []
     for c in cases:
-        prompt = [tokenizer.start_id] + tokenizer.encode(c.prompt)
+        prompt = prefix + tokenizer.encode(c.prompt)
         answer = tokenizer.encode(c.expected) if c.expected else []
         ids = (prompt + answer)[:max_len]
-        out.append(EncodedCase(c, torch.tensor([ids]), min(len(prompt), len(ids))))
+        out.append(EncodedCase(c, torch.tensor([ids]), min(len(prompt), len(ids)), len(prefix)))
     return out
+
+
+DEFAULT_CHAT_INSTRUCTION = "Continue this text."
+
+
+def analysis_prefix(tokenizer, instruction: str = DEFAULT_CHAT_INSTRUCTION) -> list[int]:
+    """The chat prefix for analyzing a chat model: <bos> + a user turn holding
+    `instruction` + an opened model turn. Each test's text then reads as the
+    model's own reply, which is where an instruction-tuned model is at home."""
+    from ..formats.chat import encode_chat
+
+    return encode_chat(tokenizer, [{"role": "user", "content": instruction}])
 
 
 def categories(enc: list[EncodedCase]) -> list[str]:
@@ -73,8 +101,8 @@ def score_cases(model, enc: list[EncodedCase], vocab: int, device) -> dict:
         nll = F.cross_entropy(logits, targets, reduction="none")
         a = acc.setdefault(e.category, {"loss_sum": 0.0, "n_tok": 0, "exp_loss_sum": 0.0, "n_exp_tok": 0,
                                         "exact": 0, "n_exp_cases": 0})
-        a["loss_sum"] += float(nll.sum())
-        a["n_tok"] += int(nll.numel())
+        a["loss_sum"] += float(nll[e.scored].sum())
+        a["n_tok"] += int(nll[e.scored].numel())
         span = e.answer_positions
         if span.stop > span.start:
             a["exp_loss_sum"] += float(nll[span].sum())

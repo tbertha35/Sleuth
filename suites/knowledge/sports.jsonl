@@ -1,0 +1,10 @@
+{"id": "sports-00", "prompt": "Q: How many players does a soccer team have on the field?\nA:", "expected": " 11"}
+{"id": "sports-01", "prompt": "Q: In which sport do players hit a shuttlecock over a net?\nA:", "expected": " Badminton"}
+{"id": "sports-02", "prompt": "Q: How many points is a touchdown worth in American football?\nA:", "expected": " 6"}
+{"id": "sports-03", "prompt": "Q: In which sport would you see a slam dunk?\nA:", "expected": " Basketball"}
+{"id": "sports-04", "prompt": "Q: How many years apart are the Summer Olympic Games held?\nA:", "expected": " 4"}
+{"id": "sports-05", "prompt": "Q: Which tennis tournament is played on grass in London every summer?\nA:", "expected": " Wimbledon"}
+{"id": "sports-06", "prompt": "Q: How many holes are played in a standard round of golf?\nA:", "expected": " 18"}
+{"id": "sports-07", "prompt": "Q: In which sport is the Stanley Cup awarded?\nA:", "expected": " Ice hockey"}
+{"id": "sports-08", "prompt": "Q: How many players does a basketball team have on the court?\nA:", "expected": " 5"}
+{"id": "sports-09", "prompt": "Q: In baseball, how many strikes make an out?\nA:", "expected": " 3"}

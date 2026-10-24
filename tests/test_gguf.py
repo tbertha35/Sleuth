@@ -288,3 +288,15 @@ def test_reader_rejects_truncated_file(tmp_path):
     (tmp_path / "t.gguf").write_bytes(data[:-16])
     with pytest.raises(ValueError, match="truncated"):
         GGUFFile(tmp_path / "t.gguf")
+
+
+@pytest.mark.parametrize("qtype,quant", [(q.Q4_0, quant_q4_0), (q.Q8_0, quant_q8_0)])
+def test_lean_dequantizers_match_reference(qtype, quant):
+    """The fast Q4_0/Q8_0 paths (used by kept-quantized layers) give exactly the
+    reference values: in fp32, and rounded once in bf16 (f16 goes the slow way)."""
+    x = RNG.normal(size=32 * 512).astype(np.float32) * 0.05
+    raw = torch.frombuffer(bytearray(quant(x)), dtype=torch.uint8)
+    ref = q._DEQUANT[qtype](raw.reshape(-1, q.BLOCK[qtype][1])).reshape(-1)
+    for dt in (torch.float32, torch.bfloat16, torch.float16):
+        got = q.dequantize(raw, qtype, x.size, dt)
+        assert got.dtype == dt and torch.equal(got, ref.to(dt)), dt

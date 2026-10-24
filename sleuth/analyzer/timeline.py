@@ -33,12 +33,15 @@ import torch
 
 from ..forge.tokenizer.bpe import Tokenizer
 from ..forge.train.checkpoint import list_snapshots, load_model
+from .common import analysis_prefix
 from .suites import load_suite
 from .views import VIEWS
 
 
-def analysis_dir(run_dir: Path, view: str, suite: Path) -> Path:
-    return Path(run_dir) / "analysis" / view / Path(suite).name
+def analysis_dir(run_dir: Path, view: str, suite: Path, chat: bool = False) -> Path:
+    """Chat-wrapped results get their own folder ("stories-chat"), so the
+    dashboard shows them as a separate suite next to the raw ones."""
+    return Path(run_dir) / "analysis" / view / (Path(suite).name + ("-chat" if chat else ""))
 
 
 def save_result(result: dict, out_dir: Path, extra: dict | None = None) -> None:
@@ -107,8 +110,11 @@ def _checkpoints(run_dir: Path, device: str):
 
 def run_timeline(run_dir: str | Path, suite: str | Path, device: str = "cpu", views: list[str] | None = None,
                  force: bool = False, steps: list[int] | None = None, options: dict | None = None,
-                 log: Callable[[str], None] = print) -> dict[str, Path]:
-    """Run `views` (default: all) on every checkpoint; returns {view: timeline.json path}."""
+                 log: Callable[[str], None] = print, chat_instruction: str | None = None) -> dict[str, Path]:
+    """Run `views` (default: all) on every checkpoint; returns {view: timeline.json path}.
+
+    chat_instruction: for chat models, wrap every test in a user turn holding
+    this instruction plus an opened model turn (common.analysis_prefix)."""
     run_dir = Path(run_dir)
     views = views or list(VIEWS)
     unknown = [v for v in views if v not in VIEWS]
@@ -117,6 +123,8 @@ def run_timeline(run_dir: str | Path, suite: str | Path, device: str = "cpu", vi
     options = options or {}
     cases = load_suite(suite)
     ckpts, tokenizer = _checkpoints(run_dir, device)
+    chat = chat_instruction is not None
+    prefix = analysis_prefix(tokenizer, chat_instruction) if chat else None
     if steps is not None:
         ckpts = [(s, f) for s, f in ckpts if s in set(steps)]
     if not ckpts:
@@ -124,22 +132,24 @@ def run_timeline(run_dir: str | Path, suite: str | Path, device: str = "cpu", vi
     log(f"analyzing {len(ckpts)} checkpoints x {len(views)} views ({', '.join(views)}), {len(cases)} tests")
     for step, load in ckpts:
         step_dir = f"step_{step:07d}"
-        todo = [v for v in views if force or not (analysis_dir(run_dir, v, suite) / step_dir / "summary.json").exists()]
+        todo = [v for v in views if force or not (analysis_dir(run_dir, v, suite, chat) / step_dir / "summary.json").exists()]
         if not todo:
             continue
         model, meta = load()
         line = []
         for v in todo:
             t0 = time.time()
-            res = VIEWS[v].run(model, tokenizer, cases, device, **options.get(v, {}))
-            save_result(res, analysis_dir(run_dir, v, suite) / step_dir,
-                        {"step": step, "tokens_seen": int(meta.get("tokens_seen", 0)), "suite": str(suite)})
+            res = VIEWS[v].run(model, tokenizer, cases, device, prefix=prefix, **options.get(v, {}))
+            extra = {"step": step, "tokens_seen": int(meta.get("tokens_seen", 0)), "suite": str(suite)}
+            if chat:
+                extra["chat_prefix"] = tokenizer.decode(prefix)
+            save_result(res, analysis_dir(run_dir, v, suite, chat) / step_dir, extra)
             line.append(f"{v} {time.time() - t0:.1f}s")
         log(f"  step {step:7d}: " + ", ".join(line))
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    out = {v: build_timeline(analysis_dir(run_dir, v, suite), v) for v in views}
+    out = {v: build_timeline(analysis_dir(run_dir, v, suite, chat), v) for v in views}
     log("timelines: " + ", ".join(str(p) for p in out.values()))
     return out
 

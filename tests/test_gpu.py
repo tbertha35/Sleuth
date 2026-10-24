@@ -25,7 +25,9 @@ pytestmark = [
 
 def test_bf16_training_and_generation(tiny_data, tmp_path):
     cfg = tiny_run_config(tiny_data, tmp_path, device="cuda", precision="bf16", max_steps=20, lr=3e-3)
+    before = torch.get_float32_matmul_precision()
     run = train(cfg, log=lambda s: None)
+    assert torch.get_float32_matmul_precision() == before  # TF32 must not leak out of train()
     model, _ = load_model(run, device="cuda")
     r = generate(model, [1, 2, 3], 20, SamplingConfig(temperature=0.8), seed=0)
     assert len(r.new_ids) > 0 and r.decode_tok_per_s > 0
@@ -82,3 +84,27 @@ def test_quantized_gemma_on_gpu(tmp_path):
     bf16, _ = load_gguf_model(path, device="cuda", dtype=torch.bfloat16, keep_quantized=True)
     r = generate(bf16, IDS[:5], 20, SamplingConfig(temperature=0.0))
     assert len(r.new_ids) == 20
+
+
+def test_triton_kernel_on_gpu(tmp_path, monkeypatch):
+    """The fused Triton kernel (bf16) agrees with the plain dequantize path, and
+    is actually used. Skipped if Triton isn't installed (Windows: triton-windows)."""
+    pytest.importorskip("triton")
+    from test_gemma import IDS, make_gemma_gguf
+
+    from sleuth.forge.model import triton_kernels as tk
+    from sleuth.formats import gguf_quants as q
+    from sleuth.formats.gguf_model import load_gguf_model
+
+    path = tmp_path / "tiny-q4.gguf"
+    make_gemma_gguf(path, quant=q.Q4_0)
+    model, _ = load_gguf_model(path, device="cuda", dtype=torch.bfloat16, keep_quantized=True)
+    x = torch.tensor([IDS], device="cuda")
+    assert tk.usable(torch.zeros(1, 64, device="cuda", dtype=torch.bfloat16), q.Q4_0), "Triton self-check failed"
+    with torch.no_grad():
+        fused = model(x).logits.float()
+        monkeypatch.setenv("SLEUTH_NO_TRITON", "1")
+        plain = model(x).logits.float()
+    # Same weights, same rounding; only the order of the fp32 sums differs.
+    assert (fused - plain).abs().max().item() < 0.05 * plain.abs().max().item()
+    assert (fused.argmax(-1) == plain.argmax(-1)).float().mean().item() > 0.9

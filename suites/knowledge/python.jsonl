@@ -1,0 +1,10 @@
+{"id": "python-00", "prompt": "def add(a, b):\n    return", "expected": " a + b"}
+{"id": "python-01", "prompt": "# print the numbers 0 to 4\nfor i in range(", "expected": "5):"}
+{"id": "python-02", "prompt": "print(len([1, 2, 3]))  # prints", "expected": " 3"}
+{"id": "python-03", "prompt": "numbers = [3, 1, 2]\nnumbers.sort()\nprint(numbers)  # prints", "expected": " [1, 2, 3]"}
+{"id": "python-04", "prompt": "def is_even(n):\n    return n %", "expected": " 2 == 0"}
+{"id": "python-05", "prompt": "import math\nprint(math.sqrt(16))  # prints", "expected": " 4.0"}
+{"id": "python-06", "prompt": "words = ['a', 'b']\nprint(', '.join(words))  # prints", "expected": " a, b"}
+{"id": "python-07", "prompt": "x = 10\nif x > 5:\n    print('big')\nelse:\n    print('small')\n# prints", "expected": " big"}
+{"id": "python-08", "prompt": "def greet(name):\n    return 'Hello, ' +", "expected": " name"}
+{"id": "python-09", "prompt": "print(type(3.5).__name__)  # prints", "expected": " float"}

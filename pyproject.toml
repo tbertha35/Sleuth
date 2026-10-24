@@ -15,6 +15,12 @@ dependencies = ["numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# Reading Parquet datasets (FineWeb-Edu, Wikipedia, FineMath, ...): approved 2026-10-23.
+data = ["pyarrow"]
+# Fused GPU kernels for quantized models (approved 2026-10-24). Linux PyTorch already
+# includes Triton; Windows needs the triton-windows build that matches PyTorch:
+# 3.8.x for PyTorch 2.14/2.15 (see github.com/triton-lang/triton-windows).
+triton = ["triton-windows>=3.8,<3.9; sys_platform == 'win32'"]
 
 [project.scripts]
 sleuth = "sleuth.cli:main"

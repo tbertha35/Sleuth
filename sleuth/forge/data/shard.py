@@ -27,7 +27,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from ..tokenizer.bpe import Tokenizer
-from .ingest import Document, find_files, is_validation, iter_documents
+from .ingest import Document, find_files, is_validation, iter_input_documents
 
 
 def _pool(workers: int, **kwargs):
@@ -131,14 +131,17 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
     t0 = time.time()
     total_bytes = 0
     cat_counts: dict[str, int] = {}
-    docs = iter_documents(files, text_field=text_field)
+    cat_bytes: dict[str, int] = {}
+    docs = iter_input_documents(inputs, text_field=text_field)
 
     def counted(docs):
         nonlocal total_bytes
         for d in docs:
-            total_bytes += len(d.text.encode("utf-8"))
+            n = len(d.text.encode("utf-8"))
+            total_bytes += n
             if d.category:
                 cat_counts[d.category] = cat_counts.get(d.category, 0) + 1
+                cat_bytes[d.category] = cat_bytes.get(d.category, 0) + n
             yield d
 
     batch_iter = batches(counted(docs))
@@ -183,6 +186,7 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
         "source_files": [str(f) for f in files],
         "source_bytes": total_bytes,
         "categories": cat_counts,
+        "category_bytes": cat_bytes,       # how much text each source contributed: the actual mix
         "val_fraction": val_fraction,
         "splits": {s: w.finish() for s, w in writers.items()},
         "seconds": round(time.time() - t0, 1),
@@ -193,4 +197,7 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     log(f"done: {meta['train_tokens']:,} train / {meta['val_tokens']:,} val tokens, "
         f"{meta['bytes_per_token']} bytes/token, {meta['seconds']}s")
+    if len(cat_bytes) > 1:
+        log("mix by text size: " + ", ".join(f"{c} {b / max(1, total_bytes):.1%}" for c, b in
+                                              sorted(cat_bytes.items(), key=lambda kv: -kv[1])))
     return meta

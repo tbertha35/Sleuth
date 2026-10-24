@@ -46,13 +46,15 @@ LOW, HIGH, SELECTIVE_MIN_RATE, SELECTIVITY = 0.01, 0.5, 0.05, 0.5
 
 
 @torch.no_grad()
-def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device: str | torch.device = "cpu") -> dict:
+def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device: str | torch.device = "cpu",
+                 prefix: list[int] | None = None) -> dict:
     """Returns {"summary": json-able dict, "arrays": dict of numpy arrays}."""
     model.eval().to(device)
     L = model.cfg.n_layers
     H = model.cfg.hidden
     cats = sorted({c.category for c in cases})
-    inputs = [(e.category, e.ids) for e in encode_cases(tokenizer, cases, model.cfg.max_seq_len)]
+    inputs = [(e.category, e.ids, e.n_prefix) for e in encode_cases(tokenizer, cases, model.cfg.max_seq_len, prefix)]
+    skip = {"n": 1}  # positions to leave out: <|bos|> (an attention sink), or a whole chat prefix
 
     # ---- pass 1: per-layer RMS of the MLP activations, plus residual-stream sizes
     sq_sum = torch.zeros(L, dtype=torch.float64)
@@ -60,16 +62,17 @@ def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device
     comp = {name: torch.zeros(L, dtype=torch.float64) for name in ("attn_out", "mlp_out", "resid_post")}
 
     def p1_act(name, t):
-        sq_sum[layer_of(name)] += t[0, 1:].double().pow(2).mean(-1).sum().cpu()
+        sq_sum[layer_of(name)] += t[0, skip["n"]:].double().pow(2).mean(-1).sum().cpu()
 
     def p1_comp(name, t):
-        comp[name.split(".")[-1]][layer_of(name)] += t[0, 1:].double().pow(2).mean(-1).sum().cpu()
+        comp[name.split(".")[-1]][layer_of(name)] += t[0, skip["n"]:].double().pow(2).mean(-1).sum().cpu()
 
     with listen(model, {"blocks.*.mlp.act": p1_act, "blocks.*.attn_out": p1_comp,
                         "blocks.*.mlp_out": p1_comp, "blocks.*.resid_post": p1_comp}):
-        for _, ids in inputs:
+        for _, ids, n_prefix in inputs:
+            skip["n"] = n_prefix
             model(ids.to(device))
-            n_tok += ids.shape[1] - 1
+            n_tok += ids.shape[1] - n_prefix
     if n_tok == 0:
         raise ValueError("suite produced no tokens")
     rms = (sq_sum / n_tok).sqrt()
@@ -84,15 +87,16 @@ def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device
 
     def p2_act(name, t):
         li = layer_of(name)
-        a = t[0, 1:].double().abs().cpu()           # [T, H]
+        a = t[0, skip["n"]:].double().abs().cpu()   # [T, H]
         fire[li, current["cat"]] += (a > k * rms[li]).sum(0)
         abs_sum[li] += a.sum(0)
         abs_max[li] = torch.maximum(abs_max[li], a.max(0).values)
 
     with listen(model, {"blocks.*.mlp.act": p2_act}):
-        for cat, ids in inputs:
+        for cat, ids, n_prefix in inputs:
             current["cat"] = ci[cat]
-            tok_per_cat[ci[cat]] += ids.shape[1] - 1
+            skip["n"] = n_prefix
+            tok_per_cat[ci[cat]] += ids.shape[1] - n_prefix
             model(ids.to(device))
 
     rate_by_cat = fire / tok_per_cat.clamp(min=1)[None, :, None]   # [L, C, H]
@@ -145,9 +149,9 @@ def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device
     return {"summary": summary, "arrays": arrays}
 
 
-def run(model, tokenizer, cases, device, k: float = 1.0, **_) -> dict:
+def run(model, tokenizer, cases, device, k: float = 1.0, prefix: list[int] | None = None, **_) -> dict:
     """View interface (see analyzer/views.py)."""
-    return neuron_stats(model, tokenizer, cases, k=k, device=device)
+    return neuron_stats(model, tokenizer, cases, k=k, device=device, prefix=prefix)
 
 
 _HELP = {

@@ -1,0 +1,43 @@
+# Scaling ladder, rung 1: the 10M TinyStories shape (d=384, 6 layers) on the general mix
+# (FineWeb-Edu, Cosmopedia, Wikipedia, Python, FineMath, sports; see docs/DATA.md).
+# With a 32k vocabulary the embedding is 12.6M, so ~22M parameters in all (9.4M non-embedding).
+#
+# Same data, same tokenizer and same context as mix-60m and mix-100m, so the
+# three differ only in size: that's what makes the comparison a scaling test.
+#
+# 7600 steps x 16 x 1024 x 4 = 0.50B tokens (~23 per parameter). Estimated ~2 h
+# on the RTX 5060 Ti (the first log lines will tell).
+#
+#   python -m sleuth train configs/mix-20m.toml
+name = "mix-20m"
+
+[data]
+shards = "data/shards/mix"
+
+[model]
+vocab_size = 0          # from the shards (tokenizer trained with --vocab-size 32768)
+d_model = 384
+n_layers = 6
+n_heads = 6
+n_kv_heads = 2
+max_seq_len = 1024
+
+[train]
+micro_batch_size = 16
+grad_accum = 4
+max_steps = 7600
+lr = 1e-3
+warmup_steps = 300
+device = "auto"
+precision = "bf16"
+seq_len = 1024
+min_lr_ratio = 0.1
+schedule = "cosine"
+weight_decay = 0.1
+grad_clip = 1.0
+log_every = 25
+eval_every = 250
+eval_batches = 40
+snapshot_every = 500
+resume_every = 500
+peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.
