@@ -209,6 +209,21 @@ def train_tokenizer(inputs: list[str | Path], vocab_size: int, out_path: str | P
         "merge_seconds": round(time.time() - t1, 1),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
+    bpt = bytes_per_token(tok, counts)
+    tok.train_info["bytes_per_token"] = round(bpt, 3)
     tok.save(out_path)
-    log(f"saved {out_path} (vocab {tok.vocab_size}, {time.time() - t0:.1f}s total)")
+    log(f"saved {out_path} (vocab {tok.vocab_size}, ~{bpt:.2f} bytes/token on its training text, "
+        f"{time.time() - t0:.1f}s total)")
     return tok
+
+
+def bytes_per_token(tok: Tokenizer, counts: Counter, top: int = 200_000) -> float:
+    """Average bytes per token on the training text, from the chunk counts: each
+    distinct chunk is encoded once and weighted by how often it occurred. Only
+    the `top` most frequent chunks are used (they cover nearly all the text), so
+    it's quick even for millions of distinct chunks."""
+    n_bytes = n_tokens = 0
+    for chunk, c in counts.most_common(top):
+        n_bytes += c * len(chunk.encode("utf-8"))
+        n_tokens += c * len(tok._encode_chunk(chunk))
+    return n_bytes / max(1, n_tokens)

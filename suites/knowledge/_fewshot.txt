@@ -1,0 +1,12 @@
+Q: What color is the sky on a clear day?
+A: Blue
+
+Q: How many days are in a week?
+A: 7
+
+Q: What is the capital of Germany?
+A: Berlin
+
+Q: What is 3 + 4?
+A: 7
+

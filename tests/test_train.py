@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -78,3 +79,34 @@ def test_nearest_snapshot(tiny_data, tmp_path):
         resolve_weights(run, 5)
     assert resolve_weights(run, 5, nearest=True).parent.name == "step_0000004"  # ties go to the earlier step
     assert resolve_weights(run, 100, nearest=True).parent.name == "step_0000006"
+
+
+def test_stop_file_saves_and_stops(tiny_data, tmp_path):
+    """Creating runs/<run>/STOP stops training cleanly with a resumable checkpoint
+    (Ctrl-C doesn't reach a process running in the background)."""
+    cfg = tiny_run_config(tiny_data, tmp_path, max_steps=6, resume_every=100)
+    lines = []
+
+    def log(msg):
+        lines.append(msg)
+        if msg.startswith("to stop cleanly"):
+            (Path(msg.split("create the file ")[1].split(" (or")[0])).write_text("")
+
+    run = train(cfg, log=log)
+    assert any("stopped at step 1" in m for m in lines)
+    assert latest_resume(run) is not None and not (run / "STOP").exists()
+
+
+def test_validation_reports_each_source(tiny_data, tmp_path):
+    cfg = tiny_run_config(tiny_data, tmp_path, max_steps=3, eval_every=3, eval_windows=12)
+    run = train(cfg, log=lambda s: None)
+    evals = [json.loads(l) for l in (run / "metrics.jsonl").read_text().splitlines() if "val_loss" in l]
+    assert evals and math.isfinite(evals[-1]["val_loss"]) and evals[-1]["val_tokens"] == 12 * cfg.train.seq_len
+
+
+def test_eval_command(tiny_data, tmp_path, capsys):
+    from sleuth.cli import main
+
+    run = train(tiny_run_config(tiny_data, tmp_path, max_steps=3), log=lambda s: None)
+    assert main(["eval", str(run), "--windows", "6", "--device", "cpu"]) == 0
+    assert "val loss" in capsys.readouterr().out

@@ -360,7 +360,9 @@ the traffic ~4×, but the real fix is a *fused* kernel that reads the 4-bit bloc
 multiplies in one go, never writing a bf16 copy (what llama.cpp does). **Decided
 (2026-10-24): Triton** (`triton-windows` on Windows). First kernel: Q4_0/Q8_0
 (`forge/model/triton_kernels.py`), checked on CPU in Triton's interpreter; GPU speed to be
-measured. Next if needed: K-quants, a split-K variant for batch-1 decoding, CUDA graphs.
+measured. Result: Gemma 4 12B decode 0.7 → 7.7 tok/s (llama.cpp: 46). Then a few-row kernel for
+batch-1 decoding and a fused RMSNorm. Next: CUDA graphs for the decode step (~4,000 kernel
+launches per token are now a large part of the time), then K-quants.
 
 ### 4.6 Chat SFT (later)
 Conversation jsonl → chat template with special tokens → loss only on
@@ -485,7 +487,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 |---|---|---|---|
 | **M0** ✅ | Skeleton, PLAN, hardware probe | probe run on both GX10s, the 5060 Ti and the 3060 Ti (results stay local; summaries in LOG.md) | your machines |
 | **M1** ✅ (CPU) | Tokenizer + 10M model end-to-end | BPE trains on your data; round-trip tests; 10M model trains on 1 GPU; snapshot + resume checkpoints; `generate` prints text + tok/s; **one analyzer view (per-layer activation stats over checkpoints) in the dashboard** | code + CPU tests here; real run on 5060 Ti or GB10 |
-| M2a | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them | 5060 Ti |
+| M2a 🔶 | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them. *Done: mix-20m (3.34 nats on the whole mix), mix-60m (2.99); next: mix-100m.* | 5060 Ti |
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
 | **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |

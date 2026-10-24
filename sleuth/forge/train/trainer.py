@@ -21,6 +21,7 @@ import dataclasses
 import json
 import math
 import shutil
+import signal
 import time
 from pathlib import Path
 from typing import Callable
@@ -59,32 +60,51 @@ class MetricsLog:
 
 
 @torch.no_grad()
-def evaluate(model, ds: ShardDataset, batch_size: int, seq_len: int, max_batches: int,
+def evaluate(model, ds: ShardDataset, batch_size: int, seq_len: int, n_windows: int,
              byte_lens: torch.Tensor, device: torch.device, autocast) -> dict:
-    """Validation loss (nats/token) and bits-per-byte.
+    """Validation loss (nats/token) and bits-per-byte, overall and per source.
 
     Bits-per-byte = total loss in bits / number of raw-text bytes predicted.
     It doesn't depend on the tokenizer, so models with different
     tokenizers (or vocab sizes) can be compared fairly. Lower is better.
+
+    The windows are spread evenly over the whole val split (ShardDataset.eval_windows),
+    so a mix is measured in its real proportions. Shards that record where each
+    source starts also give a loss per source ("val_by_source").
     """
     was_training = model.training
     model.eval()
     loss_sum, n_tok, n_bytes = 0.0, 0, 0
-    for x, y in ds.sequential_batches(batch_size, seq_len, max_batches):
+    by_src: dict[str, list[float]] = {}
+    windows = ds.eval_windows(n_windows, seq_len)
+    for x, y, sources in ds.window_batches(windows, batch_size, seq_len):
         x, y = x.to(device), y.to(device)
         with autocast():
             logits = model(x).logits
-        loss = torch.nn.functional.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1), reduction="sum")
-        loss_sum += loss.item()
+        loss = torch.nn.functional.cross_entropy(logits.float().transpose(1, 2), y, reduction="none")  # [B, T]
+        per_window = loss.sum(1).tolist()
+        loss_sum += sum(per_window)
         n_tok += y.numel()
         n_bytes += int(byte_lens[y].sum().item())
+        for src, w in zip(sources, per_window):
+            if src is not None:
+                acc = by_src.setdefault(src, [0.0, 0])
+                acc[0] += w
+                acc[1] += y.shape[1]
     if was_training:
         model.train()
-    return {
+    out = {
         "val_loss": loss_sum / max(1, n_tok),
         "val_bpb": loss_sum / math.log(2) / max(1, n_bytes),
         "val_tokens": n_tok,
     }
+    if by_src:
+        out["val_by_source"] = {k: v[0] / v[1] for k, v in sorted(by_src.items())}
+    return out
+
+
+class _StopRequested(Exception):
+    """Raised by the SIGTERM / Ctrl-Break handlers: stop like Ctrl-C does (save, then exit)."""
 
 
 def prepare_run_dir(cfg: RunConfig) -> Path:
@@ -134,7 +154,7 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     elif cfg.model.vocab_size != data_vocab:
         raise ValueError(f"model.vocab_size={cfg.model.vocab_size} but the shards use vocab {data_vocab} "
                          f"(set model.vocab_size = 0 to take it from the data)")
-    tokenizer = Tokenizer.load(train_ds.meta["tokenizer"])
+    tokenizer = Tokenizer.load(train_ds.tokenizer_path)
     if tokenizer.fingerprint() != train_ds.meta["tokenizer_fingerprint"]:
         raise ValueError("tokenizer file changed since the shards were made; re-shard or restore it")
     byte_lens = torch.tensor(tokenizer.token_byte_lengths() + [0] * (cfg.model.padded_vocab - tokenizer.vocab_size),
@@ -157,10 +177,17 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
         run_dir = run_dir or prepare_run_dir(cfg)
         (run_dir / "config.json").write_text(json.dumps(to_dict(cfg), indent=2) + "\n")
         (run_dir / "env.json").write_text(json.dumps(env_info(), indent=2) + "\n")
-        shutil.copy(train_ds.meta["tokenizer"], run_dir / "tokenizer.json")
+        shutil.copy(train_ds.tokenizer_path, run_dir / "tokenizer.json")
         save_snapshot(run_dir, 0, model, 0, tc.snapshot_dtype)  # untrained baseline for the timeline
 
-    fwd = torch.compile(model) if tc.compile else model
+    compile_model = tc.compile
+    if compile_model and device.type == "cuda":
+        try:
+            import triton  # noqa: F401  (torch.compile's GPU code generator)
+        except ImportError:
+            log("warning: compile = true needs Triton (Windows: pip install -e .[triton]); training without it")
+            compile_model = False
+    fwd = torch.compile(model) if compile_model else model
     use_bf16 = tc.precision == "bf16" and device.type == "cuda"
 
     def autocast():
@@ -181,6 +208,12 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
         # memorizing it and validation loss gets worse (overfitting).
         log(f"warning: this run reads the training data ~{epochs:.0f} times. Expect overfitting: "
             f"watch val loss, and consider more data or fewer steps.")
+
+    n_eval = tc.eval_windows or tc.eval_batches * tc.micro_batch_size
+    stop_file = run_dir / "STOP"
+    stop_file.unlink(missing_ok=True)
+    log(f"to stop cleanly from anywhere: create the file {stop_file} (or press Ctrl-C here)")
+    restore_signals = _install_stop_signals()
 
     model.train()
     completed = start_step
@@ -227,16 +260,19 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
                     rec["mem_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
                 metrics.write(rec)
                 log(f"step {completed:6d} | loss {rec['loss']:.4f} | lr {lr:.2e} | "
-                    f"gnorm {rec['grad_norm']:.2f} | {tps:,.0f} tok/s" + (f" | mfu {rec['mfu']:.1%}" if "mfu" in rec else ""))
+                    f"gnorm {rec['grad_norm']:.2f} | {tps:,.0f} tok/s" + (f" | mfu {rec['mfu']:.1%}" if "mfu" in rec else "")
+                    + (f" | mem {rec['mem_gb']:.1f} GB" if "mem_gb" in rec else ""))
                 loss_sum.zero_()
                 loss_count = 0
                 t_last, tok_last = time.perf_counter(), tokens_seen
 
             if val_ds is not None and (completed % tc.eval_every == 0 or last):
                 t_eval = time.perf_counter()
-                ev = evaluate(fwd, val_ds, tc.micro_batch_size, tc.seq_len, tc.eval_batches, byte_lens, device, autocast)
+                ev = evaluate(fwd, val_ds, tc.micro_batch_size, tc.seq_len, n_eval, byte_lens, device, autocast)
                 metrics.write({"step": completed, "tokens": tokens_seen, **ev, "time": time.time()})
-                log(f"step {completed:6d} | val loss {ev['val_loss']:.4f} | val bpb {ev['val_bpb']:.4f}")
+                srcs = ev.get("val_by_source")
+                log(f"step {completed:6d} | val loss {ev['val_loss']:.4f} | val bpb {ev['val_bpb']:.4f}"
+                    + (" | " + ", ".join(f"{k} {v:.3f}" for k, v in srcs.items()) if srcs else ""))
                 # Don't count eval time as training time. Shift the timer by the
                 # eval's duration; resetting it would pair a full logging
                 # interval's tokens with a partial interval's time whenever
@@ -247,18 +283,49 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
             if completed in snaps:
                 save_snapshot(run_dir, completed, model, tokens_seen, tc.snapshot_dtype)
             stopping = stop_at_step is not None and completed >= stop_at_step and not last
+            if stop_file.exists() and not last:
+                stop_file.unlink(missing_ok=True)
+                stopping = True
             if completed % tc.resume_every == 0 or last or stopping:
                 save_resume(run_dir, completed, model, optimizer, {"tokens_seen": tokens_seen}, tc.keep_resume)
             if stopping:
                 log(f"stopped at step {completed} as requested; resume with: python -m sleuth train --resume {run_dir}")
                 return run_dir
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _StopRequested) as e:
         if completed > start_step:
             log(f"\ninterrupted: saving resumable checkpoint at step {completed}...")
             save_resume(run_dir, completed, model, optimizer, {"tokens_seen": tokens_seen}, tc.keep_resume)
             log(f"resume with: python -m sleuth train --resume {run_dir}")
-        raise
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return run_dir
     finally:
         metrics.close()
+        restore_signals()
     log(f"done. snapshots in {run_dir / 'snapshots'}")
     return run_dir
+
+
+def _install_stop_signals():
+    """Make SIGTERM (a `kill`, or a job scheduler) and, on Windows, Ctrl-Break
+    stop training like Ctrl-C: save a resumable checkpoint first. A process run
+    in the background often never sees Ctrl-C (the owner lost ~460 steps that
+    way); the STOP file is the most reliable way to stop one. Returns a function
+    that puts the old handlers back."""
+    def handler(signum, frame):
+        raise _StopRequested(f"signal {signum}")
+
+    old = {}
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            old[sig] = signal.signal(sig, handler)
+        except ValueError:  # not the main thread (e.g. a test runner): leave signals alone
+            pass
+
+    def restore():
+        for sig, h in old.items():
+            signal.signal(sig, h)
+    return restore

@@ -153,7 +153,11 @@ so on big models add `--views neuron_stats,attention,logit_lens` to skip it at f
 
 Training writes `runs/<run-id>/` with the config, the environment, metrics, weight
 snapshots (log-spaced: steps 0, 1, 2, 4, … plus every 500) and resumable checkpoints.
-Ctrl-C saves a checkpoint. Continue with `python -m sleuth train --resume runs/<run-id>`.
+Ctrl-C saves a checkpoint, and so does creating a file named `STOP` in the run folder (use
+that for a run in the background, which may never see Ctrl-C). Continue with
+`python -m sleuth train --resume runs/<run-id>`. `python -m sleuth eval runs/<run-id>` re-measures
+a run's validation loss (overall and per data source), and `python -m sleuth score runs/<run-id>
+--suite suites/knowledge` checks its answers.
 
 Things to try:
 - `python -m sleuth tokenize --tokenizer data/tokenizers/synthetic-1k.json "any text"`

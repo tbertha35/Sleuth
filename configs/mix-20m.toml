@@ -5,8 +5,8 @@
 # Same data, same tokenizer and same context as mix-60m and mix-100m, so the
 # three differ only in size: that's what makes the comparison a scaling test.
 #
-# 7600 steps x 16 x 1024 x 4 = 0.50B tokens (~23 per parameter). Estimated ~2 h
-# on the RTX 5060 Ti (the first log lines will tell).
+# 7600 steps x 16 x 1024 x 4 = 0.50B tokens (~23 per parameter). Measured: 95 min on the
+# RTX 5060 Ti without torch.compile (85-89k tok/s, ~31% MFU); compile should cut that.
 #
 #   python -m sleuth train configs/mix-20m.toml
 name = "mix-20m"
@@ -38,6 +38,8 @@ grad_clip = 1.0
 log_every = 25
 eval_every = 250
 eval_batches = 40
+eval_windows = 640      # val windows spread over the whole split (same set for every rung)
+compile = true          # torch.compile (needs Triton; on Windows: pip install -e .[triton]): ~2.5x faster here
 snapshot_every = 500
 resume_every = 500
 peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.

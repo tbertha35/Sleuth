@@ -75,8 +75,7 @@ class Attention(nn.Module):
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         if self.v_norm:
-            vf = v.float()
-            v = (vf * torch.rsqrt(vf.pow(2).mean(-1, keepdim=True) + self.eps)).to(v.dtype)
+            v = F.rms_norm(v.float(), (self.hd,), None, self.eps).to(v.dtype)
         if self.use_rope:
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         q, k = self.tap_q(q), self.tap_k(k)

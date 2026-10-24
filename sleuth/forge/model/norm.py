@@ -13,6 +13,7 @@ because the mean of squares loses precision in bf16 (only 8 mantissa bits).
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -23,9 +24,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xf = x.float()
-        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (xf * self.weight.float()).to(x.dtype)
+        # F.rms_norm computes exactly x / sqrt(mean(x²) + eps) * weight, but as one
+        # fused operation instead of ~7 small GPU kernels. That matters when
+        # decoding one token at a time, where launching kernels is most of the cost
+        # (Gemma 4 runs 6 norms in each of its 48 layers).
+        return F.rms_norm(x.float(), (x.shape[-1],), self.weight.float(), self.eps).to(x.dtype)
 
 
 def make_norm(kind: str, dim: int, eps: float) -> nn.Module:

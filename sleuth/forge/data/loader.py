@@ -38,6 +38,12 @@ class ShardDataset:
     def vocab_size(self) -> int:
         return self.meta["vocab_size"]
 
+    @property
+    def tokenizer_path(self) -> Path:
+        """The shards' tokenizer: "tokenizer.json" in the shard folder, or, for
+        shards made before 2026-10-25, the absolute path meta.json recorded."""
+        return self.dir / self.meta["tokenizer"]   # an absolute path stays absolute under "/"
+
     def batch(self, batch_size: int, seq_len: int, seed: int, step: int,
               micro_step: int = 0, rank: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Random windows of seq_len+1 tokens; x is the first seq_len, y is
@@ -53,6 +59,43 @@ class ShardDataset:
             rows.append(np.asarray(self.arrays[sid][off: off + seq_len + 1], dtype=np.int64))
         buf = torch.from_numpy(np.stack(rows))
         return buf[:, :-1], buf[:, 1:]
+
+    def eval_windows(self, n_windows: int, seq_len: int) -> list[tuple[int, int, str | None]]:
+        """n_windows fixed windows, spread evenly over the *whole* split:
+        [(shard index, offset, source name)]. Always the same ones, so every
+        evaluation is comparable.
+
+        (The first version took windows from the start of the split. The
+        documents are stored source by source, so with a mix that measured only
+        the first source: FineWeb-Edu, 7% of the val set. Found by the owner's
+        agent on the mix-20m run.)
+        """
+        # A window can start at offsets 0..len-seq_len-1 of a shard; shards too
+        # short for one window are skipped.
+        slots = np.array([max(0, len(a) - seq_len) for a in self.arrays], dtype=np.int64)
+        if slots.sum() == 0:
+            raise ValueError(f"{self.split} split has fewer than seq_len+1={seq_len + 1} tokens per shard")
+        ends = np.cumsum(slots)                          # slot g lives in the shard where g < ends[sid]
+        bases = np.cumsum([0] + [len(a) for a in self.arrays])
+        ranges = self.meta.get("split_sources", {}).get(self.split, [])
+        starts = [r["start"] for r in ranges]
+        out = []
+        for g in np.linspace(0, ends[-1] - 1, n_windows).astype(np.int64):
+            sid = int(np.searchsorted(ends, g, side="right"))
+            off = int(g - (ends[sid - 1] if sid else 0))
+            src = None
+            if ranges:                                   # which source this window starts in
+                src = ranges[int(np.searchsorted(starts, bases[sid] + off, side="right")) - 1]["name"]
+            out.append((sid, off, src))
+        return out
+
+    def window_batches(self, windows: list[tuple[int, int, str | None]], batch_size: int, seq_len: int):
+        """Yield (x, y, source names) batches for the given windows."""
+        for i in range(0, len(windows), batch_size):
+            chunk = windows[i:i + batch_size]
+            buf = torch.from_numpy(np.stack([np.asarray(self.arrays[sid][off: off + seq_len + 1], dtype=np.int64)
+                                             for sid, off, _ in chunk]))
+            yield buf[:, :-1], buf[:, 1:], [src for _, _, src in chunk]
 
     def sequential_batches(self, batch_size: int, seq_len: int, max_batches: int) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         """Non-overlapping windows from the start of the split, always the

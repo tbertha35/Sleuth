@@ -448,3 +448,48 @@ downloaded into the repo), which is the reference for how GGUF files run.
   `mix-100m` (101M, 1.57B, ~20 h): same 32k tokenizer, data and 1024-token context, so only
   size differs. New `suites/knowledge` (facts, sports, math, python; 40 short questions) and
   a `score` command (loss, answer loss, exact match per category) to compare them.
+
+**2026-10-25: Round 4: Triton works on Windows; first scaling ladder (20M, 60M); a val-loss bug.**
+- *Triton on the RTX 5060 Ti* (triton-windows 3.8.0.post29 + PyTorch 2.14.1): all GPU tests pass,
+  including the bf16 kernel check and torch.compile. Gemma 4 12B decoding went 0.7 → **7.7 tok/s**,
+  prompt 1593 → 127 ms (the plain path, with the lean dequantizer, is 1.6 tok/s). llama.cpp: 46.
+  What's left at batch size 1: the dot-product kernel wasted 15 of its 16 tensor-core rows and
+  reloaded each block's scale per weight (new few-row kernel, CPU-checked; GPU speed to be
+  measured), and ~4,000 small kernel launches per token (RMSNorm is now one fused op; CUDA graphs
+  are the real fix, next).
+- *Gemma 4 forward pass, settled:* perplexity 22.72 (bf16) / 22.46 (fp32) vs llama.cpp's 22.59,
+  under 1% apart. Last round's 20.98 came from a scratch script with slightly different chunking.
+  Raw-prompt first token: ours "0" (31%) vs llama.cpp "1"; our margin is 0.375 logits, two bf16
+  steps at that size, so plausibly rounding; an fp32 `next` will tell.
+- *Gemma in its chat format* answers "Paris" (100%) and scores 77.5% exact on suites/knowledge
+  (answer loss 0.32). Chat-wrapped logit lens: final loss 4.08, top-1 42% (raw prompts: 12.0 /
+  12%). Its last layer does a lot: L46 is at 12.4 nats, L47 at 4.1. Top induction heads agree
+  across both measures: L17H0, L41H14, L35H7.
+- *Induction depends on the data.* The mix models grow strong induction heads early: random-token
+  gain 1.6 (20m) / 5.5 (60m) at step 500, ~10.3 by the end (first copy 11.2 → repeat 0.8), with
+  heads scoring 0.75–0.94 (L5H0/L5H2 in 20m; L4H1/L4H2/L4H9 in 60m). The TinyStories model never
+  did (top head 0.12, gain 1.0), and its gain on repeated *story text* peaked at step 500 (0.45)
+  then sagged (0.37). TinyStories rarely repeats long exact strings; web text and code do all the
+  time, so copying pays off there. Bigger model → earlier and sharper induction heads.
+- *Scaling, first two rungs* (same 32k tokenizer and data; val = 40 random windows of the whole
+  mix): mix-20m (22M params, 0.5B tokens) 3.34 nats → mix-60m (64M, 1.0B) **2.99**. No overfitting
+  (val = train). On suites/knowledge, answer loss 3.16 → 2.79 (sports 3.88 → 3.24, python 2.02 →
+  1.65), but exact match stayed at 7.5% (the same 3 Python items): knowledge is moving under the
+  surface before it shows up as right answers. Greedy text: fluent nonsense ("The capital of France
+  is France"), and Q&A prompts slide into multiple-choice formats copied from the training data.
+  Logit lens final row: 3.18 / 40% top-1 (20m) → 2.76 / 49% (60m).
+- *Training speed:* micro-batch 16 at 64M filled the 16 GB and Windows spilled into shared memory
+  (17% MFU). Micro-batch 8 + torch.compile: **~63% MFU, 63k tok/s, ~8 GB** (owner's agent's
+  benchmark: compile alone is ~2.5×). The ladder configs now use that, with `eval_windows = 640`.
+- *Bug (found by the owner's agent): the validation loss only measured FineWeb-Edu.* Eval took
+  windows from the start of the val split, and shards store documents source by source, so with
+  40 batches it read the first 7% = FineWeb-Edu only (3.90 reported vs 3.34 over the whole mix for
+  mix-20m). Now: windows spread evenly over the whole split, and shards record where each source
+  starts, so every eval also reports loss *per source*. `sleuth eval RUN` re-measures a finished run
+  (for the per-source split, re-shard: ~2 min). TinyStories numbers were unaffected (one source).
+- *Other fixes:* a STOP file (`runs/<run>/STOP`) and SIGTERM/Ctrl-Break also stop training with a
+  checkpoint (a Ctrl-C sent to a background process never arrived, losing ~460 steps); peak memory
+  in the training log; meta.json no longer records an absolute local path (the shard folder keeps a
+  copy of its tokenizer); `tokenizer` prints bytes/token; compile is skipped with a warning if
+  Triton is missing; `score --few-shot` (worked examples first, so a base model knows to answer
+  briefly).

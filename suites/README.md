@@ -35,3 +35,7 @@ different sizes trained on general data (the `mix-*` configs):
 A base model (no chat tuning) only *continues* text, so the questions use a
 "Q: ... A:" format it will have seen in web text. Watch "expected loss" fall as
 models grow: it moves long before exact matches start appearing.
+
+`knowledge/_fewshot.txt` holds a few worked "Q: ... A: ..." examples (none of them
+from the tests). `sleuth score --suite suites/knowledge --few-shot` puts them before
+every test, the classic way to tell a base model "answer briefly, like this".

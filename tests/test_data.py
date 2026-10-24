@@ -2,6 +2,7 @@ import json
 
 import numpy as np
 import pytest
+import torch
 
 from sleuth.forge.data.ingest import find_files, is_validation, iter_documents
 from sleuth.forge.data.loader import ShardDataset
@@ -125,3 +126,23 @@ def test_shard_reports_the_mix(tiny_data, tmp_path):
     meta = build_shards([tmp_path / "a", f"{tmp_path / 'b'}@1"], tiny_data["tokenizer"], tmp_path / "out",
                         val_fraction=0.0, log=lambda s: None)
     assert set(meta["category_bytes"]) == {"a", "b"} and meta["categories"]["a"] == 30
+
+
+def test_eval_windows_cover_every_source(tiny_data, tmp_path):
+    """Val windows are spread over the whole split and labelled by source (the first
+    version read only the start of the split: with a mix, only the first source)."""
+    for name, words in (("web", "the cat sat on the mat"), ("code", "def f(x): return x"), ("wiki", "Paris is in France")):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "d.jsonl").write_bytes(b"".join(
+            json.dumps({"text": f"{words} {i} " * 20}).encode() + b"\n" for i in range(200)))
+    out = tmp_path / "shards"
+    meta = build_shards([tmp_path / "web", tmp_path / "code", tmp_path / "wiki"], tiny_data["tokenizer"], out,
+                        val_fraction=0.3, log=lambda s: None)
+    assert [r["name"] for r in meta["split_sources"]["val"]] == ["web", "code", "wiki"]
+    assert meta["tokenizer"] == "tokenizer.json" and (out / "tokenizer.json").exists()  # no local path recorded
+    ds = ShardDataset(out, "val")
+    assert ds.tokenizer_path == out / "tokenizer.json"
+    w = ds.eval_windows(30, 16)
+    assert {src for _, _, src in w} == {"web", "code", "wiki"} and w == ds.eval_windows(30, 16)
+    for x, y, srcs in ds.window_batches(w, 8, 16):
+        assert x.shape[1] == 16 and torch.equal(x[:, 1:], y[:, :-1]) and len(srcs) == x.shape[0]

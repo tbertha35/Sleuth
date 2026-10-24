@@ -18,6 +18,7 @@ I/O compared with int32. Bigger vocabs automatically switch to uint32.
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from collections import deque
 import multiprocessing as mp
@@ -68,6 +69,8 @@ class _ShardWriter:
         self.n = 0
         self.starts: list[int] = []
         self.docs = 0
+        self.total = 0                     # tokens written to this split so far (all shards)
+        self.sources: list[dict] = []      # where each source's documents begin, in split-wide token offsets
 
     def _open(self):
         name = f"{self.split}_{len(self.shards):03d}.bin"
@@ -85,12 +88,17 @@ class _ShardWriter:
         self.shards[-1]["n_tokens"] = self.n
         self.shards[-1]["n_docs"] = len(self.starts)
 
-    def write(self, ids: np.ndarray):
+    def write(self, ids: np.ndarray, source: str | None = None):
         if self.fh is None:
             self._open()
+        if source is not None and (not self.sources or self.sources[-1]["name"] != source):
+            # Documents arrive input by input, so each source is one contiguous
+            # range. Recording the ranges lets evaluation report loss per source.
+            self.sources.append({"name": source, "start": self.total})
         self.starts.append(self.n)
         self.fh.write(ids.astype(self.dtype).tobytes())
         self.n += len(ids)
+        self.total += len(ids)
         self.docs += 1
         if self.n >= self.shard_tokens:
             self._close()
@@ -112,16 +120,17 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
     dtype = np.dtype(np.uint16 if tok.vocab_size <= 65536 else np.uint32)
     writers = {s: _ShardWriter(out, s, dtype, shard_tokens) for s in ("train", "val")}
     files = find_files(inputs)
+    shutil.copy(tokenizer_path, out / "tokenizer.json")
     log(f"sharding {len(files)} files -> {out} ({dtype.name}, val_fraction={val_fraction})")
 
     def batches(docs: Iterable[Document], size: int = 512):
-        """Yield (texts, is_val flags) batches, deciding the split up front."""
+        """Yield (texts, (is_val, source) flags) batches, deciding the split up front."""
         texts, flags = [], []
         for i, d in enumerate(docs):
             if max_docs is not None and i >= max_docs:
                 break
             texts.append(d.text)
-            flags.append(is_validation(d.text, val_fraction))
+            flags.append((is_validation(d.text, val_fraction), d.category))
             if len(texts) >= size:
                 yield texts, flags
                 texts, flags = [], []
@@ -169,15 +178,19 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
                 yield encoded, pending_flags.popleft()
 
     for bi, (encoded, flags) in enumerate(encoded_batches()):
-        for ids, is_val in zip(encoded, flags):
-            writers["val" if is_val else "train"].write(ids)
+        for ids, (is_val, source) in zip(encoded, flags):
+            writers["val" if is_val else "train"].write(ids, source)
         if bi % 200 == 0 and bi:
             log(f"  {total_bytes / 1e6:.0f} MB, {writers['train'].docs + writers['val'].docs:,} docs "
                 f"({time.time() - t0:.0f}s)")
 
     meta = {
         "version": META_VERSION,
-        "tokenizer": str(Path(tokenizer_path).resolve()),
+        # A copy of the tokenizer lives next to the shards, and meta.json names it
+        # relative to them: the folder is self-contained, can move, and doesn't
+        # record a local path (with a user name in it).
+        "tokenizer": "tokenizer.json",
+        "tokenizer_source": Path(tokenizer_path).name,
         "tokenizer_fingerprint": tok.fingerprint(),
         "vocab_size": tok.vocab_size,
         "dtype": dtype.name,
@@ -189,6 +202,7 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
         "category_bytes": cat_bytes,       # how much text each source contributed: the actual mix
         "val_fraction": val_fraction,
         "splits": {s: w.finish() for s, w in writers.items()},
+        "split_sources": {s: w.sources for s, w in writers.items()},
         "seconds": round(time.time() - t0, 1),
     }
     for s in meta["splits"]:

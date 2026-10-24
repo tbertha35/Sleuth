@@ -32,7 +32,8 @@ class TrainConfig:
     grad_clip: float = 1.0          # max global gradient norm (0 = off)
     log_every: int = 10
     eval_every: int = 250
-    eval_batches: int = 20
+    eval_batches: int = 20          # validation windows = eval_batches x micro_batch_size...
+    eval_windows: int = 0           # ...unless this is set: a fixed count, independent of the batch size
     snapshot_every: int = 500       # weight snapshots for the analyzer...
     snapshot_log_spaced: bool = True  # ...plus steps 0,1,2,4,8,... (early training changes fastest)
     snapshot_dtype: str = "bf16"    # "bf16" | "fp32"

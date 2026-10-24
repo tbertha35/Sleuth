@@ -133,8 +133,9 @@ def cmd_generate(a):
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
     if meta.get("kept_quantized"):
         where += f", {meta['kept_quantized']} layers kept quantized"
-    print(f"[{where}, {model.num_params() / 1e6:.2f}M params, {device}, {next(model.parameters()).dtype}]",
-          file=sys.stderr, flush=True)
+    dt = next(model.parameters()).dtype
+    shown = f"{dt} weights, bf16 autocast" if device.type == "cuda" and str(dt) == "torch.float32" else str(dt)
+    print(f"[{where}, {model.num_params() / 1e6:.2f}M params, {device}, {shown}]", file=sys.stderr, flush=True)
     # The first run of anything pays one-time setup (on GPU: loading kernels,
     # creating cuBLAS handles, the KV cache and sampling kernels; on CPU:
     # thread pools and buffers). A throwaway 2-token generation exercises the
@@ -246,6 +247,39 @@ def cmd_next(a):
     print(f"entropy of the distribution: {ent:.3f} nats")
 
 
+def cmd_eval(a):
+    """Validation loss of a finished run (our models), on evenly spread windows, per source."""
+    import contextlib
+
+    import torch
+
+    from .forge.data.loader import ShardDataset
+    from .forge.tokenizer.bpe import Tokenizer
+    from .forge.train.checkpoint import load_model
+    from .forge.train.trainer import evaluate, resolve_device
+
+    run = Path(a.run)
+    cfg = json.loads((run / "config.json").read_text())
+    shards = Path(a.shards or cfg["data"]["shards"])
+    device = resolve_device(a.device)
+    model, meta = load_model(run, step=a.step, device=device, nearest=True)
+    ds = ShardDataset(shards, "val")
+    tok = Tokenizer.load(run / "tokenizer.json")
+    if tok.fingerprint() != ds.meta["tokenizer_fingerprint"]:
+        raise SystemExit(f"{shards} was made with a different tokenizer than {run}")
+    seq_len = cfg["train"]["seq_len"]
+    byte_lens = torch.tensor(tok.token_byte_lengths() + [0] * (model.cfg.padded_vocab - tok.vocab_size), device=device)
+    autocast = ((lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if device.type == "cuda"
+                else contextlib.nullcontext)
+    ev = evaluate(model, ds, a.batch_size, seq_len, a.windows, byte_lens, device, autocast)
+    print(f"{run.name} step {meta['step']}: {a.windows} windows of {seq_len} tokens from {shards}")
+    print(f"val loss {ev['val_loss']:.4f} nats/token, {ev['val_bpb']:.4f} bits/byte")
+    for k, v in (ev.get("val_by_source") or {}).items():
+        print(f"  {k:14s} {v:.4f}")
+    if "val_by_source" not in ev:
+        print("  (no per-source breakdown: these shards predate it; re-run `sleuth shard` to get one)")
+
+
 def cmd_score(a):
     """Per-category loss / answer loss / exact match of one model on a suite."""
     from .analyzer.common import analysis_prefix, encode_cases, score_cases
@@ -256,10 +290,23 @@ def cmd_score(a):
     device = resolve_device(a.device)
     model, tok, meta = load_any(a.path, device=device, dtype=_dtype(a.dtype), step=a.step,
                                 keep_quantized=_keep_quantized(a.keep_quantized))
-    cases = [c for s in a.suite for c in load_suite(s)]
-    prefix = analysis_prefix(tok, a.chat) if a.chat else None
-    res = score_cases(model, encode_cases(tok, cases, model.cfg.max_seq_len, prefix),
-                      min(tok.vocab_size, model.cfg.padded_vocab), device)
+    enc = []
+    for suite in a.suite:
+        cases = load_suite(suite)
+        if a.chat:
+            prefix = analysis_prefix(tok, a.chat)
+        elif a.few_shot:
+            # A few worked examples before each question: a base model then
+            # knows the expected *format* (short answer, then stop), so the
+            # score reflects what it knows rather than its rambling habits.
+            f = Path(suite) / "_fewshot.txt"
+            if not f.exists():
+                raise SystemExit(f"--few-shot needs {f} (example questions and answers)")
+            prefix = [tok.start_id] + tok.encode(f.read_text(encoding="utf-8"))
+        else:
+            prefix = None
+        enc += encode_cases(tok, cases, model.cfg.max_seq_len, prefix)
+    res = score_cases(model, enc, min(tok.vocab_size, model.cfg.padded_vocab), device)
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
     print(f"{a.path} ({where}, {model.num_params() / 1e6:.1f}M params)")
     print(f"{'category':12s} {'tokens':>7s} {'loss':>7s} {'answer loss':>12s} {'exact':>7s}")
@@ -515,12 +562,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_chat_args(s)
     s.set_defaults(fn=cmd_next)
 
+    s = sub.add_parser("eval", help="validation loss of a trained run, overall and per data source")
+    s.add_argument("run", help="a Sleuth run directory")
+    s.add_argument("--shards", default=None, help="shard folder (default: the one the run trained on)")
+    s.add_argument("--step", type=int, default=None, help="which snapshot (default: latest)")
+    s.add_argument("--windows", type=int, default=640, help="number of val windows (spread over the whole split)")
+    s.add_argument("--batch-size", type=int, default=8)
+    s.add_argument("--device", default="auto")
+    s.set_defaults(fn=cmd_eval)
+
     s = sub.add_parser("score", help="a model's loss, answer loss and exact match on a test suite, per category")
     s.add_argument("path", help="a Sleuth run, a Hugging Face model folder, or a .gguf file")
     s.add_argument("--suite", action="append", required=True, help="suite directory (repeatable)")
     s.add_argument("--step", type=int, default=None, help="our runs: which snapshot (default: latest)")
     s.add_argument("--device", default="auto")
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    s.add_argument("--few-shot", action="store_true",
+                   help="put the suite's _fewshot.txt (worked examples) before every test")
     _add_keep_quantized(s)
     _add_chat_suite_arg(s)
     s.set_defaults(fn=cmd_score)

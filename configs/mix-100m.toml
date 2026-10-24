@@ -1,9 +1,9 @@
 # Scaling ladder, rung 3: GPT-2-small-like, d=768, 12 layers: ~101M parameters
 # (76M non-embedding). Same data, tokenizer and context as mix-20m / mix-60m.
 #
-# 12000 steps x 8 x 1024 x 16 = 1.57B tokens (~16 per parameter). Estimated ~20 h on the
-# RTX 5060 Ti (a weekend; resumable), or a natural first job for a GX10.
-# micro_batch_size 8 keeps the 32k-vocab logits and activations inside 16 GB.
+# 12000 steps x 8 x 1024 x 16 = 1.57B tokens (~16 per parameter). With torch.compile at
+# the ~60% MFU mix-60m reached, ~37k tok/s: about 12 h on the RTX 5060 Ti (overnight;
+# resumable). Stop cleanly with Ctrl-C or by creating runs/<run-id>/STOP.
 #
 #   python -m sleuth train configs/mix-100m.toml
 name = "mix-100m"
@@ -35,6 +35,8 @@ grad_clip = 1.0
 log_every = 25
 eval_every = 250
 eval_batches = 40
+eval_windows = 640      # val windows spread over the whole split (same set for every rung)
+compile = true          # torch.compile (needs Triton; on Windows: pip install -e .[triton]): ~2.5x faster here
 snapshot_every = 500
 resume_every = 500
 peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.
