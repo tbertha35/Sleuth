@@ -107,38 +107,39 @@ def cmd_generate(a):
 
     from .forge.infer.generate import generate
     from .forge.infer.sampling import SamplingConfig
-    from .forge.tokenizer.bpe import Tokenizer
-    from .forge.train.checkpoint import load_model, resolve_weights
     from .forge.train.trainer import resolve_device
+    from .models import load_any
 
     device = resolve_device(a.device)
-    model, meta = load_model(a.path, step=a.step, device=device)
-    weights = resolve_weights(a.path, a.step)
-    tok_path = a.tokenizer or next((p / "tokenizer.json" for p in weights.parents if (p / "tokenizer.json").exists()), None)
-    if tok_path is None:
-        sys.exit("couldn't find tokenizer.json next to the checkpoint; pass --tokenizer")
-    tok = Tokenizer.load(tok_path)
+    model, tok, meta = load_any(a.path, device=device, dtype=_dtype(a.dtype), step=a.step)
+    if a.tokenizer:
+        from .forge.tokenizer.bpe import Tokenizer
+
+        tok = Tokenizer.load(a.tokenizer)
     sampling = SamplingConfig(a.temperature, a.top_k, a.top_p, a.min_p, a.repetition_penalty)
-    print(f"[step {meta['step']}, {model.num_params() / 1e6:.2f}M params, {device}]", file=sys.stderr, flush=True)
+    where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
+    print(f"[{where}, {model.num_params() / 1e6:.2f}M params, {device}, {next(model.parameters()).dtype}]",
+          file=sys.stderr, flush=True)
     # The first forward pass pays one-time setup (on GPU: loading kernels and
     # creating cuBLAS handles; on CPU: allocating thread pools and buffers).
     # Do it now so it doesn't distort the first sample's speed reading.
     with torch.no_grad():
-        model(torch.tensor([[tok.bos_id] * 8], device=device))
+        model(torch.tensor([[tok.start_id] * 8], device=device))
     if device.type == "cuda":
         torch.cuda.synchronize()
+    stops = _stop_ids(tok)
     for i in range(a.samples):
-        prompt_ids = [tok.bos_id] + tok.encode(a.prompt)
+        prompt_ids = [tok.start_id] + tok.encode(a.prompt)
         print(a.prompt, end="", flush=True)
         # One token can end in the middle of a multi-byte character; the
         # incremental decoder holds those bytes until the character is complete.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         def on_token(t):
-            if t != tok.eos_id:
+            if t not in stops:
                 print(decoder.decode(tok.decode_bytes([t])), end="", flush=True)
 
-        res = generate(model, prompt_ids, a.max_new_tokens, sampling, stop_ids={tok.eos_id},
+        res = generate(model, prompt_ids, a.max_new_tokens, sampling, stop_ids=stops,
                        vocab_limit=tok.vocab_size, seed=None if a.seed is None else a.seed + i,
                        on_token=on_token)
         print(decoder.decode(b"", final=True), flush=True)
@@ -148,11 +149,64 @@ def cmd_generate(a):
             print("-" * 40, flush=True)
 
 
-def cmd_analyze(a):
-    from .analyzer.timeline import run_timeline
-    from .forge.train.trainer import resolve_device
+def _dtype(name: str | None):
+    import torch
 
-    run_timeline(a.run, a.suite, device=str(resolve_device(a.device)), k=a.k, force=a.force)
+    return {None: None, "auto": None, "fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[name]
+
+
+def _stop_ids(tok) -> set[int]:
+    """End-of-text and end-of-turn tokens: generation stops at any of them."""
+    stops = {tok.eos_id} - {None}
+    for name in ("<|eos|>", "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "<|end|>"):
+        if name in tok.special_tokens:
+            stops.add(tok.special_tokens[name])
+    return stops
+
+
+def cmd_compare(a):
+    from .analyzer.compare import compare_models, format_report
+    from .analyzer.suites import load_suite
+    from .forge.train.trainer import resolve_device
+    from .models import load_any
+
+    device = resolve_device(a.device)
+    dtype = _dtype(a.dtype)
+    cases = [c for s in (a.suite or ["suites/stories", "suites/basic"]) for c in load_suite(s)]
+
+    def loader(path):
+        def load():
+            model, tok, _ = load_any(path, device=device, dtype=dtype)
+            return model, tok
+        return load
+
+    result = compare_models(loader(a.a), loader(a.b), cases, device=device)
+    print(format_report(result, a.a, a.b))
+
+
+def cmd_inspect(a):
+    from .models import describe_file
+
+    print(describe_file(a.path, max_groups=a.max_groups))
+
+
+def cmd_analyze(a):
+    from .analyzer.timeline import prepare_external_run, run_timeline
+    from .forge.train.trainer import resolve_device
+    from .models import detect
+
+    device = str(resolve_device(a.device))
+    run = a.run
+    if detect(run) != "sleuth" or not Path(run).is_dir():
+        # An external model (Hugging Face folder or .gguf): analysis results go
+        # into a small run folder of their own, so the dashboard lists them.
+        run = prepare_external_run(run, name=a.name, dtype=_dtype(a.dtype), device=device)
+        print(f"results for this external model go to {run}")
+    views = [v.strip() for v in a.views.split(",")] if a.views else None
+    steps = [int(s) for s in a.steps.split(",")] if a.steps else None
+    options = {"neuron_stats": {"k": a.k}, "ablation": {"method": a.ablation}}
+    for suite in a.suite or ["suites/basic"]:
+        run_timeline(run, suite, device=device, views=views, force=a.force, steps=steps, options=options)
 
 
 def cmd_ui(a):
@@ -257,7 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_info)
 
     s = sub.add_parser("generate", help="generate text from a run or snapshot")
-    s.add_argument("path", help="run dir, snapshot dir, or model.safetensors")
+    s.add_argument("path", help="a Sleuth run/snapshot, a Hugging Face model folder, or a .gguf file")
+    s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
     s.add_argument("--prompt", default="")
     s.add_argument("--step", type=int, default=None, help="which snapshot (default: latest)")
     s.add_argument("--max-new-tokens", type=int, default=200)
@@ -272,13 +327,35 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tokenizer", default=None)
     s.set_defaults(fn=cmd_generate)
 
-    s = sub.add_parser("analyze", help="run the neuron-stats view over every checkpoint of a run")
-    s.add_argument("run")
-    s.add_argument("--suite", default="suites/basic")
+    s = sub.add_parser("analyze", help="run analyzer views over every checkpoint of a run")
+    s.add_argument("run", help="a Sleuth run, a Hugging Face model folder, or a .gguf file")
+    s.add_argument("--suite", action="append", default=None,
+                   help="test suite directory (repeatable; default suites/basic). "
+                        "For TinyStories models also try suites/stories")
+    s.add_argument("--views", default=None,
+                   help="comma-separated: neuron_stats,attention,logit_lens,ablation (default: all)")
+    s.add_argument("--steps", default=None, help="only these checkpoints, e.g. 0,500,5000 (default: all)")
     s.add_argument("--device", default="auto")
-    s.add_argument("--k", type=float, default=1.0, help="firing threshold, in units of the layer's RMS")
+    s.add_argument("--k", type=float, default=1.0, help="neuron firing threshold, in units of the layer's RMS")
+    s.add_argument("--ablation", choices=["mean", "zero"], default="mean", help="how ablated parts are replaced")
     s.add_argument("--force", action="store_true", help="redo checkpoints that were already analyzed")
+    s.add_argument("--name", default=None, help="external models: name of the results folder under runs/")
+    s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto",
+                   help="external models: weight precision (auto = bf16 on GPU, fp32 on CPU)")
     s.set_defaults(fn=cmd_analyze)
+
+    s = sub.add_parser("compare", help="do two models (same tokenizer) predict the same next tokens?")
+    s.add_argument("a", help="model A (Sleuth run, Hugging Face folder, or .gguf)")
+    s.add_argument("b", help="model B")
+    s.add_argument("--suite", action="append", default=None, help="default: suites/stories + suites/basic")
+    s.add_argument("--device", default="auto")
+    s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    s.set_defaults(fn=cmd_compare)
+
+    s = sub.add_parser("inspect", help="show what's inside a .gguf file or Hugging Face model folder")
+    s.add_argument("path")
+    s.add_argument("--max-groups", type=int, default=80, help="how many tensor groups to list")
+    s.set_defaults(fn=cmd_inspect)
 
     s = sub.add_parser("ui", help="serve the local dashboard")
     s.add_argument("--runs", default=None, help="runs directory (default: $SLEUTH_RUNS or ./runs)")

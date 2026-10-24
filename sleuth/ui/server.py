@@ -129,12 +129,23 @@ class Api:
         if summary is None:
             raise ApiError(HTTPStatus.NOT_FOUND, f"no analysis for {step_dir}")
         arrays = {}
-        if (d / "neurons.npz").exists():
-            with np.load(d / "neurons.npz") as z:
-                for k in ("fire_rate", "fire_rate_by_category", "mean_abs"):
-                    if k in z:
-                        arrays[k] = np.round(z[k].astype(np.float64), 4).tolist()
+        npz = d / "arrays.npz" if (d / "arrays.npz").exists() else d / "neurons.npz"  # older runs: neurons.npz
+        if npz.exists():
+            with np.load(npz) as z:
+                for k in z.files:
+                    arrays[k] = _to_json_array(z[k])
         return {"summary": summary, "arrays": arrays}
+
+
+def _to_json_array(a: np.ndarray):
+    """Rounded nested lists; NaN (e.g. "no answers in this category") becomes
+    null, because JSON has no NaN and the browser's parser would reject it."""
+    a = np.round(a.astype(np.float64), 4)
+    if not np.isnan(a).any():
+        return a.tolist()
+    obj = a.astype(object)
+    obj[np.isnan(a)] = None
+    return obj.tolist()
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -37,3 +37,4 @@ sleuth.local.toml
 .idea/
 *.swp
 .DS_Store
+*.bundle

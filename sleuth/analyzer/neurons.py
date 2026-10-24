@@ -35,24 +35,14 @@ The <|bos|> position is excluded: models use the first token as an
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 import torch
 
 from ..forge.model.taps import listen
+from .common import encode_cases, layer_of, series
 from .suites import TestCase
 
 LOW, HIGH, SELECTIVE_MIN_RATE, SELECTIVITY = 0.01, 0.5, 0.05, 0.5
-
-
-def _encode_cases(tokenizer, cases: list[TestCase], max_len: int) -> list[tuple[str, torch.Tensor]]:
-    out = []
-    for c in cases:
-        ids = [tokenizer.bos_id] + tokenizer.encode(c.text)
-        out.append((c.category, torch.tensor([ids[:max_len]])))
-    return out
 
 
 @torch.no_grad()
@@ -62,15 +52,12 @@ def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device
     L = model.cfg.n_layers
     H = model.cfg.hidden
     cats = sorted({c.category for c in cases})
-    inputs = _encode_cases(tokenizer, cases, model.cfg.max_seq_len)
+    inputs = [(e.category, e.ids) for e in encode_cases(tokenizer, cases, model.cfg.max_seq_len)]
 
     # ---- pass 1: per-layer RMS of the MLP activations, plus residual-stream sizes
     sq_sum = torch.zeros(L, dtype=torch.float64)
     n_tok = 0
     comp = {name: torch.zeros(L, dtype=torch.float64) for name in ("attn_out", "mlp_out", "resid_post")}
-
-    def layer_of(name: str) -> int:
-        return int(name.split(".")[1])
 
     def p1_act(name, t):
         sq_sum[layer_of(name)] += t[0, 1:].double().pow(2).mean(-1).sum().cpu()
@@ -158,8 +145,32 @@ def neuron_stats(model, tokenizer, cases: list[TestCase], k: float = 1.0, device
     return {"summary": summary, "arrays": arrays}
 
 
-def save_result(result: dict, out_dir: Path, extra: dict | None = None) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    summary = {**result["summary"], **(extra or {})}
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
-    np.savez_compressed(out_dir / "neurons.npz", **result["arrays"])
+def run(model, tokenizer, cases, device, k: float = 1.0, **_) -> dict:
+    """View interface (see analyzer/views.py)."""
+    return neuron_stats(model, tokenizer, cases, k=k, device=device)
+
+
+_HELP = {
+    "frac_selective": ("Category-selective neurons", "Share of neurons whose firing concentrates in one test "
+                       "category. Rising = neurons specializing.", "pct"),
+    "fire_rate_mean": ("Mean firing rate", "Average fraction of tokens on which a neuron fires "
+                       "(|activation| above its layer's RMS).", "pct"),
+    "frac_low_activity": ("Nearly-dead neurons", "Share of neurons firing on fewer than 1% of tokens.", "pct"),
+    "frac_high_activity": ("Always-on neurons", "Share of neurons firing on more than half of all tokens.", "pct"),
+    "act_rms": ("MLP activation size (RMS)", "Typical magnitude of each layer's MLP hidden activations.", "num"),
+    "mlp_out_rms": ("MLP output size", "How much each layer's MLP writes into the residual stream.", "num"),
+    "attn_out_rms": ("Attention output size", "How much each layer's attention writes into the residual stream.",
+                     "num"),
+    "resid_rms": ("Residual stream size", "Magnitude of the residual stream after each layer.", "num"),
+}
+
+
+def timeline_series(summary: dict) -> dict:
+    rows = [f"L{lay['layer']}" for lay in summary["layers"]]
+    out = {k: series(label, help, rows, [lay[k] for lay in summary["layers"]], fmt)
+           for k, (label, help, fmt) in _HELP.items()}
+    for c in summary["categories"]:
+        out[f"cat:{c}"] = series(f"Firing rate on “{c}” tests", "Average firing rate of each layer's neurons, on "
+                                 "this category's tests only.", rows,
+                                 [lay["fire_rate_by_category"][c] for lay in summary["layers"]], "pct")
+    return out

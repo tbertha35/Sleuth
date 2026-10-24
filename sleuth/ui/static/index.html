@@ -13,6 +13,7 @@
     <div class="filters" role="toolbar" aria-label="Filters">
       <label>Run <select id="run-select"></select></label>
       <label>Suite <select id="suite-select"></select></label>
+      <label>Checkpoint <select id="ckpt-select"></select></label>
       <button id="refresh" type="button" title="Reload data">Refresh</button>
       <button id="theme" type="button" title="Toggle light/dark">Theme</button>
     </div>
@@ -23,7 +24,7 @@
 
     <section class="tiles" id="tiles" aria-label="Run summary"></section>
 
-    <section class="card">
+    <section class="card" id="training-card">
       <div class="card-head">
         <h2>Training</h2>
         <p class="hint">Loss in nats per token. Validation is measured on held-out text; a gap that grows means overfitting.</p>
@@ -31,9 +32,11 @@
       <div class="chart" id="loss-chart"></div>
     </section>
 
-    <section class="card">
+    <nav class="tabs" role="tablist" aria-label="Analyzer views" id="tabs"></nav>
+
+    <section class="card" id="timeline-card">
       <div class="card-head">
-        <h2>Neuron activity across checkpoints</h2>
+        <h2 id="timeline-title">Across checkpoints</h2>
         <div class="controls">
           <label>Metric <select id="metric-select"></select></label>
           <label><input type="checkbox" id="logx" checked> log-scale steps</label>
@@ -41,27 +44,12 @@
       </div>
       <p class="hint" id="metric-help"></p>
       <div class="two-col">
-        <div><h3>One line per layer</h3><div class="chart" id="timeline-chart"></div></div>
-        <div><h3>Layer × checkpoint</h3><div class="chart" id="timeline-heat"></div></div>
+        <div><h3 id="lines-title">One line per layer</h3><div class="chart" id="timeline-chart"></div></div>
+        <div><h3>Row × checkpoint</h3><div class="chart" id="timeline-heat"></div></div>
       </div>
     </section>
 
-    <section class="card">
-      <div class="card-head">
-        <h2>Neurons at one checkpoint</h2>
-        <div class="controls">
-          <label>Checkpoint <select id="ckpt-select"></select></label>
-          <label>Category <select id="cat-select"></select></label>
-          <label><input type="checkbox" id="sort-neurons" checked> sort neurons by rate</label>
-        </div>
-      </div>
-      <p class="hint">Firing rate = fraction of tokens on which |activation| exceeds that layer's RMS. Each row is a layer; each column a neuron.</p>
-      <div class="chart tall" id="neuron-heat"></div>
-      <details>
-        <summary>Table view</summary>
-        <div class="table-wrap"><table id="layer-table"></table></div>
-      </details>
-    </section>
+    <section class="card" id="detail"></section>
   </main>
   <div id="tooltip" class="tooltip" hidden></div>
 </body>
