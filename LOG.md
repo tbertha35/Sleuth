@@ -266,3 +266,31 @@ small Qwen first (simplest architecture, both formats available), then Gemma.
 Proposed validation on real weights: Qwen3-0.6B as official safetensors vs. ggml-org's Q8_0
 GGUF vs. a Q4_K_M GGUF, using `sleuth compare`. Same model in three formats, so any
 disagreement beyond quantization noise points at our loader or dequantizer.
+
+**2026-10-24: First TinyStories model (RTX 5060 Ti, Windows).** `configs/tinystories-10m.toml`:
+12.59M params (9.44M non-embedding), vocab 8192, 6000 steps × 64 × 512 = 197M tokens in ~25 min.
+- Data: TinyStoriesV2-GPT4 → 531M train / 2.7M val tokens at 4.14 bytes/token (shards built in 41 s).
+  The run used 37% of one epoch, so no data was repeated.
+- Speed: 125–137k tok/s, **~26% MFU** against the re-measured bf16 peak (44.75 TFLOP/s).
+- Validation, at steps 250 / 500 / 1000 / 2000 / 3000 / 4000 / 5000 / 6000:
+  - loss 2.52 / 2.05 / 1.80 / 1.62 / 1.52 / 1.45 / 1.41 / **1.385** nats
+  - bits/byte 0.879 / 0.716 / 0.627 / 0.564 / 0.531 / 0.507 / 0.491 / **0.483**
+- It **never overfit**: val loss fell at every check, and train loss (~1.37) stayed level
+  with val at the end. Still improving at step 6000, so a longer run (or a bigger model)
+  would get lower. That's a natural first LAB baseline.
+- Samples at 6000: grammatical, with dialogue, stable character names ("Tim … Tim"), story arcs
+  and morals. Logic slips remain ("tied the string to the string", "joy and joy").
+  At step 256 it's grammatical but loops on a word ("the fish … the fish … a big fish").
+  Asked "what does 5 + 10 equal", it tells a story about the park: TinyStories contains
+  no arithmetic, so it has never seen any. A good reminder that a model's abilities are bounded by its data.
+- Re-run probe (GPU only): bf16 44.75, fp16 42.8, fp8 e4m3 90.0, nvfp4 **334** TFLOP/s;
+  memory copy 351 GB/s; host→GPU 14.1 GB/s. That's 3–10% above the first probe (the first was
+  probably sharing the GPU with something). The MFU baseline in the config is now 44.75.
+- Fixed after this run: `--step` now falls back to the nearest snapshot (log-spaced
+  snapshots meant step 250 didn't exist; it uses 256 and says so). The first sample's
+  prompt still ran slowly (~30 tok/s vs. 300+ later) despite the warm-up: the warm-up ran
+  only a forward pass and left sampling and KV-cache setup cold. It's now a throwaway
+  2-token generation. Prompt speed is reported in milliseconds, since "tokens/s" over a
+  5-token prompt is mostly noise.
+- Still slow, as expected: decode ~90 tok/s at batch 1 (per-token overhead, see the
+  inference backlog in PLAN §4.5.1).

@@ -103,8 +103,6 @@ def cmd_info(a):
 def cmd_generate(a):
     import codecs
 
-    import torch
-
     from .forge.infer.generate import generate
     from .forge.infer.sampling import SamplingConfig
     from .forge.train.trainer import resolve_device
@@ -117,16 +115,17 @@ def cmd_generate(a):
 
         tok = Tokenizer.load(a.tokenizer)
     sampling = SamplingConfig(a.temperature, a.top_k, a.top_p, a.min_p, a.repetition_penalty)
+    if a.step is not None and meta.get("step") is not None and int(meta["step"]) != a.step:
+        print(f"(no snapshot at step {a.step}; using the nearest one, step {meta['step']})", file=sys.stderr)
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
     print(f"[{where}, {model.num_params() / 1e6:.2f}M params, {device}, {next(model.parameters()).dtype}]",
           file=sys.stderr, flush=True)
-    # The first forward pass pays one-time setup (on GPU: loading kernels and
-    # creating cuBLAS handles; on CPU: allocating thread pools and buffers).
-    # Do it now so it doesn't distort the first sample's speed reading.
-    with torch.no_grad():
-        model(torch.tensor([[tok.start_id] * 8], device=device))
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    # The first run of anything pays one-time setup (on GPU: loading kernels,
+    # creating cuBLAS handles, the KV cache and sampling kernels; on CPU:
+    # thread pools and buffers). A throwaway 2-token generation exercises the
+    # whole path, so the first real sample's speed reading isn't distorted.
+    # (Warming up only the forward pass, as before, left the sampling path cold.)
+    generate(model, [tok.start_id] * 8, 2, sampling, seed=0)
     stops = _stop_ids(tok)
     for i in range(a.samples):
         prompt_ids = [tok.start_id] + tok.encode(a.prompt)
@@ -143,8 +142,8 @@ def cmd_generate(a):
                        vocab_limit=tok.vocab_size, seed=None if a.seed is None else a.seed + i,
                        on_token=on_token)
         print(decoder.decode(b"", final=True), flush=True)
-        print(f"[{len(res.new_ids)} tokens, stop: {res.stop_reason}, prefill {res.prefill_tok_per_s:,.0f} tok/s, "
-              f"decode {res.decode_tok_per_s:,.0f} tok/s]", file=sys.stderr, flush=True)
+        print(f"[{len(res.new_ids)} tokens, stop: {res.stop_reason}, prompt {len(prompt_ids)} tokens in "
+              f"{res.prefill_seconds * 1000:.0f} ms, decode {res.decode_tok_per_s:,.0f} tok/s]", file=sys.stderr, flush=True)
         if i + 1 < a.samples:
             print("-" * 40, flush=True)
 

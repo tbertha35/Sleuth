@@ -49,8 +49,8 @@ def load_any(path: str | Path, device: str | torch.device = "cpu", dtype: torch.
         from .forge.tokenizer.bpe import Tokenizer
         from .forge.train.checkpoint import load_model, resolve_weights
 
-        weights = resolve_weights(path, step)
-        model, meta = load_model(path, step=step, device=device, dtype=dtype or torch.float32)
+        weights = resolve_weights(path, step, nearest=True)
+        model, meta = load_model(path, step=step, device=device, dtype=dtype or torch.float32, nearest=True)
         tok_path = next((d / "tokenizer.json" for d in weights.parents if (d / "tokenizer.json").exists()), None)
         if tok_path is None:
             raise FileNotFoundError("couldn't find tokenizer.json next to the checkpoint")

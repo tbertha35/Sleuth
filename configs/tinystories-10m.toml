@@ -37,4 +37,4 @@ eval_every = 250
 eval_batches = 40
 snapshot_every = 500
 resume_every = 500
-peak_tflops = 42.0      # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.
+peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak (second probe); enables the MFU column. Change per machine.

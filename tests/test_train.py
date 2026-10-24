@@ -68,3 +68,13 @@ def test_resume_is_exact(tiny_data, tmp_path):
     # The metrics log continues rather than restarting.
     steps = [json.loads(line)["step"] for line in (run / "metrics.jsonl").read_text().splitlines()]
     assert steps == sorted(steps) and steps[-1] == 6
+
+
+def test_nearest_snapshot(tiny_data, tmp_path):
+    from sleuth.forge.train.checkpoint import resolve_weights
+
+    run = train(tiny_run_config(tiny_data, tmp_path), log=quiet)  # snapshots 0,1,2,3,4,6
+    with pytest.raises(FileNotFoundError):
+        resolve_weights(run, 5)
+    assert resolve_weights(run, 5, nearest=True).parent.name == "step_0000004"  # ties go to the earlier step
+    assert resolve_weights(run, 100, nearest=True).parent.name == "step_0000006"
