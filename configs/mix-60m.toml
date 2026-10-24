@@ -1,8 +1,10 @@
 # Scaling ladder, rung 2: d=640, 10 layers: ~64M parameters (43M non-embedding).
 # Same data, tokenizer and context as mix-20m / mix-100m.
 #
-# 7600 steps x 16 x 1024 x 8 = 1.0B tokens (~16 per parameter). Estimated ~9 h on the
-# RTX 5060 Ti: an overnight run. Ctrl-C saves a checkpoint; continue with
+# 7600 steps x 8 x 1024 x 16 = 1.0B tokens (~16 per parameter). Measured on the RTX 5060 Ti
+# (2026-10-24): micro-batch 16 without compile filled the 16 GB and spilled into shared
+# memory (17% MFU); micro-batch 8 + torch.compile ran at ~63% MFU, 63k tok/s, ~8 GB:
+# about 4.5 h. To stop: Ctrl-C, or create the file runs/<run-id>/STOP; continue with
 # `python -m sleuth train --resume runs/<run-id>`.
 #
 #   python -m sleuth train configs/mix-60m.toml
@@ -20,8 +22,8 @@ n_kv_heads = 2
 max_seq_len = 1024
 
 [train]
-micro_batch_size = 16
-grad_accum = 8
+micro_batch_size = 8
+grad_accum = 16
 max_steps = 7600
 lr = 6e-4
 warmup_steps = 400
@@ -35,6 +37,8 @@ grad_clip = 1.0
 log_every = 25
 eval_every = 250
 eval_batches = 40
+eval_windows = 640      # val windows spread over the whole split (same set for every rung)
+compile = true          # torch.compile (needs Triton; on Windows: pip install -e .[triton]): ~2.5x faster here
 snapshot_every = 500
 resume_every = 500
 peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.

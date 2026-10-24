@@ -16,6 +16,12 @@ How the kernel works (y = x @ Wᵀ, x: [M, K] activations, W: [N, K] in blocks):
   * the rounding matches the plain path exactly: (q - 8)·d is computed in
     fp32 and rounded once to bf16, as dequantize() does
 
+For 1-4 rows of x (decoding a token at a time) a second kernel is used:
+tensor cores need 16 rows, so the dot-product kernel wasted most of its work,
+and it reloaded each block's scale for every weight. The few-row kernel
+handles whole 32-value blocks (one scale load, 16 contiguous bytes) and sums
+in fp32 without rounding the weights to bf16 first (a tiny bit *more* precise).
+
 Triton is optional. It ships with PyTorch on Linux; on Windows it's the
 `triton-windows` package (owner-approved 2026-10-24). Without it, or if the
 self-check below fails, QuantLinear silently uses the plain path. Set the
@@ -87,6 +93,51 @@ if triton is not None:
         tl.store(y, acc.to(y_ptr.dtype.element_ty), mask=m_ok[:, None] & n_ok[None, :])
 
 
+    @triton.jit
+    def _qgemv_kernel(x_ptr, w_ptr, y_ptr, N, K, stride_xm, stride_ym, row_bytes,
+                      QTYPE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCKS: tl.constexpr):
+        """Few-row version (decoding: one token at a time). Program (pid_n, m)
+        computes BLOCK_N outputs of row m. Works block-structured: each 32-value
+        block's scale is loaded once, and its bytes as one contiguous run, then
+        everything is multiplied and summed in fp32 (no tensor cores: with one
+        row of x there is nothing for them to do; memory speed is the limit)."""
+        pid_n = tl.program_id(0)
+        m = tl.program_id(1)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_ok = rn < N
+        row = rn.to(tl.int64) * row_bytes
+        n_blocks = K // 32
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        i16 = tl.arange(0, 16)
+        for b0 in range(0, n_blocks, BLOCKS):
+            b = b0 + tl.arange(0, BLOCKS)
+            b_ok = b < n_blocks
+            ok2 = n_ok[:, None] & b_ok[None, :]                                 # [BN, BB]
+            xrow = x_ptr + m * stride_xm + (b * 32)[:, None] + i16[None, :]     # [BB, 16]
+            x_lo = tl.load(xrow, mask=b_ok[:, None], other=0.0).to(tl.float32)        # values 0..15 of each block
+            x_hi = tl.load(xrow + 16, mask=b_ok[:, None], other=0.0).to(tl.float32)   # values 16..31
+            if QTYPE == 0:
+                base = w_ptr + row[:, None] + (b * 18)[None, :]                 # Q4_0: [d: f16][16 bytes]
+                qs = tl.load(base[:, :, None] + 2 + i16[None, None, :], mask=ok2[:, :, None], other=0).to(tl.int32)
+                lo = (qs & 0xF).to(tl.float32) - 8.0                            # value j (j < 16): low nibble
+                hi = (qs >> 4).to(tl.float32) - 8.0                             # value j + 16: high nibble
+            else:
+                base = w_ptr + row[:, None] + (b * 34)[None, :]                 # Q8_0: [d: f16][32 x int8]
+                lo = tl.load(base[:, :, None] + 2 + i16[None, None, :], mask=ok2[:, :, None],
+                             other=0).to(tl.int8, bitcast=True).to(tl.float32)
+                hi = tl.load(base[:, :, None] + 18 + i16[None, None, :], mask=ok2[:, :, None],
+                             other=0).to(tl.int8, bitcast=True).to(tl.float32)
+            d_lo = tl.load(base, mask=ok2, other=0).to(tl.uint16)
+            d_hi = tl.load(base + 1, mask=ok2, other=0).to(tl.uint16)
+            d = (d_lo | (d_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)      # [BN, BB]
+            dot = tl.sum(lo * x_lo[None, :, :] + hi * x_hi[None, :, :], axis=2)       # [BN, BB]
+            acc += tl.sum(dot * d, axis=1)
+        tl.store(y_ptr + m * stride_ym + rn, acc.to(y_ptr.dtype.element_ty), mask=n_ok)
+
+
+GEMV_MAX_ROWS = 4  # up to this many rows of x (tokens), the few-row kernel is used
+
+
 def qmatmul(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, out_features: int) -> torch.Tensor:
     """x [..., K] @ Wᵀ, where W [out_features, K] is stored as GGUF blocks in `raw` (uint8)."""
     code, nb = SUPPORTED[ggml_type]
@@ -94,6 +145,11 @@ def qmatmul(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, out_features: in
     x2 = x.reshape(-1, K).contiguous()
     M, N = x2.shape[0], out_features
     y = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    if M <= GEMV_MAX_ROWS:
+        block_n, blocks = 16, 8
+        _qgemv_kernel[(triton.cdiv(N, block_n), M)](x2, raw, y, N, K, x2.stride(0), y.stride(0), K // 32 * nb,
+                                                    QTYPE=code, BLOCK_N=block_n, BLOCKS=blocks)
+        return y.reshape(*x.shape[:-1], N)
     block_m = 16 if M <= 16 else 64        # decoding (M = 1) wastes some tensor-core rows; memory is the limit
     block_n, block_k = 64, 64
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
@@ -128,11 +184,14 @@ def _self_check(device, ggml_type, dtype) -> bool:
         g = torch.Generator().manual_seed(0)
         w = torch.randn(96, 160, generator=g) * 0.05
         raw = q.quantize(w, ggml_type).to(device)
-        x = (torch.randn(3, 160, generator=g)).to(device, dtype)
+        x = (torch.randn(3, 160, generator=g)).to(device, dtype)            # 3 rows: the few-row kernel
         ref = x.float() @ q.dequantize(raw, ggml_type, w.numel(), dtype).float().reshape(96, 160).T
-        got = qmatmul(x, raw, ggml_type, 96).float()
         tol = 1e-4 if dtype == torch.float32 else 2e-2
-        ok = bool(torch.allclose(got, ref, atol=tol * ref.abs().max().item(), rtol=tol))
+        ok = True
+        for xs in (x, x.repeat(8, 1)):                                       # 24 rows: the tensor-core kernel
+            r = ref if xs is x else ref.repeat(8, 1)
+            got = qmatmul(xs, raw, ggml_type, 96).float()
+            ok &= bool(torch.allclose(got, r, atol=tol * r.abs().max().item(), rtol=tol))
         if not ok:
             warnings.warn(f"Triton {q.TYPE_NAMES[ggml_type]} kernel gave wrong results on {device}; "
                           f"using the plain (slower) path", stacklevel=3)

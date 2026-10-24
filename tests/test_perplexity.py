@@ -71,3 +71,8 @@ def test_score_command(gemma, capsys):
     out = capsys.readouterr().out
     for cat in ("facts", "sports", "math", "python", "overall"):
         assert cat in out
+
+
+def test_score_few_shot(gemma, capsys):
+    assert main(["score", str(gemma), "--suite", "suites/knowledge", "--few-shot", "--dtype", "fp32"]) == 0
+    assert "overall" in capsys.readouterr().out
