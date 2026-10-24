@@ -478,7 +478,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
 | **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |
-| M5 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model | any GPU |
+| **M5** 🔶 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model. *Done: HF + GGUF loading for llama/qwen2/qwen3, export to HF format, `inspect`/`compare`. Next: Gemma adapter, quantized-in-VRAM layers, SentencePiece tokenizers.* | any GPU |
 | M6 | LAB harness | experiment runner, noise floor, compare report, synthetic tasks, μP | GB10 |
 | M7 | Engram | module + GPU tier → host tier → NVMe tier with prefetch; quality-vs-table-size and throughput-per-tier results | 5060 Ti + GB10 |
 | M8 | MoE | MoE layers, routing analysis, MoE vs dense vs Engram | GB10 |

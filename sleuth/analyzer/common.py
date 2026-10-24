@@ -1,7 +1,9 @@
 """Shared helpers for analyzer views: encoding tests and scoring a model on them.
 
 Every test case becomes   [<|bos|>] + prompt tokens + expected tokens
-and we remember where the expected part starts. Prompt and expected text are
+and we remember where the expected part starts. (Models without a BOS token,
+like Qwen, get their end-of-text token there instead, which is what they saw
+between documents in training: `tokenizer.start_id`.) Prompt and expected text are
 encoded separately so we know exactly which tokens are "the answer" (encoding
 them together could merge a token across the boundary).
 
@@ -44,7 +46,7 @@ class EncodedCase:
 def encode_cases(tokenizer, cases: list[TestCase], max_len: int) -> list[EncodedCase]:
     out = []
     for c in cases:
-        prompt = [tokenizer.bos_id] + tokenizer.encode(c.prompt)
+        prompt = [tokenizer.start_id] + tokenizer.encode(c.prompt)
         answer = tokenizer.encode(c.expected) if c.expected else []
         ids = (prompt + answer)[:max_len]
         out.append(EncodedCase(c, torch.tensor([ids]), min(len(prompt), len(ids))))

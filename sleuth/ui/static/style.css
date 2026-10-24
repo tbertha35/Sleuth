@@ -136,3 +136,5 @@ th:first-child, td:first-child { text-align: left; }
 .facts { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 4px 0 8px; color: var(--ink-2); font-size: 13px; }
 .facts strong { color: var(--ink); font-variant-numeric: tabular-nums; }
 .chart.square { height: 420px; }
+
+[hidden] { display: none !important; }

@@ -86,6 +86,8 @@ async function loadRun(id) {
   setStatus("Loading…");
   const [run, metrics] = await Promise.all([api(`runs/${id}`), api(`runs/${id}/metrics`)]);
   Object.assign(state, { run, metrics, timeline: null, ckpt: null });
+  // External models have no training history: hide what would be empty.
+  $("training-card").hidden = Boolean(run.config.external);
   renderTiles();
   renderLoss();
   const suites = [...new Set(run.analyses.map((a) => a.suite))];
@@ -127,6 +129,7 @@ async function selectView(view) {
   fillSelect($("ckpt-select"), t.steps.map((s, i) => [s, `step ${s} (${fmtNum(t.tokens[i])} tok)`]),
     t.steps.map(String).includes(prevStep) ? prevStep : t.steps[t.steps.length - 1]);
   $("timeline-title").textContent = `${VIEWS[view].title} across checkpoints`;
+  $("timeline-card").hidden = t.steps.length < 2;  // a "timeline" of one checkpoint is just a dot
   renderTimeline();
   await loadCheckpoint();
 }
@@ -160,6 +163,18 @@ function renderTiles() {
   const last = metrics.train[metrics.train.length - 1] || {};
   const lastVal = metrics.val[metrics.val.length - 1] || {};
   const p = run.params;
+  const ext = run.config.external;
+  if (ext) {
+    const tiles = [
+      ["Parameters", p ? fmtNum(p.total) : "–", p ? `${fmtNum(p.non_embedding)} non-embedding` : ""],
+      ["Source", ext.format.toUpperCase(), ext.info?.architecture || ext.info?.model_type || ""],
+      ["Layers × heads", `${run.config.model.n_layers} × ${run.config.model.n_heads}`, `width ${run.config.model.d_model}`],
+    ];
+    $("tiles").replaceChildren(...tiles.map(([l, v, s]) =>
+      el("div", { class: "tile" }, el("div", { class: "label", text: l }), el("div", { class: "value", text: v }),
+        el("div", { class: "sub", text: s }))));
+    return;
+  }
   const tiles = [
     ["Parameters", p ? fmtNum(p.non_embedding) : "–", p ? `non-embedding (+${fmtNum(p.embedding)} embedding)` : ""],
     ["Step", `${last.step ?? 0}`, `of ${run.config.train.max_steps}`],
@@ -174,6 +189,7 @@ function renderTiles() {
 }
 
 function renderLoss() {
+  if ($("training-card").hidden) return;
   const T = tokens();
   const { train, val } = state.metrics;
   lineChart($("loss-chart"), [
@@ -184,7 +200,7 @@ function renderLoss() {
 
 function renderTimeline() {
   const t = state.timeline;
-  if (!t) return;
+  if (!t || $("timeline-card").hidden) return;
   const key = $("metric-select").value;
   const ser = t.series[key];
   if (!ser) return;

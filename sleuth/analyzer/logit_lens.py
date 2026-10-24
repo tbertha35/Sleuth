@@ -55,24 +55,28 @@ def run(model, tokenizer, cases, device, **_) -> dict:
 
     taps = {"embed": grab, "blocks.*.resid_post": grab}
 
-    def lens(ids):
-        """Per-row logits [rows, T, V] for one sequence."""
+    def residuals(ids):
         captured.clear()
         with listen(model, taps):
             model(ids)
-        return torch.stack([model.unembed(captured[r])[0, :, :V].float() for r in range(len(rows))])
+        return [captured[r] for r in range(len(rows))]
+
+    def row_logits(h):
+        # One row at a time: [T, V] floats per row. Stacking every row at once
+        # would be rows x T x V, gigabytes for a 150k-token vocab.
+        return model.unembed(h)[0, :, :V].float()
 
     for e in enc:
         ids = e.ids.to(device)
         if ids.shape[1] < 2:
             continue
-        logits = lens(ids)[:, :-1]                          # predictions for tokens 1..T-1
-        targets = ids[0, 1:].expand(len(rows), -1)
-        nll = F.cross_entropy(logits.transpose(1, 2), targets, reduction="none")  # [rows, T-1]
+        targets = ids[0, 1:]
         c = ci[e.category]
-        loss[:, c] += nll.sum(-1).double().cpu()
-        correct[:, c] += (logits.argmax(-1) == targets).sum(-1).double().cpu()
-        n_tok[c] += targets.shape[1]
+        for r, h in enumerate(residuals(ids)):
+            logits = row_logits(h)[:-1]                     # predictions for tokens 1..T-1
+            loss[r, c] += F.cross_entropy(logits, targets, reduction="sum").double().cpu()
+            correct[r, c] += (logits.argmax(-1) == targets).sum().double().cpu()
+        n_tok[c] += targets.shape[0]
 
     loss_by_cat = loss / n_tok.clamp(min=1)
     acc_by_cat = correct / n_tok.clamp(min=1)
@@ -85,9 +89,14 @@ def run(model, tokenizer, cases, device, **_) -> dict:
     if enc:
         ex = max(enc, key=lambda e: min(e.ids.shape[1], EXAMPLE_MAX_TOKENS))
         ids = ex.ids[:, :EXAMPLE_MAX_TOKENS].to(device)
-        probs = lens(ids)[:, :-1].softmax(-1)               # [rows, T-1, V]
-        top_p, top_i = probs.max(-1)
-        true_p = probs.gather(-1, ids[0, 1:].expand(len(rows), -1).unsqueeze(-1)).squeeze(-1)
+        tops, top_ids, trues = [], [], []
+        for h in residuals(ids):
+            probs = row_logits(h)[:-1].softmax(-1)          # [T-1, V]
+            p, i = probs.max(-1)
+            tops.append(p)
+            top_ids.append(i)
+            trues.append(probs.gather(-1, ids[0, 1:].unsqueeze(-1)).squeeze(-1))
+        top_p, top_i, true_p = torch.stack(tops), torch.stack(top_ids), torch.stack(trues)
         example = {
             "case_id": ex.case.id,
             "tokens": [tokenizer.decode([i]) for i in ids[0].tolist()],

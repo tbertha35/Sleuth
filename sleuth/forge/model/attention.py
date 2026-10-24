@@ -41,9 +41,10 @@ class Attention(nn.Module):
         self.layer_idx = layer_idx
         self.n_heads, self.n_kv, self.hd = cfg.n_heads, cfg.kv_heads, cfg.head_dim
         self.use_rope = cfg.pos_type == "rope"
-        self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.hd, bias=cfg.bias)
-        self.k_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=cfg.bias)
-        self.v_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=cfg.bias)
+        qkv_bias = cfg.bias or cfg.qkv_bias
+        self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.hd, bias=qkv_bias)
+        self.k_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=qkv_bias)
+        self.v_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=qkv_bias)
         self.o_proj = nn.Linear(self.n_heads * self.hd, cfg.d_model, bias=cfg.bias)
         self.q_norm = RMSNorm(self.hd, cfg.norm_eps) if cfg.qk_norm else None
         self.k_norm = RMSNorm(self.hd, cfg.norm_eps) if cfg.qk_norm else None

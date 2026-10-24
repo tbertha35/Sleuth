@@ -27,7 +27,8 @@ def param_counts(cfg: ModelConfig) -> dict[str, int]:
     d, hd, H, K, L = cfg.d_model, cfg.head_dim, cfg.n_heads, cfg.kv_heads, cfg.n_layers
     b = 1 if cfg.bias else 0
     attn = d * H * hd + 2 * d * K * hd + H * hd * d
-    attn_bias = b * (H * hd + 2 * K * hd + d)
+    qkv_b = 1 if (cfg.bias or cfg.qkv_bias) else 0
+    attn_bias = qkv_b * (H * hd + 2 * K * hd) + b * d
     n_ffn_in = 2 if cfg.ffn_type == "swiglu" else 1
     mlp = n_ffn_in * d * cfg.hidden + cfg.hidden * d
     mlp_bias = b * (n_ffn_in * cfg.hidden + d)

@@ -86,6 +86,12 @@ class Tokenizer:
         return self.special_tokens["<|eos|>"]
 
     @property
+    def start_id(self) -> int:
+        """Token placed before every analyzed text. (External tokenizers
+        without a BOS token use their end-of-text token here instead.)"""
+        return self.bos_id
+
+    @property
     def pad_id(self) -> int:
         return self.special_tokens["<|pad|>"]
 

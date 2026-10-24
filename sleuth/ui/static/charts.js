@@ -157,6 +157,7 @@ export function lineChart(el, series, opts = {}) {
   if (!series.length) return emptyState(el, opts.empty || "No data yet");
   const legendItems = series.length >= 2 ? series.map((s) => ({ label: s.name, color: s.color })) : null;
   const { canvas, ctx, W, H } = setup(el, legendItems);
+  if (W < 10 || H < 10) return;  // hidden or collapsed: nothing to draw into
   const T = tokens();
   const m = { l: opts.yLabel ? 64 : 48, r: 16, t: 10, b: 36 };
   const pw = W - m.l - m.r, ph = H - m.t - m.b;
@@ -270,6 +271,7 @@ export function heatmap(el, matrix, opts = {}) {
   if (opts.diverging && !opts.domain) { const a = Math.max(Math.abs(lo), Math.abs(hi)) || 1; lo = -a; hi = a; }
   const ramp = opts.diverging ? T.div : T.seq;
   const { canvas, ctx, W, H } = setup(el, [{ ramp, lo: fmt(lo), hi: fmt(hi), label: opts.legendLabel }]);
+  if (W < 10 || H < 10) return;  // hidden or collapsed: nothing to draw into
   const nr = matrix.length, nc = matrix[0].length;
   const rowLabels = opts.rowLabels || matrix.map((_, i) => String(i));
   const colLabels = opts.colLabels || matrix[0].map((_, i) => String(i));

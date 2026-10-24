@@ -1,5 +1,6 @@
 """Helpers shared by tests (pytest puts tests/ on sys.path)."""
 
+import struct
 from pathlib import Path
 
 
@@ -16,3 +17,36 @@ def tiny_run_config(tiny_data, runs_dir: Path, **train_overrides):
         train=TrainConfig(**tc),
         data=DataConfig(shards=str(tiny_data["shards"])),
     )
+
+
+def gguf_string(s):
+    b = s.encode()
+    return struct.pack("<Q", len(b)) + b
+
+
+def write_gguf(path, metadata, tensors, align=32):
+    """A minimal GGUF writer, for tests only. metadata: {key: (type, value)}; tensors: {name: (ggml_type, torch_shape, raw bytes)}."""
+    fmt = {0: "<B", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q"}
+    out = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata))
+    for k, (t, v) in metadata.items():
+        out += gguf_string(k) + struct.pack("<I", t)
+        if t == 8:
+            out += gguf_string(v)
+        elif t == 9:
+            et, items = v
+            out += struct.pack("<IQ", et, len(items))
+            for it in items:
+                out += gguf_string(it) if et == 8 else struct.pack(fmt[et], it)
+        else:
+            out += struct.pack(fmt[t], v)
+    offset, blobs = 0, []
+    for name, (t, shape, raw) in tensors.items():
+        out += gguf_string(name) + struct.pack("<I", len(shape)) + b"".join(struct.pack("<Q", d) for d in reversed(shape))
+        out += struct.pack("<IQ", t, offset)
+        pad = (-len(raw)) % align
+        blobs.append(raw + b"\0" * pad)
+        offset += len(raw) + pad
+    out += b"\0" * ((-len(out)) % align)
+    path.write_bytes(out + b"".join(blobs))
+
+

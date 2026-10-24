@@ -66,14 +66,13 @@ class Transformer(nn.Module):
         if cfg.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
 
-        if cfg.pos_type == "rope":
-            cos, sin = rope_tables(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
-        else:
-            cos = sin = torch.zeros(cfg.max_seq_len, cfg.head_dim)
         # persistent=False: derived from the config, so not saved in checkpoints.
+        cos, sin = self._rope()
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+        if torch.empty(0).device.type == "meta":
+            return  # building an empty shell (see Transformer.empty); weights come later
         self.apply(self._init_weights)
         # Scale down the projections that write into the residual stream.
         # Each layer adds two such contributions; without scaling, the
@@ -82,6 +81,34 @@ class Transformer(nn.Module):
             if name.endswith(("o_proj.weight", "down.weight")):
                 nn.init.normal_(p, mean=0.0, std=cfg.init_std / math.sqrt(2 * cfg.n_layers))
         assign_tap_names(self)
+
+    def _rope(self) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        if cfg.pos_type == "rope":
+            return rope_tables(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
+        z = torch.zeros(cfg.max_seq_len, cfg.head_dim)
+        return z, z
+
+    @classmethod
+    def empty(cls, cfg: ModelConfig, device: str | torch.device = "cpu", dtype: torch.dtype = torch.float32) -> "Transformer":
+        """A model with uninitialized weights, for loading a checkpoint into.
+
+        Building normally fills every weight with random numbers first. For a
+        12B model that takes minutes and needs a full extra copy in RAM. Here
+        the model is built on PyTorch's "meta" device (shapes only, no memory),
+        then given real but uninitialized storage. Every weight must be loaded
+        afterwards.
+        """
+        with torch.device("meta"):
+            model = cls(cfg)
+        model = model.to_empty(device=device).to(dtype)
+        if cfg.tie_embeddings:  # to_empty creates separate tensors; re-tie them
+            model.lm_head.weight = model.tok_emb.weight
+        cos, sin = model._rope()  # buffers are derived, not loaded: recompute them
+        model.rope_cos = cos.to(device)
+        model.rope_sin = sin.to(device)
+        assign_tap_names(model)
+        return model
 
     def _init_weights(self, m: nn.Module):
         if isinstance(m, nn.Linear):

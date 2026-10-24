@@ -95,7 +95,7 @@ def run(model, tokenizer, cases, device, induction_len: int = 40, induction_batc
     R = max(2, min(induction_len, (model.cfg.max_seq_len - 1) // 2))
     g = torch.Generator().manual_seed(1234)
     rand = torch.randint(0, _first_special(tokenizer), (induction_batch, R), generator=g)
-    seq = torch.cat([torch.full((induction_batch, 1), tokenizer.bos_id), rand, rand], dim=1).to(device)
+    seq = torch.cat([torch.full((induction_batch, 1), tokenizer.start_id), rand, rand], dim=1).to(device)
     t, k_ind, k_dup = induction_positions(R)
     ind = torch.zeros(L, H, dtype=torch.float64)
     dup = torch.zeros(L, H, dtype=torch.float64)

@@ -18,7 +18,8 @@ decisions and results: [LOG.md](LOG.md) · training data and licences: [docs/DAT
 
 **M1** (tokenizer → 10M model → checkpoints → generation) is done and has run on an
 RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is built and
-CPU-tested; next it gets checked on a TinyStories model.
+CPU-tested. **M5** (external models: safetensors + GGUF) is partly built: Llama/Qwen-family
+models load; Gemma is next.
 
 | Piece | Where |
 |---|---|
@@ -106,6 +107,30 @@ checkpoint, and the dashboard shows each as a tab:
 Options: `--views attention,logit_lens` (a subset), `--steps 0,500,6000` (some
 checkpoints), `--ablation zero` (instead of mean), `--force` (recompute). Re-running
 skips finished checkpoints, so you can analyze while training is still going.
+
+## Other people's models (Milestone 5, in progress)
+
+Sleuth reads `.safetensors` (Hugging Face folders) and GGUF (llama.cpp) files with its
+own readers and loads them into its own Transformer, so every analyzer view works on
+them too.
+
+| Supported now | |
+|---|---|
+| Hugging Face folders | Llama, Mistral, Qwen2/2.5, Qwen3 (`config.json` + `*.safetensors` + `tokenizer.json`) |
+| GGUF architectures | `llama`, `qwen2`, `qwen3`, with byte-level BPE tokenizers |
+| GGUF tensor types | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS |
+| Coming next | Gemma (needs its own adapter: run `inspect` on your file and share the output), keeping big models quantized in VRAM |
+
+```bash
+python -m sleuth inspect path/to/model.gguf          # what's inside: architecture, metadata, tensors
+python -m sleuth generate path/to/hf-folder --prompt "The capital of France is"
+python -m sleuth analyze path/to/model.gguf --suite suites/stories --views attention,logit_lens
+python -m sleuth compare path/to/hf-folder path/to/model-Q8_0.gguf   # same model, two formats: should agree
+```
+
+`analyze` on an external model puts the results in `runs/ext-<name>/`, and the
+dashboard lists it next to your own runs. Ablation runs the whole suite once per head,
+so on big models add `--views neuron_stats,attention,logit_lens` to skip it at first.
 
 Training writes `runs/<run-id>/` with the config, the environment, metrics, weight
 snapshots (log-spaced: steps 0, 1, 2, 4, … plus every 500) and resumable checkpoints.
