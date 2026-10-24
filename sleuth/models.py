@@ -85,10 +85,15 @@ def load_tokenizer(path: str | Path):
     return Tokenizer.load(next(d / "tokenizer.json" for d in weights.parents if (d / "tokenizer.json").exists()))
 
 
-def describe_file(path: str | Path, max_groups: int = 60) -> str:
+def describe_file(path: str | Path, max_groups: int = 60, show_key: str | None = None) -> str:
     """Human-readable summary of a GGUF file or HF folder: architecture,
     hyperparameters, tokenizer, and tensors grouped by name pattern
-    (blk.0..47.attn_q.weight shown once)."""
+    (blk.0..47.attn_q.weight shown once). Within a group, every distinct
+    shape is listed with its layers: some models (Gemma 4) give different
+    layers different sizes.
+
+    show_key: print just this one GGUF metadata value, in full (long values
+    such as tokenizer.chat_template are cut short in the summary)."""
     import re
     from collections import Counter, OrderedDict
 
@@ -99,16 +104,23 @@ def describe_file(path: str | Path, max_groups: int = 60) -> str:
     def add_tensor(name, shape, tname, nbytes):
         key = re.sub(r"\.(\d+)\.", ".{N}.", name)
         layer = re.search(r"\.(\d+)\.", name)
-        g = groups.setdefault(key, [shape, Counter(), 0, set()])
+        g = groups.setdefault(key, [OrderedDict(), Counter(), 0, set()])
+        layers_of_shape = g[0].setdefault(tuple(shape), [])
         g[1][tname] += 1
         g[2] += nbytes
         if layer:
             g[3].add(int(layer.group(1)))
+            layers_of_shape.append(int(layer.group(1)))
 
     if kind == "gguf":
         from .formats.gguf import GGUFFile
 
         with GGUFFile(path) as g:
+            if show_key is not None:
+                if show_key not in g.metadata:
+                    raise KeyError(f"{show_key!r} isn't in this file's metadata")
+                v = g.metadata[show_key]
+                return "\n".join(map(str, v)) if isinstance(v, list) else str(v)
             lines.append(f"GGUF v{g.version}, architecture: {g.architecture}, {len(g.tensors)} tensors")
             lines.append("metadata:")
             for k, v in g.metadata.items():
@@ -142,11 +154,28 @@ def describe_file(path: str | Path, max_groups: int = 60) -> str:
     else:
         raise ValueError("inspect works on .gguf files and Hugging Face model folders")
     lines.append(f"tensors ({total / 2**30:.2f} GiB), grouped:")
-    for i, (key, (shape, types, nbytes, layers)) in enumerate(groups.items()):
+    for i, (key, (shapes, types, nbytes, layers)) in enumerate(groups.items()):
         if i >= max_groups:
             lines.append(f"  ... {len(groups) - max_groups} more groups")
             break
         span = f" layers {min(layers)}..{max(layers)} ({len(layers)})" if layers else ""
         tstr = ", ".join(f"{t}x{c}" for t, c in types.items())
-        lines.append(f"  {key}  shape {tuple(shape)}  [{tstr}]{span}  {nbytes / 2**20:.1f} MiB")
+        first = next(iter(shapes))
+        lines.append(f"  {key}  shape {first}  [{tstr}]{span}  {nbytes / 2**20:.1f} MiB")
+        if len(shapes) > 1:
+            for shape, ls in shapes.items():
+                lines.append(f"      shape {shape}: layers {_ranges(ls)}")
     return "\n".join(lines)
+
+
+def _ranges(nums: list[int]) -> str:
+    """[0,1,2,3,5,11,17] -> '0-3, 5, 11, 17' (at most 12 items, then '...')."""
+    nums = sorted(set(nums))
+    parts, start = [], None
+    for i, n in enumerate(nums):
+        if start is None:
+            start = n
+        if i + 1 == len(nums) or nums[i + 1] != n + 1:
+            parts.append(str(start) if start == n else f"{start}-{n}")
+            start = None
+    return ", ".join(parts[:12]) + (", ..." if len(parts) > 12 else "")

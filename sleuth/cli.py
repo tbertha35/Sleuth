@@ -173,20 +173,27 @@ def cmd_compare(a):
     dtype = _dtype(a.dtype)
     cases = [c for s in (a.suite or ["suites/stories", "suites/basic"]) for c in load_suite(s)]
 
-    def loader(path):
+    def loader(path, requant=None):
         def load():
             model, tok, _ = load_any(path, device=device, dtype=dtype)
+            if requant:
+                from .analyzer.compare import requantize_model
+
+                r = requantize_model(model, requant, a.requant_match)
+                print(f"B: {r['n_tensors']} weights rounded through {requant.upper()}, relative error "
+                      f"mean {r['rel_error_mean']:.4f}, max {r['rel_error_max']:.4f}", file=sys.stderr)
             return model, tok
         return load
 
-    result = compare_models(loader(a.a), loader(a.b), cases, device=device)
-    print(format_report(result, a.a, a.b))
+    result = compare_models(loader(a.a), loader(a.b, a.requant), cases, device=device)
+    name_b = a.b + (f"  (requantized: {a.requant.upper()}, weights matching {a.requant_match!r})" if a.requant else "")
+    print(format_report(result, a.a, name_b))
 
 
 def cmd_inspect(a):
     from .models import describe_file
 
-    print(describe_file(a.path, max_groups=a.max_groups))
+    print(describe_file(a.path, max_groups=a.max_groups, show_key=a.show_key))
 
 
 def cmd_analyze(a):
@@ -349,11 +356,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--suite", action="append", default=None, help="default: suites/stories + suites/basic")
     s.add_argument("--device", default="auto")
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    s.add_argument("--requant", default=None, metavar="TYPE",
+                   help="round model B's weights through this quantizer first (Q8_0, Q4_0 or Q4_1), to measure "
+                        "what that quantization alone costs. Use the same path for A and B.")
+    s.add_argument("--requant-match", default="*", metavar="PATTERN",
+                   help="only requantize weights whose names match, e.g. 'tok_emb.weight' or 'blocks.*.mlp.*'")
     s.set_defaults(fn=cmd_compare)
 
     s = sub.add_parser("inspect", help="show what's inside a .gguf file or Hugging Face model folder")
     s.add_argument("path")
     s.add_argument("--max-groups", type=int, default=80, help="how many tensor groups to list")
+    s.add_argument("--show-key", default=None, metavar="KEY",
+                   help="print one GGUF metadata value in full, e.g. tokenizer.chat_template")
     s.set_defaults(fn=cmd_inspect)
 
     s = sub.add_parser("ui", help="serve the local dashboard")

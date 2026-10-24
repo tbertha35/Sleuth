@@ -238,6 +238,65 @@ _PLAIN = {F32: torch.float32, F16: torch.float16, BF16: torch.bfloat16, F64: tor
           I8: torch.int8, I16: torch.int16, I32: torch.int32, I64: torch.int64}
 
 
+# --------------------------------------------------------------------------- #
+# quantizing (simple formats only), following ggml's quantize_row_*_ref
+# --------------------------------------------------------------------------- #
+# We don't need to *write* GGUF files for real use, but quantizing lets us ask
+# "how much would 4-bit rounding alone hurt this model?" (the `--requant`
+# option of `sleuth compare`) and build quantized test models. These are the
+# plain round-to-nearest reference quantizers; llama.cpp's real ones search
+# for better scales (and use an importance matrix), so they lose a bit less.
+
+def _blocks32(x: torch.Tensor) -> torch.Tensor:
+    if x.numel() % 32:
+        raise ValueError(f"{x.numel()} values isn't a whole number of 32-value blocks")
+    return x.reshape(-1, 32).float()
+
+
+def _f16_bytes(d: torch.Tensor) -> torch.Tensor:
+    return d.to(torch.float16).reshape(-1, 1).view(torch.uint8)
+
+
+def _pack_nibbles(qv: torch.Tensor) -> torch.Tensor:
+    """[n, 32] values 0..15 -> [n, 16] bytes (value j low nibble, value j+16 high)."""
+    return (qv[:, :16] | (qv[:, 16:] << 4)).to(torch.uint8)
+
+
+def _quant_q8_0(b):
+    d = b.abs().amax(1, keepdim=True) / 127
+    d = torch.where(d == 0, torch.ones_like(d), d)
+    qv = torch.round(b / d).to(torch.int8).view(torch.uint8)
+    return torch.cat([_f16_bytes(d), qv], dim=1)
+
+
+def _quant_q4_0(b):
+    mx = b.gather(1, b.abs().argmax(1, keepdim=True))       # the value with the largest magnitude
+    d = mx / -8
+    d = torch.where(d == 0, torch.ones_like(d), d)
+    qv = torch.floor(b / d + 8.5).clamp(0, 15).to(torch.int32)
+    return torch.cat([_f16_bytes(d), _pack_nibbles(qv)], dim=1)
+
+
+def _quant_q4_1(b):
+    lo, hi = b.amin(1, keepdim=True), b.amax(1, keepdim=True)
+    d = (hi - lo) / 15
+    d = torch.where(d == 0, torch.ones_like(d), d)
+    qv = torch.floor((b - lo) / d + 0.5).clamp(0, 15).to(torch.int32)
+    return torch.cat([_f16_bytes(d), _f16_bytes(lo), _pack_nibbles(qv)], dim=1)
+
+
+_QUANT = {Q8_0: _quant_q8_0, Q4_0: _quant_q4_0, Q4_1: _quant_q4_1}
+QUANTIZABLE = {TYPE_NAMES[t]: t for t in _QUANT}
+
+
+def quantize(x: torch.Tensor, ggml_type: int) -> torch.Tensor:
+    """Float tensor (any shape, a multiple of 32 values) -> uint8 blocks, flat."""
+    if ggml_type not in _QUANT:
+        raise NotImplementedError(f"quantizing to {TYPE_NAMES.get(ggml_type, ggml_type)} isn't implemented "
+                                  f"(available: {', '.join(QUANTIZABLE)})")
+    return _QUANT[ggml_type](_blocks32(x)).reshape(-1)
+
+
 def dequantize(raw: torch.Tensor, ggml_type: int, n_elements: int) -> torch.Tensor:
     """uint8 bytes of a whole tensor -> flat float32 tensor of n_elements."""
     nbytes = tensor_nbytes(ggml_type, n_elements)

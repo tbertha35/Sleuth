@@ -100,6 +100,15 @@ def test_simple_formats_roundtrip(qtype, quant, steps):
     assert np.all(np.abs(y.reshape(-1, 32) - x.reshape(-1, 32)) <= tol)
 
 
+@pytest.mark.parametrize("qtype,quant", [(q.Q8_0, quant_q8_0), (q.Q4_0, quant_q4_0), (q.Q4_1, quant_q4_1)])
+def test_vectorized_quantizers_match_reference(qtype, quant):
+    """Our vectorized quantizers (used by `compare --requant`) write the same bytes."""
+    x = RNG.normal(size=32 * 64).astype(np.float32)
+    x[:32] = 0.0  # an all-zero block takes the d = 0 branch
+    ours = q.quantize(torch.from_numpy(x), qtype)
+    assert bytes(ours.numpy()) == quant(x)
+
+
 def test_plain_types():
     x = torch.randn(10)
     for t, dt in [(q.F32, torch.float32), (q.F16, torch.float16), (q.BF16, torch.bfloat16)]:

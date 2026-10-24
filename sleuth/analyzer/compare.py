@@ -23,6 +23,7 @@ large models doesn't need memory for both.
 
 from __future__ import annotations
 
+import fnmatch
 import gc
 from typing import Callable
 
@@ -39,6 +40,34 @@ def _log_probs(model, enc, vocab: int, device) -> list[torch.Tensor]:
         logits = model(e.ids.to(device)).logits[0, :-1, :vocab].float()
         out.append(F.log_softmax(logits, dim=-1).to(torch.float16).cpu())  # fp16 on CPU: compact
     return out
+
+
+@torch.no_grad()
+def requantize_model(model, type_name: str, pattern: str = "*") -> dict:
+    """Round-trip weights through a GGUF quantizer (quantize, then dequantize)
+    in place, to simulate what that quantization costs *this* model.
+
+    Only 2-D weights whose rows are whole 32-value blocks are changed (norms
+    and biases stay exact, as in real GGUF files). `pattern` selects weights
+    by our parameter names, e.g. "tok_emb.weight" or "blocks.*.mlp.*".
+    Returns {"n_tensors", "rel_error_mean", "rel_error_max"} (‖ΔW‖ / ‖W‖).
+    """
+    from ..formats import gguf_quants as q
+
+    qtype = q.QUANTIZABLE.get(type_name.upper())
+    if qtype is None:
+        raise ValueError(f"can't requantize to {type_name!r}; choose from {', '.join(q.QUANTIZABLE)}")
+    errors = []
+    for name, p in model.named_parameters():
+        if p.ndim != 2 or p.shape[1] % 32 or not fnmatch.fnmatchcase(name, pattern):
+            continue
+        w = p.float()
+        back = q.dequantize(q.quantize(w, qtype), qtype, w.numel()).reshape(w.shape)
+        errors.append(float((back - w).norm() / w.norm().clamp(min=1e-12)))
+        p.copy_(back.to(p.dtype))
+    if not errors:
+        raise ValueError(f"no weights match {pattern!r}")
+    return {"n_tensors": len(errors), "rel_error_mean": sum(errors) / len(errors), "rel_error_max": max(errors)}
 
 
 def compare_models(load_a: Callable, load_b: Callable, cases, device="cpu", log=print) -> dict:

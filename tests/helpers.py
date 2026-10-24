@@ -50,3 +50,20 @@ def write_gguf(path, metadata, tensors, align=32):
     path.write_bytes(out + b"".join(blobs))
 
 
+def add_gguf_tensor_copy(src, dst, name, new_name):
+    """Rewrite a GGUF file (as written by write_gguf) with one tensor duplicated
+    under a new name. Reads it back with our reader, so it's for small test files."""
+    from sleuth.formats.gguf import GGUFFile
+
+    with GGUFFile(src) as g:
+        md = g.metadata
+        tensors = {n: (t.ggml_type, t.shape, bytes(g.raw(n).numpy())) for n, t in g.tensors.items()}
+    tensors[new_name] = tensors[name]
+    kinds = {bool: 7, int: 5, float: 6, str: 8}
+    meta = {}
+    for k, v in md.items():
+        if isinstance(v, list):
+            meta[k] = (9, (kinds[type(v[0])], v))
+        else:
+            meta[k] = (kinds[type(v)], v)
+    write_gguf(dst, meta, tensors)

@@ -92,6 +92,19 @@ def permute_rope_rows(w: torch.Tensor, n_heads: int) -> torch.Tensor:
     return w.reshape(n_heads, 2, hd // 2, *rest).transpose(1, 2).reshape(rows, *rest)
 
 
+def output_is_tied(g: GGUFFile) -> bool:
+    """Does the output layer reuse the token embedding?
+
+    Either output.weight is absent, or it's a byte-for-byte copy of
+    token_embd.weight. llama.cpp's converter often writes the copy even for
+    tied models (ggml-org's Qwen3-0.6B Q8_0 does), and keeping both costs
+    vocab x d extra weights: 155M for Qwen3-0.6B, 311 MB in bf16. Copies
+    quantized differently (Q4_K_M stores output.weight as Q6_K) are genuinely
+    different numbers, and stay separate.
+    """
+    return "output.weight" not in g.tensors or g.same_bytes("output.weight", "token_embd.weight")
+
+
 def model_config(g: GGUFFile, max_seq_len: int = 4096) -> ModelConfig:
     arch = g.architecture
     if arch not in SUPPORTED:
@@ -116,7 +129,7 @@ def model_config(g: GGUFFile, max_seq_len: int = 4096) -> ModelConfig:
         rope_theta=float(g.arch_value("rope.freq_base", 10000.0)),
         max_seq_len=min(max_seq_len, int(g.arch_value("context_length", max_seq_len))),
         qk_norm="blk.0.attn_q_norm.weight" in g.tensors,
-        tie_embeddings="output.weight" not in g.tensors,
+        tie_embeddings=output_is_tied(g),
         qkv_bias="blk.0.attn_q.bias" in g.tensors,
         pad_vocab_to=1,
     )
@@ -134,6 +147,8 @@ def load_gguf_model(path: str | Path, device: str | torch.device = "cpu", dtype:
         permute = g.architecture not in NEOX_ROPE
         for name, info in g.tensors.items():
             ours = our_name(name)
+            if ours == "lm_head.weight" and cfg.tie_embeddings:
+                continue  # a copy of token_embd (see output_is_tied)
             if ours is None or ours not in params:
                 unused.append(name)
                 continue
@@ -154,6 +169,7 @@ def load_gguf_model(path: str | Path, device: str | torch.device = "cpu", dtype:
         for info in g.tensors.values():
             types[info.type_name] = types.get(info.type_name, 0) + 1
         info = {"format": "gguf", "architecture": g.architecture, "name": g.metadata.get("general.name"),
+                "tied_output": cfg.tie_embeddings and "output.weight" in g.tensors,
                 "tensor_types": types, "unused_tensors": unused[:20], "n_unused": len(unused)}
     model.eval()
     return model, info

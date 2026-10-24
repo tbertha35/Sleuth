@@ -20,7 +20,9 @@ our own runs.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -46,15 +48,33 @@ def save_result(result: dict, out_dir: Path, extra: dict | None = None) -> None:
     (out_dir / "summary.json").write_text(json.dumps({**result["summary"], **(extra or {})}, indent=1) + "\n")
 
 
+def external_run_name(model_path: Path) -> str:
+    """A readable, unique folder name for an external model.
+
+    The folder name alone isn't enough: Hugging Face downloads are often in
+    folders with generic names ("hf", "model"), and two of them would share
+    results. So: parent folder + name (or the file name for a .gguf), plus a
+    short hash of the full path, e.g. "qwen3-0.6b-hf-3f9a1c".
+    """
+    base = model_path.stem if model_path.is_file() else f"{model_path.parent.name}-{model_path.name}"
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "-", base).strip("-").lower() or "model"
+    digest = hashlib.sha1(os.path.normcase(str(model_path)).encode("utf-8")).hexdigest()[:6]
+    return f"{base}-{digest}"
+
+
 def prepare_external_run(model_path: str | Path, name: str | None = None, dtype=None, device: str = "cpu") -> Path:
     """Create (or reuse) runs/ext-<name>/ for analyzing an external model."""
     from ..env import env_info, runs_root
     from ..models import detect, load_any
 
     model_path = Path(model_path).resolve()
-    name = name or re.sub(r"[^A-Za-z0-9_.-]+", "-", model_path.stem if model_path.is_file() else model_path.name)
+    name = name or external_run_name(model_path)
     run_dir = runs_root() / f"ext-{name}"
-    if not (run_dir / "config.json").exists():
+    if (run_dir / "config.json").exists():
+        old = json.loads((run_dir / "config.json").read_text()).get("external", {}).get("path")
+        if old and os.path.normcase(old) != os.path.normcase(str(model_path)):
+            raise ValueError(f"{run_dir} already holds results for another model ({old}); pick a different --name")
+    else:
         model, _, info = load_any(model_path, device=device, dtype=dtype)
         run_dir.mkdir(parents=True, exist_ok=True)
         cfg = {"name": name, "external": {"path": str(model_path), "format": detect(model_path),

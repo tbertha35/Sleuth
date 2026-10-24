@@ -79,7 +79,26 @@ def test_attention_view_shapes_and_ranges(model, tok):
     rows = a["example_pattern"].astype(np.float32).sum(-1)
     np.testing.assert_allclose(rows, 1.0, atol=1e-2)  # every query's attention sums to 1
     assert math.isfinite(s["induction"]["induction_gain"])
+    assert math.isfinite(s["induction"]["induction_gain_any_token"])
+    assert s["induction"]["token_pool"] == "suite tokens" and s["induction"]["pool_size"] >= 20
     assert len(attention.timeline_series(s)["induction_score"]["rows"]) == 8
+
+
+def test_induction_sequences_use_distinct_ordinary_tokens():
+    tok = SimpleNamespace(vocab_size=50, start_id=2, special_tokens={"<pad>": 0, "<eos>": 1, "<bos>": 2})
+    ordinary = attention._ordinary_ids(tok)
+    assert ordinary.tolist() == list(range(3, 50))   # specials can sit at the start (Gemma)
+    seq = attention._repeated_random(tok, ordinary, R=10, batch=3)
+    assert seq.shape == (3, 21) and (seq[:, 0] == 2).all()
+    assert torch.equal(seq[:, 1:11], seq[:, 11:])
+    for row in seq[:, 1:11]:
+        assert len(set(row.tolist())) == 10 and min(row.tolist()) >= 3
+
+
+def test_logit_lens_emb_row_mostly_repeats_the_input(model, tok):
+    """With tied embeddings the 'emb' row predicts the current token (see logit_lens.py)."""
+    s = logit_lens.run(model, tok, CASES, "cpu")["summary"]
+    assert s["emb_top1_is_input"] > 0.9 and s["loss"][0] > s["uniform_loss"]
 
 
 def test_logit_lens_last_row_is_the_model_itself(model, tok):

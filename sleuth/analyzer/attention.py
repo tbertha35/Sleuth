@@ -25,8 +25,14 @@ Induction (measured on synthetic input, not the suite):
                    large = it copies well. Induction heads tend to appear
                    suddenly during training (a "phase change"), visible in the timeline.
 
-Random tokens are drawn from the ordinary (non-special) vocabulary with a fixed
-seed, so every checkpoint sees the same sequences.
+Which random tokens? By default they're drawn (without repeats inside a
+sequence) from the tokens that occur in the suite, i.e. tokens the model has
+certainly seen in training. A small model's vocabulary is full of tokens it
+rarely or never saw (a TinyStories tokenizer has all 256 raw bytes, Chinese
+fragments, ...); their embeddings are barely trained, so the model can't tell
+two of them apart, let alone copy them. The older measurement, over the whole
+ordinary vocabulary, is kept as `induction_gain_any_token` for comparison.
+A fixed seed means every checkpoint sees the same sequences.
 
 An example pattern (every layer and head, for one suite prompt) is saved for
 the dashboard's pattern viewer.
@@ -56,8 +62,45 @@ def induction_positions(R: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
     return t, t - R + 1, t - R
 
 
-def _first_special(tokenizer) -> int:
-    return min(tokenizer.special_tokens.values()) if tokenizer.special_tokens else tokenizer.vocab_size
+def _ordinary_ids(tokenizer) -> torch.Tensor:
+    """Every token ID that isn't a special/added token. (Specials can sit
+    anywhere: at the end for Qwen, at IDs 0-4 for Gemma.)"""
+    special = set(getattr(tokenizer, "special_tokens", {}).values())
+    special |= set(getattr(tokenizer, "added_tokens", {}).values())
+    keep = torch.ones(tokenizer.vocab_size, dtype=torch.bool)
+    keep[[i for i in special if i < tokenizer.vocab_size]] = False
+    return keep.nonzero().squeeze(1)
+
+
+def _repeated_random(tokenizer, pool: torch.Tensor, R: int, batch: int) -> torch.Tensor:
+    """[batch, 1 + 2R]: start token + R distinct random tokens from `pool` + the same R again."""
+    g = torch.Generator().manual_seed(1234)
+    if len(pool) >= R:
+        rand = torch.stack([pool[torch.randperm(len(pool), generator=g)[:R]] for _ in range(batch)])
+    else:
+        rand = pool[torch.randint(0, len(pool), (batch, R), generator=g)]
+    return torch.cat([torch.full((batch, 1), tokenizer.start_id), rand, rand], dim=1)
+
+
+def _induction_scores(model, seq, R, L, H, vocab, patterns: bool = True):
+    """Induction and duplicate attention per head [L, H], plus the loss on the
+    first and the second copy (nats/token)."""
+    t, k_ind, k_dup = induction_positions(R)
+    ind = torch.zeros(L, H, dtype=torch.float64)
+    dup = torch.zeros(L, H, dtype=torch.float64)
+
+    def on_induction(name, p):
+        li = layer_of(name)
+        p = p.double().cpu()                       # [B, H, T, T]
+        ind[li] = p[:, :, t, k_ind].mean(dim=(0, 2))
+        dup[li] = p[:, :, t, k_dup].mean(dim=(0, 2))
+
+    with listen(model, {"blocks.*.attn.pattern": on_induction} if patterns else {}):
+        logits = model(seq).logits[..., :vocab].float()
+    nll = F.cross_entropy(logits[:, :-1].transpose(1, 2), seq[:, 1:], reduction="none")  # [B, 2R]
+    # nll[:, i] predicts token i+1. First copy: tokens 2..R (token 1 is unguessable).
+    # Second copy: tokens R+2..2R (token R+1 is guessable only by "the sequence restarts").
+    return ind, dup, nll[:, 1:R].mean().item(), nll[:, R + 1:].mean().item()
 
 
 @torch.no_grad()
@@ -93,26 +136,17 @@ def run(model, tokenizer, cases, device, induction_len: int = 40, induction_batc
 
     # ---- induction on repeated random tokens
     R = max(2, min(induction_len, (model.cfg.max_seq_len - 1) // 2))
-    g = torch.Generator().manual_seed(1234)
-    rand = torch.randint(0, _first_special(tokenizer), (induction_batch, R), generator=g)
-    seq = torch.cat([torch.full((induction_batch, 1), tokenizer.start_id), rand, rand], dim=1).to(device)
-    t, k_ind, k_dup = induction_positions(R)
-    ind = torch.zeros(L, H, dtype=torch.float64)
-    dup = torch.zeros(L, H, dtype=torch.float64)
-
-    def on_induction(name, p):
-        li = layer_of(name)
-        p = p.double().cpu()                       # [B, H, T, T]
-        ind[li] = p[:, :, t, k_ind].mean(dim=(0, 2))
-        dup[li] = p[:, :, t, k_dup].mean(dim=(0, 2))
-
-    with listen(model, {"blocks.*.attn.pattern": on_induction}):
-        logits = model(seq).logits[..., : tokenizer.vocab_size].float()
-    nll = F.cross_entropy(logits[:, :-1].transpose(1, 2), seq[:, 1:], reduction="none")  # [B, 2R]
-    # nll[:, i] predicts token i+1. First copy: tokens 2..R (token 1 is unguessable).
-    # Second copy: tokens R+2..2R (token R+1 is guessable only by "the sequence restarts").
-    first = nll[:, 1:R].mean().item()
-    second = nll[:, R + 1:].mean().item()
+    ordinary = _ordinary_ids(tokenizer)
+    n_ordinary = len(ordinary)
+    is_ordinary = set(ordinary.tolist())
+    pool = sorted({i for e in enc for i in e.ids[0].tolist()} & is_ordinary)
+    pool_name = "suite tokens"
+    if len(pool) < 2 * R:  # too few distinct tokens: fall back to the whole vocabulary
+        pool, pool_name = ordinary.tolist(), "whole vocabulary"
+    seq = _repeated_random(tokenizer, torch.tensor(pool), R, induction_batch).to(device)
+    ind, dup, first, second = _induction_scores(model, seq, R, L, H, tokenizer.vocab_size)
+    any_seq = _repeated_random(tokenizer, ordinary, R, induction_batch).to(device)
+    _, _, any_first, any_second = _induction_scores(model, any_seq, R, L, H, tokenizer.vocab_size, patterns=False)
 
     # ---- example pattern for the pattern viewer
     ex = max(enc, key=lambda e: min(e.ids.shape[1], EXAMPLE_MAX_TOKENS)) if enc else None
@@ -137,9 +171,12 @@ def run(model, tokenizer, cases, device, induction_len: int = 40, induction_batc
     summary = {
         "view": "attention",
         "n_layers": L, "n_heads": H, "n_queries": n_q, "n_cases": len(enc),
-        "induction": {"repeat_len": R, "batch": induction_batch, "loss_first_copy": first,
-                      "loss_second_copy": second, "induction_gain": first - second,
-                      "uniform_loss": math.log(_first_special(tokenizer))},
+        "induction": {"repeat_len": R, "batch": induction_batch, "token_pool": pool_name, "pool_size": len(pool),
+                      "loss_first_copy": first, "loss_second_copy": second, "induction_gain": first - second,
+                      "uniform_loss": math.log(len(pool)),
+                      "any_token": {"loss_first_copy": any_first, "loss_second_copy": any_second,
+                                    "uniform_loss": math.log(n_ordinary)},
+                      "induction_gain_any_token": any_first - any_second},
         "top_induction_heads": [f"L{x['layer']}H{x['head']} ({x['induction_score']:.2f})" for x in top],
         "heads": heads,
         "example": example,
@@ -161,9 +198,12 @@ def timeline_series(summary: dict) -> dict:
         "induction_score": series("Induction score", "Attention from a repeated token to whatever followed its "
                                   "first occurrence. Induction heads (copying machinery) score high.",
                                   rows, pick("induction_score"), "pct"),
-        "induction_gain": series("Induction gain (nats/token)", "Loss on the first copy of a random sequence minus "
-                                 "loss on its repeat. Rises when the model learns to copy.",
+        "induction_gain": series("Induction gain (nats/token)", "Loss on the first copy of a random sequence of "
+                                 "familiar tokens minus loss on its repeat. Rises when the model learns to copy.",
                                  ["model"], [summary["induction"]["induction_gain"]]),
+        "induction_gain_any_token": series("Induction gain, any token (nats/token)", "The same, with random tokens "
+                                           "from the whole vocabulary, including ones the model rarely or never saw.",
+                                           ["model"], [summary["induction"].get("induction_gain_any_token", float("nan"))]),
         "prev_token": series("Previous-token attention", "Attention to the token just before. Previous-token "
                              "heads feed induction heads.", rows, pick("prev_token"), "pct"),
         "bos_share": series("Attention to <|bos|>", "Attention parked on the first token (an 'attention sink'): "
