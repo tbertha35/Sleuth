@@ -9,6 +9,11 @@ here, how good would its prediction be?
 Rows: "emb" (just the token embedding, before any layer) and "L0".."L{n-1}"
 (after each block). The last row is exactly the model's real output.
 
+The "emb" row is a baseline, not a real prediction: with tied embeddings
+(the same matrix in and out) the logit for token x is largest when x is the
+*current* token, so it mostly "predicts" the input again and its loss is far
+worse than a uniform guess. `emb_top1_is_input` records how often that happens.
+
 Per row, over every next-token prediction in the suite:
   loss            cross-entropy of the true next token (nats; lower is better)
   top1_accuracy   how often the true next token is the single top prediction
@@ -47,6 +52,7 @@ def run(model, tokenizer, cases, device, **_) -> dict:
     loss = torch.zeros(len(rows), len(cats), dtype=torch.float64)
     correct = torch.zeros(len(rows), len(cats), dtype=torch.float64)
     n_tok = torch.zeros(len(cats), dtype=torch.float64)
+    emb_is_input = 0
 
     captured: dict[int, torch.Tensor] = {}
 
@@ -76,6 +82,8 @@ def run(model, tokenizer, cases, device, **_) -> dict:
             logits = row_logits(h)[:-1]                     # predictions for tokens 1..T-1
             loss[r, c] += F.cross_entropy(logits, targets, reduction="sum").double().cpu()
             correct[r, c] += (logits.argmax(-1) == targets).sum().double().cpu()
+            if r == 0:
+                emb_is_input += int((logits.argmax(-1) == ids[0, :-1]).sum())
         n_tok[c] += targets.shape[0]
 
     loss_by_cat = loss / n_tok.clamp(min=1)
@@ -110,6 +118,8 @@ def run(model, tokenizer, cases, device, **_) -> dict:
         "rows": rows,
         "categories": cats,
         "n_tokens": int(n_tok.sum()),
+        "uniform_loss": float(torch.log(torch.tensor(float(V)))),
+        "emb_top1_is_input": emb_is_input / max(1, int(n_tok.sum())),
         "loss": [float(x) for x in loss_all],
         "top1_accuracy": [float(x) for x in acc_all],
         "loss_by_category": {c: [float(x) for x in loss_by_cat[:, i]] for c, i in ci.items()},

@@ -143,6 +143,18 @@ class GGUFFile:
         info = self.tensors[name]
         return torch.frombuffer(bytearray(self._mm[info.offset:info.offset + info.nbytes]), dtype=torch.uint8)
 
+    def same_bytes(self, a: str, b: str, chunk: int = 1 << 26) -> bool:
+        """True if tensors a and b have the same type, shape and stored bytes
+        (compared in chunks, so huge tensors don't need extra RAM)."""
+        ta, tb = self.tensors[a], self.tensors[b]
+        if (ta.ggml_type, ta.shape) != (tb.ggml_type, tb.shape):
+            return False
+        for i in range(0, ta.nbytes, chunk):
+            n = min(chunk, ta.nbytes - i)
+            if self._mm[ta.offset + i:ta.offset + i + n] != self._mm[tb.offset + i:tb.offset + i + n]:
+                return False
+        return True
+
     def tensor(self, name: str, dtype: torch.dtype = torch.float32, device: str | torch.device = "cpu") -> torch.Tensor:
         """Dequantized tensor in PyTorch shape order."""
         info = self.tensors[name]

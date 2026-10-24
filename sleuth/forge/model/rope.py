@@ -18,9 +18,20 @@ from __future__ import annotations
 import torch
 
 
-def rope_tables(head_dim: int, max_len: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin tables of shape [max_len, head_dim], computed in float32."""
+def rope_tables(head_dim: int, max_len: int, theta: float,
+                freq_factors: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin tables of shape [max_len, head_dim], computed in float32.
+
+    freq_factors ([head_dim/2], optional) divide each pair's frequency, as in
+    llama.cpp's ggml_rope_ext. Gemma 4's full-attention layers ship them as the
+    rope_freqs tensor ("proportional RoPE"): a huge factor makes a pair rotate
+    (almost) not at all, so those channels carry no position information.
+    """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    if freq_factors is not None:
+        if freq_factors.numel() != head_dim // 2:
+            raise ValueError(f"{freq_factors.numel()} RoPE frequency factors for head_dim {head_dim}")
+        inv_freq = inv_freq / freq_factors.float().cpu()
     pos = torch.arange(max_len, dtype=torch.float32)
     angles = torch.outer(pos, inv_freq)            # [max_len, head_dim/2]
     angles = torch.cat([angles, angles], dim=-1)   # duplicate for the two halves

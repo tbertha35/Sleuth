@@ -144,7 +144,7 @@ def test_analyze_external_model(tok, tmp_path, monkeypatch):
     monkeypatch.setenv("SLEUTH_RUNS", str(tmp_path / "runs"))
     hf_dir = save_hf_model(make_model(tok), tmp_path / "hf-model", tokenizer=tok)
     run = prepare_external_run(hf_dir, dtype=torch.float32)
-    assert run.name == "ext-hf-model"
+    assert run.name.startswith(f"ext-{tmp_path.name.lower()}-hf-model-")
     cfg = json.loads((run / "config.json").read_text())
     assert cfg["external"]["format"] == "hf" and cfg["model"]["n_layers"] == 2
     out = run_timeline(run, "suites/basic", views=["attention", "logit_lens"], log=lambda s: None)
@@ -169,3 +169,44 @@ def test_compare_models(tok, tmp_path):
     assert same["overall"]["top1_agreement"] == 1.0 and same["overall"]["kl_mean"] < 1e-4
     q = compare_models(loader(tmp_path / "f32.gguf"), loader(tmp_path / "q8.gguf"), cases)
     assert 0 < q["overall"]["kl_mean"] < 0.01 and q["overall"]["top1_agreement"] > 0.9
+
+
+def test_external_run_names_are_unique(tok, tmp_path, monkeypatch):
+    """Two models in folders with the same name ("hf") must not share results."""
+    monkeypatch.setenv("SLEUTH_RUNS", str(tmp_path / "runs"))
+    a = save_hf_model(make_model(tok), tmp_path / "qwen" / "hf", tokenizer=tok)
+    b = save_hf_model(make_model(tok), tmp_path / "llama" / "hf", tokenizer=tok)
+    ra, rb = prepare_external_run(a, dtype=torch.float32), prepare_external_run(b, dtype=torch.float32)
+    assert ra != rb and ra.name.startswith("ext-qwen-hf-") and rb.name.startswith("ext-llama-hf-")
+    assert prepare_external_run(a, dtype=torch.float32) == ra          # same model -> same folder
+    with pytest.raises(ValueError, match="another model"):
+        prepare_external_run(b, name=ra.name.removeprefix("ext-"), dtype=torch.float32)
+
+
+def test_gguf_ties_identical_output_weight(tok, tmp_path):
+    """llama.cpp's converter writes output.weight even when the model ties it to
+    the embedding. If the bytes are identical, we tie them (saving vocab x d)."""
+    m = make_model(tok, qk_norm=True, tie_embeddings=True)
+    export_gguf(m, tok, tmp_path / "t.gguf", "qwen3", quant=True)
+    from helpers import add_gguf_tensor_copy
+    add_gguf_tensor_copy(tmp_path / "t.gguf", tmp_path / "t2.gguf", "token_embd.weight", "output.weight")
+    loaded, info = load_gguf_model(tmp_path / "t2.gguf", dtype=torch.float32)
+    assert loaded.cfg.tie_embeddings and info["tied_output"]
+    assert loaded.num_params() == m.num_params()
+    # A different output matrix stays separate.
+    m2 = make_model(tok, qk_norm=True, tie_embeddings=False)
+    export_gguf(m2, tok, tmp_path / "u.gguf", "qwen3", quant=True)
+    assert not load_gguf_model(tmp_path / "u.gguf", dtype=torch.float32)[0].cfg.tie_embeddings
+
+
+def test_requantize_model(tok):
+    from sleuth.analyzer.compare import requantize_model
+
+    m = make_model(tok, qk_norm=True)
+    before = {n: p.clone() for n, p in m.named_parameters()}
+    r = requantize_model(m, "q4_1", "blocks.*.mlp.*")
+    assert r["n_tensors"] == 6 and 0.02 < r["rel_error_mean"] < 0.15
+    for n, p in m.named_parameters():
+        assert torch.equal(p, before[n]) == (".mlp." not in n)
+    with pytest.raises(ValueError, match="choose from"):
+        requantize_model(m, "q4_k")

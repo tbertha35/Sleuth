@@ -43,8 +43,11 @@ def cmd_tokenizer(a):
 
 def cmd_tokenize(a):
     from .forge.tokenizer.bpe import Tokenizer
+    from .models import load_tokenizer
 
-    tok = Tokenizer.load(a.tokenizer)
+    p = Path(a.tokenizer)
+    # Our tokenizer.json, or the tokenizer of any model we can load (.gguf, HF folder, run).
+    tok = Tokenizer.load(p) if p.is_file() and p.suffix == ".json" else load_tokenizer(p)
     ids = tok.encode(a.text, allowed_special="all" if a.allow_special else "none")
     print(f"{len(a.text.encode())} bytes -> {len(ids)} tokens")
     print(" | ".join(repr(tok.decode([i]))[1:-1] for i in ids))
@@ -109,7 +112,8 @@ def cmd_generate(a):
     from .models import load_any
 
     device = resolve_device(a.device)
-    model, tok, meta = load_any(a.path, device=device, dtype=_dtype(a.dtype), step=a.step)
+    model, tok, meta = load_any(a.path, device=device, dtype=_dtype(a.dtype), step=a.step,
+                                keep_quantized=_keep_quantized(a.keep_quantized))
     if a.tokenizer:
         from .forge.tokenizer.bpe import Tokenizer
 
@@ -118,6 +122,8 @@ def cmd_generate(a):
     if a.step is not None and meta.get("step") is not None and int(meta["step"]) != a.step:
         print(f"(no snapshot at step {a.step}; using the nearest one, step {meta['step']})", file=sys.stderr)
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
+    if meta.get("kept_quantized"):
+        where += f", {meta['kept_quantized']} layers kept quantized"
     print(f"[{where}, {model.num_params() / 1e6:.2f}M params, {device}, {next(model.parameters()).dtype}]",
           file=sys.stderr, flush=True)
     # The first run of anything pays one-time setup (on GPU: loading kernels,
@@ -142,10 +148,27 @@ def cmd_generate(a):
                        vocab_limit=tok.vocab_size, seed=None if a.seed is None else a.seed + i,
                        on_token=on_token)
         print(decoder.decode(b"", final=True), flush=True)
+        mem = ""
+        if device.type == "cuda":
+            import torch
+
+            mem = f", peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB"
         print(f"[{len(res.new_ids)} tokens, stop: {res.stop_reason}, prompt {len(prompt_ids)} tokens in "
-              f"{res.prefill_seconds * 1000:.0f} ms, decode {res.decode_tok_per_s:,.0f} tok/s]", file=sys.stderr, flush=True)
+              f"{res.prefill_seconds * 1000:.0f} ms, decode {res.decode_tok_per_s:,.1f} tok/s{mem}]",
+              file=sys.stderr, flush=True)
         if i + 1 < a.samples:
             print("-" * 40, flush=True)
+
+
+def _keep_quantized(name: str):
+    return {"auto": "auto", "yes": True, "no": False}[name]
+
+
+def _add_keep_quantized(s):
+    s.add_argument("--keep-quantized", choices=["auto", "yes", "no"], default="auto",
+                   help="GGUF: keep quantized weights quantized in GPU/CPU memory and dequantize each layer "
+                        "while running (uses ~4x less memory than bf16, but runs slower). auto = only when "
+                        "dequantized weights would need more than half the GPU's memory (8 GiB on CPU)")
 
 
 def _dtype(name: str | None):
@@ -156,8 +179,9 @@ def _dtype(name: str | None):
 
 def _stop_ids(tok) -> set[int]:
     """End-of-text and end-of-turn tokens: generation stops at any of them."""
-    stops = {tok.eos_id} - {None}
-    for name in ("<|eos|>", "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "<|end|>"):
+    stops = {tok.eos_id, getattr(tok, "eot_id", None)} - {None}
+    for name in ("<|eos|>", "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "<|end|>",
+                 "<eos>", "<turn|>", "<|tool_response>"):  # the last three: Gemma 4's end-of-generation tokens
         if name in tok.special_tokens:
             stops.add(tok.special_tokens[name])
     return stops
@@ -173,20 +197,27 @@ def cmd_compare(a):
     dtype = _dtype(a.dtype)
     cases = [c for s in (a.suite or ["suites/stories", "suites/basic"]) for c in load_suite(s)]
 
-    def loader(path):
+    def loader(path, requant=None):
         def load():
-            model, tok, _ = load_any(path, device=device, dtype=dtype)
+            model, tok, _ = load_any(path, device=device, dtype=dtype, keep_quantized=_keep_quantized(a.keep_quantized))
+            if requant:
+                from .analyzer.compare import requantize_model
+
+                r = requantize_model(model, requant, a.requant_match)
+                print(f"B: {r['n_tensors']} weights rounded through {requant.upper()}, relative error "
+                      f"mean {r['rel_error_mean']:.4f}, max {r['rel_error_max']:.4f}", file=sys.stderr)
             return model, tok
         return load
 
-    result = compare_models(loader(a.a), loader(a.b), cases, device=device)
-    print(format_report(result, a.a, a.b))
+    result = compare_models(loader(a.a), loader(a.b, a.requant), cases, device=device)
+    name_b = a.b + (f"  (requantized: {a.requant.upper()}, weights matching {a.requant_match!r})" if a.requant else "")
+    print(format_report(result, a.a, name_b))
 
 
 def cmd_inspect(a):
     from .models import describe_file
 
-    print(describe_file(a.path, max_groups=a.max_groups))
+    print(describe_file(a.path, max_groups=a.max_groups, show_key=a.show_key))
 
 
 def cmd_analyze(a):
@@ -199,7 +230,8 @@ def cmd_analyze(a):
     if detect(run) != "sleuth" or not Path(run).is_dir():
         # An external model (Hugging Face folder or .gguf): analysis results go
         # into a small run folder of their own, so the dashboard lists them.
-        run = prepare_external_run(run, name=a.name, dtype=_dtype(a.dtype), device=device)
+        run = prepare_external_run(run, name=a.name, dtype=_dtype(a.dtype), device=device,
+                                   keep_quantized=_keep_quantized(a.keep_quantized))
         print(f"results for this external model go to {run}")
     views = [v.strip() for v in a.views.split(",")] if a.views else None
     steps = [int(s) for s in a.steps.split(",")] if a.steps else None
@@ -282,7 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_tokenizer)
 
     s = sub.add_parser("tokenize", help="show how a tokenizer splits some text")
-    s.add_argument("--tokenizer", required=True)
+    s.add_argument("--tokenizer", required=True,
+                   help="our tokenizer .json, or a model (.gguf file, Hugging Face folder, Sleuth run)")
     s.add_argument("text")
     s.add_argument("--allow-special", action="store_true")
     s.set_defaults(fn=cmd_tokenize)
@@ -324,6 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--samples", type=int, default=1)
     s.add_argument("--device", default="auto")
     s.add_argument("--tokenizer", default=None)
+    _add_keep_quantized(s)
     s.set_defaults(fn=cmd_generate)
 
     s = sub.add_parser("analyze", help="run analyzer views over every checkpoint of a run")
@@ -341,6 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--name", default=None, help="external models: name of the results folder under runs/")
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto",
                    help="external models: weight precision (auto = bf16 on GPU, fp32 on CPU)")
+    _add_keep_quantized(s)
     s.set_defaults(fn=cmd_analyze)
 
     s = sub.add_parser("compare", help="do two models (same tokenizer) predict the same next tokens?")
@@ -349,11 +384,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--suite", action="append", default=None, help="default: suites/stories + suites/basic")
     s.add_argument("--device", default="auto")
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    s.add_argument("--requant", default=None, metavar="TYPE",
+                   help="round model B's weights through this quantizer first (Q8_0, Q4_0 or Q4_1), to measure "
+                        "what that quantization alone costs. Use the same path for A and B.")
+    s.add_argument("--requant-match", default="*", metavar="PATTERN",
+                   help="only requantize weights whose names match, e.g. 'tok_emb.weight' or 'blocks.*.mlp.*'")
+    _add_keep_quantized(s)
     s.set_defaults(fn=cmd_compare)
 
     s = sub.add_parser("inspect", help="show what's inside a .gguf file or Hugging Face model folder")
     s.add_argument("path")
     s.add_argument("--max-groups", type=int, default=80, help="how many tensor groups to list")
+    s.add_argument("--show-key", default=None, metavar="KEY",
+                   help="print one GGUF metadata value in full, e.g. tokenizer.chat_template")
     s.set_defaults(fn=cmd_inspect)
 
     s = sub.add_parser("ui", help="serve the local dashboard")

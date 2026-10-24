@@ -312,7 +312,10 @@ function renderAttention(box, d, step) {
     el("div", { class: "facts" },
       el("span", {}, "induction gain ", el("strong", { text: `${ind.induction_gain.toFixed(2)} nats/token` })),
       el("span", {}, "random sequence loss: first copy ", el("strong", { text: ind.loss_first_copy.toFixed(2) }),
-        ", repeat ", el("strong", { text: ind.loss_second_copy.toFixed(2) })),
+        ", repeat ", el("strong", { text: ind.loss_second_copy.toFixed(2) }),
+        ind.token_pool ? ` (${ind.pool_size} ${ind.token_pool}; uniform guess ${ind.uniform_loss.toFixed(2)})` : ""),
+      ind.any_token ? el("span", {}, "with any token: gain ", el("strong", { text: `${ind.induction_gain_any_token.toFixed(2)}` }),
+        ` (${ind.any_token.loss_first_copy.toFixed(2)} → ${ind.any_token.loss_second_copy.toFixed(2)})`) : "",
       el("span", {}, "top induction heads ", el("strong", { text: s.top_induction_heads.slice(0, 3).join(", ") }))),
     el("p", { class: "hint", text: "Each cell is one head (row = layer, column = head). Click a head to see its attention pattern below." }),
     grid,
@@ -352,6 +355,7 @@ function renderLogitLens(box, d, step) {
   box.append(
     cardHead(`Logit lens at step ${step}`),
     el("p", { class: "hint", text: "What each layer would predict if the model stopped there. Rows: embeddings, then after each layer (the last row is the real output). Color = probability given to the true next token. Hover to see each layer's top guess." }),
+    s.emb_top1_is_input === undefined ? "" : el("p", { class: "hint", text: `About the “emb” row: it's the input embedding sent straight to the output layer, before any layer has run. With tied embeddings that mostly predicts the current token again (here in ${pct(s.emb_top1_is_input)} of positions), which is rarely the next token. Its loss is ${num(s.loss[0])}; a uniform guess would score ${num(s.uniform_loss)}. Read it as a starting point, not a prediction.` }),
     grid,
     el("details", { open: "" }, el("summary", { text: "Per-layer accuracy (whole suite)" }),
       table([...s.rows.keys()], cols)));
@@ -381,6 +385,7 @@ function renderAblation(box, d, step) {
   const heads = el("div", { class: "chart" });
   const layers = el("div", { class: "chart" });
   layers.style.height = "160px";
+  const topBox = el("div");
   const base = s.baseline;
   box.append(
     cardHead(`Ablation at step ${step} (${s.method})`, labeled("Measure", mSel), labeled("Category", cSel)),
@@ -389,8 +394,7 @@ function renderAblation(box, d, step) {
       base[k].exact_match !== null ? `, exact ${pct(base[k].exact_match)}` : ""))),
     el("h3", { text: "Single heads" }), heads,
     el("h3", { text: "Whole layers" }), layers,
-    el("details", {}, el("summary", { text: "Most important parts (overall Δ loss)" }),
-      table(s.most_important, [{ label: "component", get: (r) => r.component }, { label: "Δ loss", get: (r) => num(r.delta_loss) }])));
+    topBox);
   function values(measure) {
     const src = measure === "drop_exact" ? a.delta_exact : a[measure];
     const j = keys.indexOf(cSel.value);
@@ -413,6 +417,12 @@ function renderAblation(box, d, step) {
       format: fmt, legendLabel: label, diverging: true, domain: [-lim, lim],
       tipTitle: (r, c) => `remove layer ${c} ${r === 0 ? "attention" : "MLP"}`,
     });
+    // The ranking follows the selected measure and category (it used to be
+    // fixed to overall Δ loss, whatever the selectors said).
+    const ranked = v.map((x, i) => [x, i]).filter(([x]) => Number.isFinite(x)).sort((p, q) => q[0] - p[0]).slice(0, 12);
+    topBox.replaceChildren(el("details", { open: "" },
+      el("summary", { text: `Most important parts (${label}, ${cSel.value})` }),
+      table(ranked, [{ label: "component", get: ([, i]) => s.components[i] }, { label, get: ([x]) => fmt(x) }])));
   }
   draw();
 }

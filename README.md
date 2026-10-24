@@ -19,7 +19,8 @@ decisions and results: [LOG.md](LOG.md) · training data and licences: [docs/DAT
 **M1** (tokenizer → 10M model → checkpoints → generation) is done and has run on an
 RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is built and
 CPU-tested. **M5** (external models: safetensors + GGUF) is partly built: Llama/Qwen-family
-models load; Gemma is next.
+models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) loads in tests,
+waiting for its first real run.
 
 | Piece | Where |
 |---|---|
@@ -117,19 +118,24 @@ them too.
 | Supported now | |
 |---|---|
 | Hugging Face folders | Llama, Mistral, Qwen2/2.5, Qwen3 (`config.json` + `*.safetensors` + `tokenizer.json`) |
-| GGUF architectures | `llama`, `qwen2`, `qwen3`, with byte-level BPE tokenizers |
+| GGUF architectures | `llama`, `qwen2`, `qwen3` (byte-level BPE tokenizers); `gemma4` (dense text models, its own BPE tokenizer) |
 | GGUF tensor types | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS |
-| Coming next | Gemma (needs its own adapter: run `inspect` on your file and share the output), keeping big models quantized in VRAM |
+| Big models | quantized weights can stay quantized in memory (`--keep-quantized`; automatic when bf16 wouldn't fit) |
+| Not yet | Gemma 4's vision/audio projector (mmproj) and its MTP "assistant" draft model; Gemma 4 E2B/E4B and MoE variants; Hugging Face Gemma folders |
 
 ```bash
 python -m sleuth inspect path/to/model.gguf          # what's inside: architecture, metadata, tensors
+python -m sleuth inspect path/to/model.gguf --show-key tokenizer.chat_template   # one metadata value, in full
 python -m sleuth generate path/to/hf-folder --prompt "The capital of France is"
 python -m sleuth analyze path/to/model.gguf --suite suites/stories --views attention,logit_lens
 python -m sleuth compare path/to/hf-folder path/to/model-Q8_0.gguf   # same model, two formats: should agree
+python -m sleuth compare path/to/hf-folder path/to/hf-folder --requant q4_1   # what 4-bit rounding alone costs
+python -m sleuth tokenize --tokenizer path/to/model.gguf "any text"   # how that model splits text
 ```
 
-`analyze` on an external model puts the results in `runs/ext-<name>/`, and the
-dashboard lists it next to your own runs. Ablation runs the whole suite once per head,
+`analyze` on an external model puts the results in `runs/ext-<name>-<hash>/` (the hash
+comes from the model's path, so two models in folders with the same name don't collide),
+and the dashboard lists it next to your own runs. Ablation runs the whole suite once per head,
 so on big models add `--views neuron_stats,attention,logit_lens` to skip it at first.
 
 Training writes `runs/<run-id>/` with the config, the environment, metrics, weight
@@ -138,7 +144,7 @@ Ctrl-C saves a checkpoint. Continue with `python -m sleuth train --resume runs/<
 
 Things to try:
 - `python -m sleuth tokenize --tokenizer data/tokenizers/synthetic-1k.json "any text"`
-  shows how text is split into tokens.
+  shows how text is split into tokens (`--tokenizer` also takes a `.gguf` or a model folder).
 - In the dashboard, set the metric to "Category-selective neurons" and watch neurons
   specialize in stories vs. math vs. code as training goes on.
 - Generate from early snapshots (`--step 16`, `--step 128`) to see grammar, then

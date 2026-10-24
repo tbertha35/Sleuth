@@ -196,8 +196,9 @@ def save_hf_model(model: Transformer, out_dir: str | Path, tokenizer=None, max_s
     from .safetensors import save_file
 
     cfg = model.cfg
-    if cfg.ffn_type != "swiglu" or cfg.norm_type != "rmsnorm" or cfg.pos_type != "rope" or cfg.bias:
-        raise ValueError("only Llama-compatible models (SwiGLU, RMSNorm, RoPE, no linear biases) can be exported")
+    if not cfg.llama_compatible:
+        raise ValueError("only Llama-compatible models (SwiGLU, RMSNorm, RoPE, no linear biases, "
+                         "none of the Gemma features) can be exported")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     model_type = "qwen3" if cfg.qk_norm else ("qwen2" if cfg.qkv_bias else "llama")
