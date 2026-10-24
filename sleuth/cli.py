@@ -148,8 +148,14 @@ def cmd_generate(a):
                        vocab_limit=tok.vocab_size, seed=None if a.seed is None else a.seed + i,
                        on_token=on_token)
         print(decoder.decode(b"", final=True), flush=True)
+        mem = ""
+        if device.type == "cuda":
+            import torch
+
+            mem = f", peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB"
         print(f"[{len(res.new_ids)} tokens, stop: {res.stop_reason}, prompt {len(prompt_ids)} tokens in "
-              f"{res.prefill_seconds * 1000:.0f} ms, decode {res.decode_tok_per_s:,.0f} tok/s]", file=sys.stderr, flush=True)
+              f"{res.prefill_seconds * 1000:.0f} ms, decode {res.decode_tok_per_s:,.1f} tok/s{mem}]",
+              file=sys.stderr, flush=True)
         if i + 1 < a.samples:
             print("-" * 40, flush=True)
 
