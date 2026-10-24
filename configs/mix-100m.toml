@@ -1,0 +1,40 @@
+# Scaling ladder, rung 3: GPT-2-small-like, d=768, 12 layers: ~101M parameters
+# (76M non-embedding). Same data, tokenizer and context as mix-20m / mix-60m.
+#
+# 12000 steps x 8 x 1024 x 16 = 1.57B tokens (~16 per parameter). Estimated ~20 h on the
+# RTX 5060 Ti (a weekend; resumable), or a natural first job for a GX10.
+# micro_batch_size 8 keeps the 32k-vocab logits and activations inside 16 GB.
+#
+#   python -m sleuth train configs/mix-100m.toml
+name = "mix-100m"
+
+[data]
+shards = "data/shards/mix"
+
+[model]
+vocab_size = 0          # from the shards (tokenizer trained with --vocab-size 32768)
+d_model = 768
+n_layers = 12
+n_heads = 12
+n_kv_heads = 4
+max_seq_len = 1024
+
+[train]
+micro_batch_size = 8
+grad_accum = 16
+max_steps = 12000
+lr = 6e-4
+warmup_steps = 500
+device = "auto"
+precision = "bf16"
+seq_len = 1024
+min_lr_ratio = 0.1
+schedule = "cosine"
+weight_decay = 0.1
+grad_clip = 1.0
+log_every = 25
+eval_every = 250
+eval_batches = 40
+snapshot_every = 500
+resume_every = 500
+peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.

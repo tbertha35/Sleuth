@@ -20,7 +20,7 @@ decisions and results: [LOG.md](LOG.md) · training data and licences: [docs/DAT
 RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is built and
 CPU-tested. **M5** (external models: safetensors + GGUF) is partly built: Llama/Qwen-family
 models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) runs and matches
-llama.cpp's perplexity, but decodes slowly (quantized weights are unpacked in plain PyTorch).
+llama.cpp's perplexity; with Triton, its 4-bit weights are unpacked inside a fused GPU kernel.
 
 | Piece | Where |
 |---|---|
@@ -56,15 +56,19 @@ you'll see:
 - PyTorch's Windows builds have no FlashAttention kernel, so attention falls back to
   the memory-efficient, cuDNN or plain kernels. That's fine for small models, and the
   probe records which ones work.
-- `torch.compile` needs Triton, which isn't bundled on Windows, so keep `compile = false`.
-  (A community `triton-windows` package exists; it would be a new dependency, so ask first.)
+- Triton (GPU kernels written in Python) isn't bundled with PyTorch on Windows. Install
+  the community build with `pip install -e ".[triton]"` (approved 2026-10-24; it pins
+  `triton-windows` 3.8.x, the series that matches PyTorch 2.14/2.15). Sleuth uses it for
+  fused quantized matmuls (big GGUF models), and it should also make `torch.compile` work.
 - No NCCL, so no multi-GPU training on Windows. That only matters on the GX10s (Linux).
 - Environment variables in PowerShell: `$env:SLEUTH_DATA = "D:\sleuth\data"`.
 - WSL2 (Linux on Windows) would get FlashAttention and Triton. It's optional and can come later.
 
 ```bash
 pip install -e ".[dev]"        # numpy + pytest, and the `sleuth` command
-pytest -q                      # ~80 CPU tests, ~10 s
+pip install -e ".[data]"       # optional: pyarrow, to read Parquet datasets (FineWeb-Edu, Wikipedia, ...)
+pip install -e ".[triton]"     # optional, Windows: triton-windows (Linux PyTorch already has Triton)
+pytest -q                      # ~190 CPU tests, under a minute
 python scripts/probe_hardware.py --disk-path /path/to/your/nvme   # saves hardware/<host>.json (stays local)
 ```
 

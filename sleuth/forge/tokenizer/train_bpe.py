@@ -31,7 +31,7 @@ import multiprocessing as mp
 from pathlib import Path
 from typing import Callable, Iterable
 
-from ..data.ingest import find_files, iter_documents
+from ..data.ingest import find_files, iter_input_documents
 from .bpe import SPECIAL_TOKENS, Tokenizer
 from .pretokenize import PATTERN, compile_pattern
 
@@ -186,10 +186,12 @@ def train_tokenizer(inputs: list[str | Path], vocab_size: int, out_path: str | P
         raise ValueError(f"vocab_size must be at least {256 + len(SPECIAL_TOKENS)}")
     files = find_files(inputs)
     if not files:
-        raise ValueError(f"no .txt/.jsonl files found in {inputs}")
+        raise ValueError(f"no .txt/.jsonl/.parquet files found in {inputs}")
     log(f"counting chunks in {len(files)} files with {workers} workers...")
     t0 = time.time()
-    docs = (d.text for d in iter_documents(files, text_field=text_field))
+    # Per-input caps ("path@MB") give every source of a mix its share of the
+    # tokenizer's training text.
+    docs = (d.text for d in iter_input_documents(inputs, text_field=text_field))
     counts, seen = count_chunks(docs, workers=workers, max_bytes=max_bytes, log=log)
     log(f"  {seen / 1e6:.1f} MB of text, {len(counts):,} distinct chunks ({time.time() - t0:.1f}s)")
 

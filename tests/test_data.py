@@ -88,3 +88,40 @@ def test_sequential_validation_batches(tiny_data):
     b = list(ds.sequential_batches(4, 16, max_batches=3))
     assert len(a) == 3
     assert all((xa == xb).all() for (xa, _), (xb, _) in zip(a, b))
+
+
+def _write_parquet(path, texts, column="text"):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({column: texts, "id": list(range(len(texts)))}), path)
+
+
+def test_parquet_and_size_caps(tmp_path):
+    from sleuth.forge.data.ingest import iter_input_documents, parse_input
+
+    (tmp_path / "web").mkdir()
+    (tmp_path / "math").mkdir()
+    _write_parquet(tmp_path / "web" / "000.parquet", [f"web document number {i}. " * 10 for i in range(50)])
+    _write_parquet(tmp_path / "math" / "a.parquet", [f"{i} + {i} = {2 * i}" for i in range(20)])
+    assert parse_input("data/raw/wiki@2.5") == (parse_input("data/raw/wiki")[0], 2_500_000)
+    docs = list(iter_input_documents([tmp_path / "web", tmp_path / "math"]))
+    assert len(docs) == 70 and {d.category for d in docs} == {"web", "math"}
+    # A cap of 0.001 MB = 1000 bytes: only the first few web documents.
+    capped = list(iter_input_documents([f"{tmp_path / 'web'}@0.001", tmp_path / "math"]))
+    web = [d for d in capped if d.category == "web"]
+    assert 0 < len(web) < 50 and sum(len(d.text) for d in web) <= 1000
+    assert sum(d.category == "math" for d in capped) == 20
+    with pytest.raises(ValueError, match="no column"):
+        list(iter_documents([tmp_path / "web" / "000.parquet"], text_field="content"))
+
+
+def test_shard_reports_the_mix(tiny_data, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "x.jsonl").write_bytes(b"".join(json.dumps({"text": f"Tom saw a cat {i}."}).encode() + b"\n"
+                                                     for i in range(30)))
+    (tmp_path / "b" / "y.txt").write_bytes(b"def f(x):\n    return x\n")
+    meta = build_shards([tmp_path / "a", f"{tmp_path / 'b'}@1"], tiny_data["tokenizer"], tmp_path / "out",
+                        val_fraction=0.0, log=lambda s: None)
+    assert set(meta["category_bytes"]) == {"a", "b"} and meta["categories"]["a"] == 30

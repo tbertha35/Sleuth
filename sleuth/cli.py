@@ -246,6 +246,29 @@ def cmd_next(a):
     print(f"entropy of the distribution: {ent:.3f} nats")
 
 
+def cmd_score(a):
+    """Per-category loss / answer loss / exact match of one model on a suite."""
+    from .analyzer.common import analysis_prefix, encode_cases, score_cases
+    from .analyzer.suites import load_suite
+    from .forge.train.trainer import resolve_device
+    from .models import load_any
+
+    device = resolve_device(a.device)
+    model, tok, meta = load_any(a.path, device=device, dtype=_dtype(a.dtype), step=a.step,
+                                keep_quantized=_keep_quantized(a.keep_quantized))
+    cases = [c for s in a.suite for c in load_suite(s)]
+    prefix = analysis_prefix(tok, a.chat) if a.chat else None
+    res = score_cases(model, encode_cases(tok, cases, model.cfg.max_seq_len, prefix),
+                      min(tok.vocab_size, model.cfg.padded_vocab), device)
+    where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
+    print(f"{a.path} ({where}, {model.num_params() / 1e6:.1f}M params)")
+    print(f"{'category':12s} {'tokens':>7s} {'loss':>7s} {'answer loss':>12s} {'exact':>7s}")
+    for c, r in res.items():
+        el = f"{r['expected_loss']:12.3f}" if r["expected_loss"] is not None else f"{'-':>12s}"
+        ex = f"{r['exact_match']:7.1%}" if r["exact_match"] is not None else f"{'-':>7s}"
+        print(f"{c:12s} {r['n_tokens']:7d} {r['loss']:7.3f} {el} {ex}")
+
+
 def cmd_perplexity(a):
     import json as _json
 
@@ -491,6 +514,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_keep_quantized(s)
     _add_chat_args(s)
     s.set_defaults(fn=cmd_next)
+
+    s = sub.add_parser("score", help="a model's loss, answer loss and exact match on a test suite, per category")
+    s.add_argument("path", help="a Sleuth run, a Hugging Face model folder, or a .gguf file")
+    s.add_argument("--suite", action="append", required=True, help="suite directory (repeatable)")
+    s.add_argument("--step", type=int, default=None, help="our runs: which snapshot (default: latest)")
+    s.add_argument("--device", default="auto")
+    s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    _add_keep_quantized(s)
+    _add_chat_suite_arg(s)
+    s.set_defaults(fn=cmd_score)
 
     s = sub.add_parser("perplexity", help="perplexity on a text file, chunked like llama.cpp's llama-perplexity")
     s.add_argument("path", help="a Sleuth run, a Hugging Face model folder, or a .gguf file")

@@ -8,12 +8,14 @@ weight for Q4_0) on the GPU and dequantize just before each matmul:
     QuantLinear:     y = x @ dequantize(blocks).T          (one layer at a time)
     QuantEmbedding:  dequantize only the rows of the tokens being looked up
 
-The price is speed: every forward pass dequantizes every weight again.
-(Real inference engines fuse the dequantization into the matmul kernel;
-that's a possible later optimization. Here, correctness and memory first.)
-
-Big weights are dequantized in chunks of output rows, so even the 262k-token
-output layer never needs its full ~2 GB bf16 copy at once.
+Two ways to run a QuantLinear:
+  * fused (GPU + Triton, Q4_0/Q8_0): a Triton kernel unpacks the blocks inside
+    the matmul (triton_kernels.py). Each weight byte is read once; nothing is
+    written back. This is what makes a 12B model usable on a 16 GB card.
+  * plain (everything else): dequantize to bf16 in memory, then F.linear.
+    Correct everywhere, but every forward pass rewrites every weight. Big
+    weights go in chunks of output rows, so even the 262k-token output layer
+    never needs its full ~2 GB bf16 copy at once.
 
 The quantized bytes are buffers, not Parameters: they can't be trained, and
 `num_params()` counts their *logical* weights (see `n_weights`).
@@ -69,6 +71,10 @@ class QuantLinear(nn.Module):
         return self.dequantize_rows(0, self.out_features, torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from . import triton_kernels  # imported on first use: loading Triton takes a moment
+
+        if triton_kernels.usable(x, self.ggml_type):
+            return triton_kernels.qmatmul(x, self.raw, self.ggml_type, self.out_features)
         rows = max(1, CHUNK_ELEMENTS // self.in_features)
         if rows >= self.out_features:
             return F.linear(x, self.dequantize_rows(0, self.out_features, x.dtype))

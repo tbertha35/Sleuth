@@ -64,3 +64,10 @@ def test_generate_chat(gemma, capsys):
     assert main(["generate", str(gemma), "--prompt", "the cat", "--chat", "--system", "Be brief.",
                  "--max-new-tokens", "3", "--temperature", "0", "--dtype", "fp32"]) == 0
     assert "3 tokens" in capsys.readouterr().err
+
+
+def test_score_command(gemma, capsys):
+    assert main(["score", str(gemma), "--suite", "suites/knowledge", "--dtype", "fp32"]) == 0
+    out = capsys.readouterr().out
+    for cat in ("facts", "sports", "math", "python", "overall"):
+        assert cat in out

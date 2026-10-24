@@ -357,14 +357,10 @@ Big quantized models (Gemma 4 12B, Q4_0 kept in VRAM) have the opposite problem:
 token dequantizes all 12B weights in plain PyTorch, so decoding is 0.7 tok/s against
 llama.cpp's 46 on the same card. Dequantizing is bandwidth: the lean path (2026-10-24) cuts
 the traffic ~4×, but the real fix is a *fused* kernel that reads the 4-bit blocks and
-multiplies in one go, never writing a bf16 copy (what llama.cpp does). ❓ Two ways, both
-need your OK:
-  * **Triton** kernels (Python-like GPU code). Included with PyTorch on Linux (the GX10s);
-    on Windows it needs the community package `triton-windows`, a new dependency. Bonus:
-    it would also make `torch.compile` work on Windows.
-  * a small **CUDA C++ extension** compiled by PyTorch itself (`torch.utils.cpp_extension`).
-    No new Python package, but on Windows it needs Visual Studio Build Tools + the CUDA
-    Toolkit installed.
+multiplies in one go, never writing a bf16 copy (what llama.cpp does). **Decided
+(2026-10-24): Triton** (`triton-windows` on Windows). First kernel: Q4_0/Q8_0
+(`forge/model/triton_kernels.py`), checked on CPU in Triton's interpreter; GPU speed to be
+measured. Next if needed: K-quants, a split-K variant for batch-1 decoding, CUDA graphs.
 
 ### 4.6 Chat SFT (later)
 Conversation jsonl → chat template with special tokens → loss only on
@@ -489,10 +485,11 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 |---|---|---|---|
 | **M0** ✅ | Skeleton, PLAN, hardware probe | probe run on both GX10s, the 5060 Ti and the 3060 Ti (results stay local; summaries in LOG.md) | your machines |
 | **M1** ✅ (CPU) | Tokenizer + 10M model end-to-end | BPE trains on your data; round-trip tests; 10M model trains on 1 GPU; snapshot + resume checkpoints; `generate` prints text + tok/s; **one analyzer view (per-layer activation stats over checkpoints) in the dashboard** | code + CPU tests here; real run on 5060 Ti or GB10 |
+| M2a | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them | 5060 Ti |
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
 | **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |
-| **M5** 🔶 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model. *Done: HF + GGUF loading for llama/qwen2/qwen3 (verified on real Qwen3-0.6B files), export to HF format, `inspect`/`compare`; Gemma 4 GGUF adapter + its tokenizer, quantized-in-VRAM layers (perplexity within 0.07 nats/token of llama.cpp on the owner's 12B file); chat formats (Gemma 4, ChatML) and chat-wrapped analysis; `perplexity`/`next` tools. Next: fused quantized matmuls (decision ❓ in §4.5.1), Qwen3's thinking switch, Gemma's MTP draft model (→ M9 speculative decoding), mmproj.* | any GPU |
+| **M5** 🔶 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model. *Done: HF + GGUF loading for llama/qwen2/qwen3 (verified on real Qwen3-0.6B files), export to HF format, `inspect`/`compare`; Gemma 4 GGUF adapter + its tokenizer, quantized-in-VRAM layers (perplexity within 0.07 nats/token of llama.cpp on the owner's 12B file); chat formats (Gemma 4, ChatML) and chat-wrapped analysis; `perplexity`/`next` tools. Fused Q4_0/Q8_0 Triton kernel (first GPU measurement pending). Next: Qwen3's thinking switch, Gemma's MTP draft model (→ M9 speculative decoding), mmproj.* | any GPU |
 | M6 | LAB harness | experiment runner, noise floor, compare report, synthetic tasks, μP | GB10 |
 | M7 | Engram | module + GPU tier → host tier → NVMe tier with prefetch; quality-vs-table-size and throughput-per-tier results | 5060 Ti + GB10 |
 | M8 | MoE | MoE layers, routing analysis, MoE vs dense vs Engram | GB10 |

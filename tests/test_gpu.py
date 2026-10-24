@@ -84,3 +84,27 @@ def test_quantized_gemma_on_gpu(tmp_path):
     bf16, _ = load_gguf_model(path, device="cuda", dtype=torch.bfloat16, keep_quantized=True)
     r = generate(bf16, IDS[:5], 20, SamplingConfig(temperature=0.0))
     assert len(r.new_ids) == 20
+
+
+def test_triton_kernel_on_gpu(tmp_path, monkeypatch):
+    """The fused Triton kernel (bf16) agrees with the plain dequantize path, and
+    is actually used. Skipped if Triton isn't installed (Windows: triton-windows)."""
+    pytest.importorskip("triton")
+    from test_gemma import IDS, make_gemma_gguf
+
+    from sleuth.forge.model import triton_kernels as tk
+    from sleuth.formats import gguf_quants as q
+    from sleuth.formats.gguf_model import load_gguf_model
+
+    path = tmp_path / "tiny-q4.gguf"
+    make_gemma_gguf(path, quant=q.Q4_0)
+    model, _ = load_gguf_model(path, device="cuda", dtype=torch.bfloat16, keep_quantized=True)
+    x = torch.tensor([IDS], device="cuda")
+    assert tk.usable(torch.zeros(1, 64, device="cuda", dtype=torch.bfloat16), q.Q4_0), "Triton self-check failed"
+    with torch.no_grad():
+        fused = model(x).logits.float()
+        monkeypatch.setenv("SLEUTH_NO_TRITON", "1")
+        plain = model(x).logits.float()
+    # Same weights, same rounding; only the order of the fp32 sums differs.
+    assert (fused - plain).abs().max().item() < 0.05 * plain.abs().max().item()
+    assert (fused.argmax(-1) == plain.argmax(-1)).float().mean().item() > 0.9

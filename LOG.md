@@ -423,3 +423,28 @@ downloaded into the repo), which is the reference for how GGUF files run.
   small CUDA extension), see PLAN §4.5.1.
 - New tools: `perplexity` (llama-perplexity's chunking, plus bits/byte and loss by
   position) and `next` (top next-token candidates with probabilities).
+
+**2026-10-24: Triton kernel for quantized models; data for a scaling ladder.**
+- *Owner decisions:* Triton for fused GPU kernels (`triton-windows` 3.8.x on Windows, matching
+  PyTorch 2.14; Linux PyTorch ships Triton). And: build a model ladder bigger than 10M on
+  general knowledge, Python, math and sports, to see how answers improve with size.
+- *Fused Q4_0/Q8_0 matmul* (`forge/model/triton_kernels.py`): each program loads a slice of
+  activations and the matching raw weight bytes, unpacks and scales them in registers
+  (fp32, rounded once to bf16, the same values as the plain path), and accumulates with
+  `tl.dot`. Each weight byte is read once and nothing is written back, against ~30 GB of
+  memory traffic per token before. Checked on CPU with Triton's interpreter
+  (TRITON_INTERPRET=1): matches dequantize+matmul to fp32 rounding, also through a whole tiny
+  Gemma 4. The interpreter has no bfloat16, so bf16 is checked on the GPU only: a
+  self-check on first use compares the kernel with the plain path and silently falls back
+  if they disagree (or Triton fails to compile). `SLEUTH_NO_TRITON=1` forces the plain path.
+- *Data:* Parquet ingest (pyarrow, approved earlier) and per-source caps `path@MB`, which set
+  a mix's proportions for both the tokenizer and the shards; `meta.json` records the actual
+  mix. Sources and licences in docs/DATA.md §2a: FineWeb-Edu 40%, Cosmopedia v2 15%,
+  Wikipedia 12%, Python-Edu 15%, FineMath-4+ 10%, OnlySports 8% (optional: CC BY-NC-SA).
+  One surprise from the research: SmolLM's own `python-edu` subset holds only file IDs (the
+  code must be fetched from Software Heritage's S3), so we use a community copy with the
+  code included (`Avelina/python-edu-cleaned`, ODC-By).
+- *Ladder:* `mix-20m` (22M params, 0.5B tokens, ~2 h estimated), `mix-60m` (64M, 1.0B, ~9 h),
+  `mix-100m` (101M, 1.57B, ~20 h): same 32k tokenizer, data and 1024-token context, so only
+  size differs. New `suites/knowledge` (facts, sports, math, python; 40 short questions) and
+  a `score` command (loss, answer loss, exact match per category) to compare them.
