@@ -109,9 +109,11 @@ def list_snapshots(run_dir: str | Path) -> list[tuple[int, Path]]:
     return _list_steps(Path(run_dir) / "snapshots")
 
 
-def resolve_weights(path: str | Path, step: int | None = None) -> Path:
+def resolve_weights(path: str | Path, step: int | None = None, nearest: bool = False) -> Path:
     """Accept a .safetensors file, a step directory, or a run directory
-    (picks `step`, or the latest snapshot)."""
+    (picks `step`, or the latest snapshot). With nearest=True, a step that has
+    no snapshot falls back to the closest one (snapshots are log-spaced, so
+    e.g. 250 -> 256)."""
     p = Path(path)
     if p.is_file():
         return p
@@ -125,13 +127,15 @@ def resolve_weights(path: str | Path, step: int | None = None) -> Path:
     for s, d in snaps:
         if s == step:
             return d / "model.safetensors"
+    if nearest:
+        return min(snaps, key=lambda sd: (abs(sd[0] - step), sd[0]))[1] / "model.safetensors"
     raise FileNotFoundError(f"no snapshot for step {step} in {p} (have {[s for s, _ in snaps]})")
 
 
 def load_model(path: str | Path, step: int | None = None, device: str | torch.device = "cpu",
-               dtype: torch.dtype = torch.float32) -> tuple[Transformer, dict]:
+               dtype: torch.dtype = torch.float32, nearest: bool = False) -> tuple[Transformer, dict]:
     """Rebuild a model from a snapshot. Returns (model in eval mode, metadata)."""
-    f = resolve_weights(path, step)
+    f = resolve_weights(path, step, nearest)
     with SafetensorsFile(f) as st:
         meta = dict(st.metadata)
     if meta.get("format") != SNAPSHOT_FORMAT:
