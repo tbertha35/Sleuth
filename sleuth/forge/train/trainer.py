@@ -102,12 +102,24 @@ def train(cfg: RunConfig, run_dir: Path | None = None, resume: bool = False,
     save a resumable checkpoint, e.g. to train in time slices on a shared
     machine. The learning-rate schedule still follows max_steps.
     """
-    tc = cfg.train
-    device = resolve_device(tc.device)
-    torch.manual_seed(tc.seed)
+    device = resolve_device(cfg.train.device)
+    previous = torch.get_float32_matmul_precision()
     if device.type == "cuda":
         # Let plain fp32 matmuls use TF32 tensor cores (outside autocast).
         torch.set_float32_matmul_precision("high")
+    try:
+        return _train(cfg, device, run_dir, resume, stop_at_step, log)
+    finally:
+        # The setting is process-wide. Leaving it on silently made later fp32
+        # work in the same process (an exactness test, an analysis) ~1e-3 less
+        # precise: TF32 keeps only 10 mantissa bits.
+        torch.set_float32_matmul_precision(previous)
+
+
+def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: bool,
+           stop_at_step: int | None, log: Callable[[str], None]) -> Path:
+    tc = cfg.train
+    torch.manual_seed(tc.seed)
 
     # ---- data + tokenizer -------------------------------------------------
     train_ds = ShardDataset(cfg.data.shards, "train")

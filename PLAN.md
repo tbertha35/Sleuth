@@ -7,7 +7,7 @@ along the way.
 
 > Status: **M0 and M1 done** (M1 trained on an RTX 5060 Ti); **M3 (analyzer core)
 > built** and run on a 10M TinyStories model and Qwen3-0.6B; **M5 (external models)
-> in progress** (Qwen done, Gemma 4 waiting for its first real run). M2 (multi-GPU,
+> in progress** (Qwen done; Gemma 4 runs and matches llama.cpp, but slowly). M2 (multi-GPU,
 > 125M) waits on the GX10s being set up. Sections marked ❓ still need a decision from you
 > (collected in [Open questions](#10-open-questions-for-you)).
 
@@ -353,6 +353,19 @@ not bandwidth-bound (see LOG 2026-10-23). In order: CUDA graphs for the decode s
 static (non-growing) context buffer, sampling on the GPU without a per-token sync, then
 batching several prompts. Each one is measured against the previous.
 
+Big quantized models (Gemma 4 12B, Q4_0 kept in VRAM) have the opposite problem: every
+token dequantizes all 12B weights in plain PyTorch, so decoding is 0.7 tok/s against
+llama.cpp's 46 on the same card. Dequantizing is bandwidth: the lean path (2026-10-24) cuts
+the traffic ~4×, but the real fix is a *fused* kernel that reads the 4-bit blocks and
+multiplies in one go, never writing a bf16 copy (what llama.cpp does). ❓ Two ways, both
+need your OK:
+  * **Triton** kernels (Python-like GPU code). Included with PyTorch on Linux (the GX10s);
+    on Windows it needs the community package `triton-windows`, a new dependency. Bonus:
+    it would also make `torch.compile` work on Windows.
+  * a small **CUDA C++ extension** compiled by PyTorch itself (`torch.utils.cpp_extension`).
+    No new Python package, but on Windows it needs Visual Studio Build Tools + the CUDA
+    Toolkit installed.
+
 ### 4.6 Chat SFT (later)
 Conversation jsonl → chat template with special tokens → loss only on
 assistant tokens. Reuses the trainer.
@@ -479,7 +492,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
 | **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |
-| **M5** 🔶 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model. *Done: HF + GGUF loading for llama/qwen2/qwen3 (verified on real Qwen3-0.6B files), export to HF format, `inspect`/`compare`; Gemma 4 GGUF adapter + its tokenizer, quantized-in-VRAM layers (CPU-tested against a transcription of llama.cpp's graph; first real run pending). Next: Gemma chat template, faster quantized matmuls, Gemma's MTP draft model (→ M9 speculative decoding), mmproj.* | any GPU |
+| **M5** 🔶 | External models | safetensors read/write, GGUF + common quants, `tokenizer.json` reader, Llama-family adapter; analyze a local model. *Done: HF + GGUF loading for llama/qwen2/qwen3 (verified on real Qwen3-0.6B files), export to HF format, `inspect`/`compare`; Gemma 4 GGUF adapter + its tokenizer, quantized-in-VRAM layers (perplexity within 0.07 nats/token of llama.cpp on the owner's 12B file); chat formats (Gemma 4, ChatML) and chat-wrapped analysis; `perplexity`/`next` tools. Next: fused quantized matmuls (decision ❓ in §4.5.1), Qwen3's thinking switch, Gemma's MTP draft model (→ M9 speculative decoding), mmproj.* | any GPU |
 | M6 | LAB harness | experiment runner, noise floor, compare report, synthetic tasks, μP | GB10 |
 | M7 | Engram | module + GPU tier → host tier → NVMe tier with prefetch; quality-vs-table-size and throughput-per-tier results | 5060 Ti + GB10 |
 | M8 | MoE | MoE layers, routing analysis, MoE vs dense vs Engram | GB10 |

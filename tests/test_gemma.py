@@ -30,6 +30,7 @@ from sleuth.models import load_any
 
 SPECIALS = [("<pad>", CONTROL), ("<eos>", CONTROL), ("<bos>", CONTROL), ("<unk>", 2), ("<mask>", CONTROL),
             ("<|turn>", CONTROL), ("<turn|>", CONTROL), ("<|tool>", USER_DEFINED)]
+CHAT_TOKENS = ["<|channel>", "<channel|>", "<|think|>"]
 CHARS = list("abcdefghijklmnopqrstuvwxyzTO.,!?'") + ["▁", "\n", "\n\n"]
 MERGES = ["▁ t", "h e", "▁t he", "a n", "▁ a", "▁a n", "i s", "▁ c", "a t", "▁c at",
           "▁ ▁", "▁▁ ▁▁", "c e", "n ce", "O nce"]
@@ -51,6 +52,9 @@ def tiny_vocab():
         if a + b not in tokens:
             tokens.append(a + b)
             types.append(NORMAL)
+    for t in CHAT_TOKENS:  # at the end, so the IDs used elsewhere in these tests don't move
+        tokens.append(t)
+        types.append(CONTROL)
     return tokens, types
 
 

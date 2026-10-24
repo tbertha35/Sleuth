@@ -25,7 +25,9 @@ pytestmark = [
 
 def test_bf16_training_and_generation(tiny_data, tmp_path):
     cfg = tiny_run_config(tiny_data, tmp_path, device="cuda", precision="bf16", max_steps=20, lr=3e-3)
+    before = torch.get_float32_matmul_precision()
     run = train(cfg, log=lambda s: None)
+    assert torch.get_float32_matmul_precision() == before  # TF32 must not leak out of train()
     model, _ = load_model(run, device="cuda")
     r = generate(model, [1, 2, 3], 20, SamplingConfig(temperature=0.8), seed=0)
     assert len(r.new_ids) > 0 and r.decode_tok_per_s > 0

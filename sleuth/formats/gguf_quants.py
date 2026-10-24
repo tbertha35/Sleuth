@@ -297,19 +297,53 @@ def quantize(x: torch.Tensor, ggml_type: int) -> torch.Tensor:
     return _QUANT[ggml_type](_blocks32(x)).reshape(-1)
 
 
-def dequantize(raw: torch.Tensor, ggml_type: int, n_elements: int) -> torch.Tensor:
-    """uint8 bytes of a whole tensor -> flat float32 tensor of n_elements."""
+# --------------------------------------------------------------------------- #
+# lean paths for the hottest formats (kept-quantized layers run these on every
+# forward pass)
+# --------------------------------------------------------------------------- #
+# The general decoders above work in int64/float32: clear, but each weight
+# makes ~50 bytes of memory traffic through temporaries. On a GPU, that traffic
+# *is* the cost. These unpack the integers straight into the output buffer
+# (bf16, f16 or f32) and apply the scale in one pass. The scale d stays in fp32
+# and the kernel computes in fp32, so each weight is rounded exactly once, to
+# the output type: the same values as the reference decoder followed by a cast.
+
+def _q4_0_into(b: torch.Tensor, out: torch.Tensor) -> None:
+    d = b[:, 0:2].contiguous().view(torch.float16).float()          # [n, 1]
+    qs = b[:, 2:18]
+    out[:, :16] = qs & 0x0F                                          # copy_ casts uint8 -> float
+    out[:, 16:] = qs >> 4
+    torch.addcmul(d * -8, out, d, out=out)                           # (q - 8)·d, rounded once
+
+
+def _q8_0_into(b: torch.Tensor, out: torch.Tensor) -> None:
+    d = b[:, 0:2].contiguous().view(torch.float16).float()
+    out.copy_(b[:, 2:34].contiguous().view(torch.int8))
+    torch.mul(out, d, out=out)
+
+
+_FAST = {Q4_0: _q4_0_into, Q8_0: _q8_0_into}
+
+
+def dequantize(raw: torch.Tensor, ggml_type: int, n_elements: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """uint8 bytes of a whole tensor -> flat tensor of n_elements, in `dtype`."""
     nbytes = tensor_nbytes(ggml_type, n_elements)
     if raw.numel() != nbytes:
         raise ValueError(f"expected {nbytes} bytes, got {raw.numel()}")
     if ggml_type in _PLAIN:
-        return raw.view(_PLAIN[ggml_type]).float()
+        return raw.view(_PLAIN[ggml_type]).to(dtype)
     if ggml_type not in _DEQUANT:
         raise NotImplementedError(f"dequantizing {TYPE_NAMES.get(ggml_type, ggml_type)} isn't implemented yet")
     per, nb = BLOCK[ggml_type]
     blocks = raw.reshape(-1, nb)
+    if ggml_type in _FAST and dtype in (torch.bfloat16, torch.float32):
+        out = torch.empty(blocks.shape[0], per, dtype=dtype, device=raw.device)
+        step = 1 << 20  # blocks per chunk: big chunks = few kernel launches; temporaries stay small
+        for i in range(0, blocks.shape[0], step):
+            _FAST[ggml_type](blocks[i:i + step], out[i:i + step])
+        return out.reshape(-1)
     out = torch.empty(blocks.shape[0], per, dtype=torch.float32, device=raw.device)
     step = 1 << 16  # bounded chunks keep the int64 temporaries small for huge tensors
     for i in range(0, blocks.shape[0], step):
         out[i:i + step] = _DEQUANT[ggml_type](blocks[i:i + step])
-    return out.reshape(-1)
+    return out.reshape(-1).to(dtype)

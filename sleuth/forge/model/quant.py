@@ -42,8 +42,8 @@ def dequantize_rows(raw: torch.Tensor, ggml_type: int, row_len: int, start: int,
                     dtype: torch.dtype) -> torch.Tensor:
     """Rows start..stop-1 of a row-major quantized matrix -> [stop-start, row_len]."""
     rb = row_bytes(ggml_type, row_len)
-    w = q.dequantize(raw[start * rb: stop * rb], ggml_type, (stop - start) * row_len)
-    return w.reshape(stop - start, row_len).to(dtype)
+    w = q.dequantize(raw[start * rb: stop * rb], ggml_type, (stop - start) * row_len, dtype)
+    return w.reshape(stop - start, row_len)
 
 
 class QuantLinear(nn.Module):
@@ -102,8 +102,8 @@ class QuantEmbedding(nn.Module):
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         rb = row_bytes(self.ggml_type, self.embedding_dim)
         rows = self.raw.view(self.num_embeddings, rb)[idx.reshape(-1)]   # gather just these rows' blocks
-        w = q.dequantize(rows.reshape(-1), self.ggml_type, rows.shape[0] * self.embedding_dim)
-        return w.reshape(*idx.shape, self.embedding_dim).to(self.out_dtype)
+        w = q.dequantize(rows.reshape(-1), self.ggml_type, rows.shape[0] * self.embedding_dim, self.out_dtype)
+        return w.reshape(*idx.shape, self.embedding_dim)
 
     def as_output_layer(self) -> QuantLinear:
         """A QuantLinear that shares this table's bytes: the tied output layer

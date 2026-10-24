@@ -299,7 +299,7 @@ function renderAttention(box, d, step) {
   const L = s.n_layers, Hn = s.n_heads;
   const metrics = [["induction_score", "Induction score"], ["prev_token", "Previous-token attention"],
     ["bos_share", "Attention to <|bos|>"], ["self", "Attention to itself"], ["entropy", "Entropy (0-1)"],
-    ["duplicate_score", "Attention to earlier copy"]];
+    ["duplicate_score", "Attention to earlier copy"]].concat(a.text_induction_score ? [["text_induction_score", "Induction score, repeated text"]] : []);
   const mSel = selectEl("head-metric", metrics, "induction_score", drawGrid);
   const best = s.heads.reduce((b, h) => (h.induction_score > b.induction_score ? h : b), s.heads[0]);
   const lSel = selectEl("pat-layer", [...Array(L).keys()].map((l) => [l, `layer ${l}`]), best.layer, drawPattern);
@@ -316,6 +316,8 @@ function renderAttention(box, d, step) {
         ind.token_pool ? ` (${ind.pool_size} ${ind.token_pool}; uniform guess ${ind.uniform_loss.toFixed(2)})` : ""),
       ind.any_token ? el("span", {}, "with any token: gain ", el("strong", { text: `${ind.induction_gain_any_token.toFixed(2)}` }),
         ` (${ind.any_token.loss_first_copy.toFixed(2)} → ${ind.any_token.loss_second_copy.toFixed(2)})`) : "",
+      ind.text && ind.text.n_cases ? el("span", {}, "repeated suite text: gain ", el("strong", { text: ind.text.induction_gain.toFixed(2) }),
+        ` (${ind.text.loss_first_copy.toFixed(2)} → ${ind.text.loss_second_copy.toFixed(2)}; top heads ${(s.top_text_induction_heads || []).slice(0, 3).join(", ")})`) : "",
       el("span", {}, "top induction heads ", el("strong", { text: s.top_induction_heads.slice(0, 3).join(", ") }))),
     el("p", { class: "hint", text: "Each cell is one head (row = layer, column = head). Click a head to see its attention pattern below." }),
     grid,
@@ -355,7 +357,7 @@ function renderLogitLens(box, d, step) {
   box.append(
     cardHead(`Logit lens at step ${step}`),
     el("p", { class: "hint", text: "What each layer would predict if the model stopped there. Rows: embeddings, then after each layer (the last row is the real output). Color = probability given to the true next token. Hover to see each layer's top guess." }),
-    s.emb_top1_is_input === undefined ? "" : el("p", { class: "hint", text: `About the “emb” row: it's the input embedding sent straight to the output layer, before any layer has run. With tied embeddings that mostly predicts the current token again (here in ${pct(s.emb_top1_is_input)} of positions), which is rarely the next token. Its loss is ${num(s.loss[0])}; a uniform guess would score ${num(s.uniform_loss)}. Read it as a starting point, not a prediction.` }),
+    s.emb_top1_is_input === undefined ? "" : el("p", { class: "hint", text: embNote(s) }),
     grid,
     el("details", { open: "" }, el("summary", { text: "Per-layer accuracy (whole suite)" }),
       table([...s.rows.keys()], cols)));
@@ -371,6 +373,17 @@ function renderLogitLens(box, d, step) {
       { value: `“${tok(s.example.top_tokens[r][c], 20)}”`, label: `top guess (${pct(a.example_top_p[r][c])})` },
     ],
   });
+}
+
+function embNote(s) {
+  const base = `About the “emb” row: it's the input embedding sent straight to the output layer, before any layer has run. Its loss is ${num(s.loss[0])}; a uniform guess would score ${num(s.uniform_loss)}. Read it as a starting point, not a prediction.`;
+  // With tied embeddings (same matrix in and out) the logit of token x is largest
+  // for x itself, so this row usually re-predicts the current token. Not always:
+  // in Gemma the final norm's gains reshape the vector before the output layer.
+  if (s.emb_top1_is_input >= 0.5) {
+    return `${base} Its top guess is the current token itself in ${pct(s.emb_top1_is_input)} of positions (typical with tied embeddings), and that is rarely the next token.`;
+  }
+  return `${base} Its top guess is the current token in ${pct(s.emb_top1_is_input)} of positions.`;
 }
 
 // ------------------------------------------------------------------ view: ablation

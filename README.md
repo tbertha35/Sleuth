@@ -19,8 +19,8 @@ decisions and results: [LOG.md](LOG.md) · training data and licences: [docs/DAT
 **M1** (tokenizer → 10M model → checkpoints → generation) is done and has run on an
 RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is built and
 CPU-tested. **M5** (external models: safetensors + GGUF) is partly built: Llama/Qwen-family
-models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) loads in tests,
-waiting for its first real run.
+models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) runs and matches
+llama.cpp's perplexity, but decodes slowly (quantized weights are unpacked in plain PyTorch).
 
 | Piece | Where |
 |---|---|
@@ -131,7 +131,16 @@ python -m sleuth analyze path/to/model.gguf --suite suites/stories --views atten
 python -m sleuth compare path/to/hf-folder path/to/model-Q8_0.gguf   # same model, two formats: should agree
 python -m sleuth compare path/to/hf-folder path/to/hf-folder --requant q4_1   # what 4-bit rounding alone costs
 python -m sleuth tokenize --tokenizer path/to/model.gguf "any text"   # how that model splits text
+python -m sleuth generate path/to/model.gguf --chat --prompt "What is the capital of France?"
+python -m sleuth next path/to/model.gguf --prompt "The capital of France is"   # top next tokens + probabilities
+python -m sleuth perplexity path/to/model.gguf --file some.txt --ctx 256 --chunks 20   # like llama-perplexity
+python -m sleuth analyze path/to/model.gguf --suite suites/stories --views attention,logit_lens --chat
 ```
+
+Instruction-tuned ("chat", "it") models only behave inside their chat format: `--chat`
+wraps a prompt as a user turn (Gemma 4 and ChatML/Qwen formats). For `analyze`/`compare`,
+`--chat` makes every test the model's reply to "Continue this text." and scores only the
+test's own tokens; results appear as a separate `<suite>-chat` suite.
 
 `analyze` on an external model puts the results in `runs/ext-<name>-<hash>/` (the hash
 comes from the model's path, so two models in folders with the same name don't collide),

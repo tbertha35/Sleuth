@@ -48,6 +48,15 @@ def cmd_tokenize(a):
     p = Path(a.tokenizer)
     # Our tokenizer.json, or the tokenizer of any model we can load (.gguf, HF folder, run).
     tok = Tokenizer.load(p) if p.is_file() and p.suffix == ".json" else load_tokenizer(p)
+    if a.chat:
+        from .formats.chat import encode_chat
+
+        ids = encode_chat(tok, [{"role": "user", "content": a.text}])
+        print(f"chat-formatted: {tok.decode(ids)!r}")
+        print(f"{len(ids)} tokens")
+        print(" | ".join(repr(tok.decode([i]))[1:-1] for i in ids))
+        print(ids)
+        return
     ids = tok.encode(a.text, allowed_special="all" if a.allow_special else "none")
     print(f"{len(a.text.encode())} bytes -> {len(ids)} tokens")
     print(" | ".join(repr(tok.decode([i]))[1:-1] for i in ids))
@@ -134,8 +143,9 @@ def cmd_generate(a):
     generate(model, [tok.start_id] * 8, 2, sampling, seed=0)
     stops = _stop_ids(tok)
     for i in range(a.samples):
-        prompt_ids = [tok.start_id] + tok.encode(a.prompt)
-        print(a.prompt, end="", flush=True)
+        prompt_ids = _prompt_ids(tok, a)
+        if not a.chat:
+            print(a.prompt, end="", flush=True)
         # One token can end in the middle of a multi-byte character; the
         # incremental decoder holds those bytes until the character is complete.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -158,6 +168,33 @@ def cmd_generate(a):
               file=sys.stderr, flush=True)
         if i + 1 < a.samples:
             print("-" * 40, flush=True)
+
+
+def _prompt_ids(tok, a) -> list[int]:
+    """The prompt as token IDs: plain (start token + text), or with --chat
+    wrapped in the model's chat format as a user turn (formats/chat.py)."""
+    if not getattr(a, "chat", False):
+        return [tok.start_id] + tok.encode(a.prompt)
+    from .formats.chat import encode_chat
+
+    messages = ([{"role": "system", "content": a.system}] if a.system else []) + [{"role": "user", "content": a.prompt}]
+    return encode_chat(tok, messages, thinking=a.think)
+
+
+def _add_chat_args(s):
+    s.add_argument("--chat", action="store_true",
+                   help="wrap the prompt as a user turn in the model's chat format (instruction-tuned models)")
+    s.add_argument("--system", default=None, help="with --chat: a system message")
+    s.add_argument("--think", action="store_true", help="with --chat: let the model think first (Gemma 4)")
+
+
+def _add_chat_suite_arg(s):
+    from .analyzer.common import DEFAULT_CHAT_INSTRUCTION
+
+    s.add_argument("--chat", nargs="?", const=DEFAULT_CHAT_INSTRUCTION, default=None, metavar="INSTRUCTION",
+                   help="chat models: put every test inside a user turn holding INSTRUCTION (default: "
+                        f"{DEFAULT_CHAT_INSTRUCTION!r}) and an opened model turn; only the test's own tokens "
+                        "are scored. Results go to a separate '<suite>-chat' suite")
 
 
 def _keep_quantized(name: str):
@@ -187,6 +224,54 @@ def _stop_ids(tok) -> set[int]:
     return stops
 
 
+def cmd_next(a):
+    """The model's top candidates for the next token, with probabilities."""
+    import torch
+
+    from .forge.train.trainer import resolve_device
+    from .models import load_any
+
+    device = resolve_device(a.device)
+    model, tok, _ = load_any(a.path, device=device, dtype=_dtype(a.dtype), keep_quantized=_keep_quantized(a.keep_quantized))
+    ids = _prompt_ids(tok, a)
+    with torch.no_grad():
+        logits = model(torch.tensor([ids], device=device)).logits[0, -1, :tok.vocab_size].float()
+    probs = logits.softmax(-1)
+    top = probs.topk(a.top)
+    print(f"prompt: {len(ids)} tokens, last: {tok.decode(ids[-3:])!r}")
+    print(f"{'rank':>4} {'id':>7} {'prob':>8} {'logit':>8}  token")
+    for r, (pr, i) in enumerate(zip(top.values.tolist(), top.indices.tolist())):
+        print(f"{r + 1:4d} {i:7d} {pr:8.2%} {logits[i].item():8.3f}  {tok.decode([i])!r}")
+    ent = float(-(probs * probs.clamp_min(1e-30).log()).sum())
+    print(f"entropy of the distribution: {ent:.3f} nats")
+
+
+def cmd_perplexity(a):
+    import json as _json
+
+    from .analyzer.perplexity import perplexity
+    from .forge.train.trainer import resolve_device
+    from .models import load_any
+
+    device = resolve_device(a.device)
+    model, tok, _ = load_any(a.path, device=device, dtype=_dtype(a.dtype), keep_quantized=_keep_quantized(a.keep_quantized),
+                             max_seq_len=max(4096, a.ctx))
+    text = Path(a.file).read_text(encoding="utf-8")
+    if a.max_chars:
+        text = text[:a.max_chars]
+    r = perplexity(model, tok, text, ctx=a.ctx, max_chunks=a.chunks, device=device,
+                   log=lambda line: print(line, end=" ", flush=True))
+    print()
+    print(f"{r['chunks']} chunks of {r['ctx']} tokens ({r['tokens_in_text']} in the text), "
+          f"{r['scored_tokens']} scored (second half of each chunk)")
+    print(f"perplexity {r['perplexity']:.4f}, loss {r['loss']:.4f} nats/token, {r['bits_per_byte']:.4f} bits/byte")
+    print("loss by predicted position (every prediction, not just the scored half):")
+    for b in r["by_position"]:
+        print(f"  {b['positions']:>9s}  {b['loss']:7.3f} nats  ({b['n']} tokens)")
+    if a.json:
+        Path(a.json).write_text(_json.dumps(r, indent=1) + "\n")
+
+
 def cmd_compare(a):
     from .analyzer.compare import compare_models, format_report
     from .analyzer.suites import load_suite
@@ -209,7 +294,7 @@ def cmd_compare(a):
             return model, tok
         return load
 
-    result = compare_models(loader(a.a), loader(a.b, a.requant), cases, device=device)
+    result = compare_models(loader(a.a), loader(a.b, a.requant), cases, device=device, chat_instruction=a.chat)
     name_b = a.b + (f"  (requantized: {a.requant.upper()}, weights matching {a.requant_match!r})" if a.requant else "")
     print(format_report(result, a.a, name_b))
 
@@ -237,7 +322,8 @@ def cmd_analyze(a):
     steps = [int(s) for s in a.steps.split(",")] if a.steps else None
     options = {"neuron_stats": {"k": a.k}, "ablation": {"method": a.ablation}}
     for suite in a.suite or ["suites/basic"]:
-        run_timeline(run, suite, device=device, views=views, force=a.force, steps=steps, options=options)
+        run_timeline(run, suite, device=device, views=views, force=a.force, steps=steps, options=options,
+                     chat_instruction=a.chat)
 
 
 def cmd_ui(a):
@@ -318,6 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="our tokenizer .json, or a model (.gguf file, Hugging Face folder, Sleuth run)")
     s.add_argument("text")
     s.add_argument("--allow-special", action="store_true")
+    s.add_argument("--chat", action="store_true", help="show the text as a user turn in the model's chat format")
     s.set_defaults(fn=cmd_tokenize)
 
     s = sub.add_parser("shard", help="tokenize documents into binary training shards")
@@ -358,6 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--device", default="auto")
     s.add_argument("--tokenizer", default=None)
     _add_keep_quantized(s)
+    _add_chat_args(s)
     s.set_defaults(fn=cmd_generate)
 
     s = sub.add_parser("analyze", help="run analyzer views over every checkpoint of a run")
@@ -376,6 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto",
                    help="external models: weight precision (auto = bf16 on GPU, fp32 on CPU)")
     _add_keep_quantized(s)
+    _add_chat_suite_arg(s)
     s.set_defaults(fn=cmd_analyze)
 
     s = sub.add_parser("compare", help="do two models (same tokenizer) predict the same next tokens?")
@@ -390,7 +479,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--requant-match", default="*", metavar="PATTERN",
                    help="only requantize weights whose names match, e.g. 'tok_emb.weight' or 'blocks.*.mlp.*'")
     _add_keep_quantized(s)
+    _add_chat_suite_arg(s)
     s.set_defaults(fn=cmd_compare)
+
+    s = sub.add_parser("next", help="the model's top candidates for the next token after a prompt")
+    s.add_argument("path", help="a Sleuth run, a Hugging Face model folder, or a .gguf file")
+    s.add_argument("--prompt", default="")
+    s.add_argument("--top", type=int, default=10)
+    s.add_argument("--device", default="auto")
+    s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    _add_keep_quantized(s)
+    _add_chat_args(s)
+    s.set_defaults(fn=cmd_next)
+
+    s = sub.add_parser("perplexity", help="perplexity on a text file, chunked like llama.cpp's llama-perplexity")
+    s.add_argument("path", help="a Sleuth run, a Hugging Face model folder, or a .gguf file")
+    s.add_argument("--file", required=True, help="a UTF-8 text file")
+    s.add_argument("--ctx", type=int, default=512, help="tokens per chunk (llama-perplexity's -c)")
+    s.add_argument("--chunks", type=int, default=None, help="at most this many chunks (--chunks)")
+    s.add_argument("--max-chars", type=int, default=None, help="only read the start of the file")
+    s.add_argument("--json", default=None, help="also write the results to this JSON file")
+    s.add_argument("--device", default="auto")
+    s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    _add_keep_quantized(s)
+    s.set_defaults(fn=cmd_perplexity)
 
     s = sub.add_parser("inspect", help="show what's inside a .gguf file or Hugging Face model folder")
     s.add_argument("path")

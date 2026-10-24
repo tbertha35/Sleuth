@@ -40,13 +40,16 @@ from .common import categories, encode_cases, series
 EXAMPLE_MAX_TOKENS = 40
 
 
+LOGITS_PER_CALL = 1 << 26  # unembed up to 64M logits at once (~256 MB as float32)
+
+
 @torch.no_grad()
-def run(model, tokenizer, cases, device, **_) -> dict:
+def run(model, tokenizer, cases, device, prefix: list[int] | None = None, **_) -> dict:
     model.eval().to(device)
     L = model.cfg.n_layers
     V = tokenizer.vocab_size
     rows = ["emb"] + [f"L{l}" for l in range(L)]
-    enc = encode_cases(tokenizer, cases, model.cfg.max_seq_len)
+    enc = encode_cases(tokenizer, cases, model.cfg.max_seq_len, prefix)
     cats = categories(enc)
     ci = {c: i for i, c in enumerate(cats)}
     loss = torch.zeros(len(rows), len(cats), dtype=torch.float64)
@@ -61,29 +64,40 @@ def run(model, tokenizer, cases, device, **_) -> dict:
 
     taps = {"embed": grab, "blocks.*.resid_post": grab}
 
-    def residuals(ids):
+    def residuals(ids) -> torch.Tensor:
+        """[rows, T, d]: the residual stream before any layer and after each one."""
         captured.clear()
         with listen(model, taps):
             model(ids)
-        return [captured[r] for r in range(len(rows))]
+        return torch.cat([captured[r] for r in range(len(rows))], dim=0)
 
     def row_logits(h):
-        # One row at a time: [T, V] floats per row. Stacking every row at once
-        # would be rows x T x V, gigabytes for a 150k-token vocab.
-        return model.unembed(h)[0, :, :V].float()
+        """[R, T, d] -> [R, T, V] float logits, in groups of rows.
+
+        One call per group, not per row: unembedding is a [d x vocab] matmul,
+        and with a quantized output layer (Gemma's 262k x 3840) every call
+        dequantizes the whole matrix again. Groups keep memory bounded:
+        all rows at once would be rows x T x V floats, gigabytes for a big vocab."""
+        per = max(1, LOGITS_PER_CALL // max(1, h.shape[1] * V))
+        for i in range(0, h.shape[0], per):
+            yield i, model.unembed(h[i:i + per])[..., :V].float()
 
     for e in enc:
         ids = e.ids.to(device)
-        if ids.shape[1] < 2:
+        sc = e.scored                                         # predictions of the test's own tokens
+        if sc.stop <= sc.start:
             continue
-        targets = ids[0, 1:]
+        targets = ids[0, sc.start + 1: sc.stop + 1]
         c = ci[e.category]
-        for r, h in enumerate(residuals(ids)):
-            logits = row_logits(h)[:-1]                     # predictions for tokens 1..T-1
-            loss[r, c] += F.cross_entropy(logits, targets, reduction="sum").double().cpu()
-            correct[r, c] += (logits.argmax(-1) == targets).sum().double().cpu()
-            if r == 0:
-                emb_is_input += int((logits.argmax(-1) == ids[0, :-1]).sum())
+        for r0, logits in row_logits(residuals(ids)):
+            lg = logits[:, sc]                                # [g, n, V]
+            g, n = lg.shape[:2]
+            nll = F.cross_entropy(lg.reshape(g * n, V), targets.repeat(g), reduction="none").view(g, n)
+            loss[r0:r0 + g, c] += nll.sum(1).double().cpu()
+            top = lg.argmax(-1)                               # [g, n]
+            correct[r0:r0 + g, c] += (top == targets).sum(1).double().cpu()
+            if r0 == 0:
+                emb_is_input += int((top[0] == ids[0, sc]).sum())
         n_tok[c] += targets.shape[0]
 
     loss_by_cat = loss / n_tok.clamp(min=1)
@@ -91,23 +105,25 @@ def run(model, tokenizer, cases, device, **_) -> dict:
     loss_all = loss.sum(1) / n_tok.sum().clamp(min=1)
     acc_all = correct.sum(1) / n_tok.sum().clamp(min=1)
 
-    # ---- example grid for the dashboard
+    # ---- example grid for the dashboard: the test's own tokens (plus the last
+    # prefix token, whose prediction is the test's first token)
     example = None
     arrays = {"loss_by_category": loss_by_cat.float().numpy(), "top1_by_category": acc_by_cat.float().numpy()}
     if enc:
-        ex = max(enc, key=lambda e: min(e.ids.shape[1], EXAMPLE_MAX_TOKENS))
-        ids = ex.ids[:, :EXAMPLE_MAX_TOKENS].to(device)
+        ex = max(enc, key=lambda e: min(e.ids.shape[1] - e.n_prefix, EXAMPLE_MAX_TOKENS))
+        first = ex.n_prefix - 1
+        ids = ex.ids[:, :first + EXAMPLE_MAX_TOKENS].to(device)
         tops, top_ids, trues = [], [], []
-        for h in residuals(ids):
-            probs = row_logits(h)[:-1].softmax(-1)          # [T-1, V]
-            p, i = probs.max(-1)
-            tops.append(p)
+        for _, logits in row_logits(residuals(ids)):
+            probs = logits[:, first:-1].softmax(-1)          # [g, T', V]
+            pr, i = probs.max(-1)
+            tops.append(pr)
             top_ids.append(i)
-            trues.append(probs.gather(-1, ids[0, 1:].unsqueeze(-1)).squeeze(-1))
-        top_p, top_i, true_p = torch.stack(tops), torch.stack(top_ids), torch.stack(trues)
+            trues.append(probs.gather(-1, ids[0, first + 1:].expand(probs.shape[0], -1).unsqueeze(-1)).squeeze(-1))
+        top_p, top_i, true_p = torch.cat(tops), torch.cat(top_ids), torch.cat(trues)
         example = {
             "case_id": ex.case.id,
-            "tokens": [tokenizer.decode([i]) for i in ids[0].tolist()],
+            "tokens": [tokenizer.decode([i]) for i in ids[0, first:].tolist()],
             "top_tokens": [[tokenizer.decode([i]) for i in row] for row in top_i.tolist()],
         }
         arrays["example_top_p"] = top_p.cpu().numpy()

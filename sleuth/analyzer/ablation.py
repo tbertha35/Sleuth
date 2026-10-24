@@ -13,7 +13,7 @@ Two ways to "remove" a component:
                   states it never saw in training, which can exaggerate the
                   damage.
 
-The <|bos|> position is left untouched: models often use it as an "attention
+The <|bos|> position (or a chat prefix, see common.py) is left untouched: models often use it as an "attention
 sink", and changing it would measure a different effect.
 
 For each ablation we rerun the whole suite (teacher-forced, see common.py) and
@@ -46,13 +46,14 @@ def _label(kind: str, l: int, h: int) -> str:
 
 
 @torch.no_grad()
-def run(model, tokenizer, cases, device, method: str = "mean", **_) -> dict:
+def run(model, tokenizer, cases, device, method: str = "mean", prefix: list[int] | None = None, **_) -> dict:
     if method not in ("mean", "zero"):
         raise ValueError("ablation method must be 'mean' or 'zero'")
     model.eval().to(device)
     L, H = model.cfg.n_layers, model.cfg.n_heads
     V = tokenizer.vocab_size
-    enc = encode_cases(tokenizer, cases, model.cfg.max_seq_len)
+    enc = encode_cases(tokenizer, cases, model.cfg.max_seq_len, prefix)
+    skip = {"n": 1}  # positions left untouched: <|bos|>, or the whole chat prefix
     cats = categories(enc)
 
     # ---- average outputs over the suite (needed for mean ablation)
@@ -60,7 +61,7 @@ def run(model, tokenizer, cases, device, method: str = "mean", **_) -> dict:
     counts: dict[str, int] = {}
 
     def accumulate(name, t):
-        x = t[0, 1:].double()                     # skip <|bos|>
+        x = t[0, skip["n"]:].double()             # skip <|bos|> / the prefix
         sums[name] = sums.get(name, 0) + x.sum(0)
         counts[name] = counts.get(name, 0) + x.shape[0]
 
@@ -68,17 +69,19 @@ def run(model, tokenizer, cases, device, method: str = "mean", **_) -> dict:
         with listen(model, {"blocks.*.attn.z": accumulate, "blocks.*.attn_out": accumulate,
                             "blocks.*.mlp_out": accumulate}):
             for e in enc:
+                skip["n"] = e.n_prefix
                 model(e.ids.to(device))
     means = {k: (v / max(1, counts[k])) for k, v in sums.items()}
 
     def replacement(name: str, t: torch.Tensor, head: int | None) -> torch.Tensor:
         t = t.clone()
         if head is None:
-            t[:, 1:] = means[name].to(t.device, t.dtype) if method == "mean" else 0
+            t[:, skip["n"]:] = means[name].to(t.device, t.dtype) if method == "mean" else 0
         else:
-            t[:, 1:, head] = means[name][head].to(t.device, t.dtype) if method == "mean" else 0
+            t[:, skip["n"]:, head] = means[name][head].to(t.device, t.dtype) if method == "mean" else 0
         return t
 
+    skip["n"] = enc[0].n_prefix if enc else 1  # the same for every test
     baseline = score_cases(model, enc, V, device)
     comps = _components(L, H)
     keys = cats + ["overall"]
