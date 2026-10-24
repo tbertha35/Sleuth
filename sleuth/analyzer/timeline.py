@@ -62,10 +62,11 @@ def external_run_name(model_path: Path) -> str:
     return f"{base}-{digest}"
 
 
-def prepare_external_run(model_path: str | Path, name: str | None = None, dtype=None, device: str = "cpu") -> Path:
+def prepare_external_run(model_path: str | Path, name: str | None = None, dtype=None, device: str = "cpu",
+                         keep_quantized: bool | str = "auto") -> Path:
     """Create (or reuse) runs/ext-<name>/ for analyzing an external model."""
     from ..env import env_info, runs_root
-    from ..models import detect, load_any
+    from ..models import detect, read_config
 
     model_path = Path(model_path).resolve()
     name = name or external_run_name(model_path)
@@ -75,15 +76,15 @@ def prepare_external_run(model_path: str | Path, name: str | None = None, dtype=
         if old and os.path.normcase(old) != os.path.normcase(str(model_path)):
             raise ValueError(f"{run_dir} already holds results for another model ({old}); pick a different --name")
     else:
-        model, _, info = load_any(model_path, device=device, dtype=dtype)
+        model_cfg, info = read_config(model_path)  # the weights are loaded later, only if a view needs them
         run_dir.mkdir(parents=True, exist_ok=True)
         cfg = {"name": name, "external": {"path": str(model_path), "format": detect(model_path),
                                           "dtype": str(dtype).replace("torch.", "") if dtype else None,
+                                          "keep_quantized": keep_quantized,
                                           "info": info},
-               "model": dataclasses.asdict(model.cfg), "train": {"max_steps": 0}}
+               "model": dataclasses.asdict(model_cfg), "train": {"max_steps": 0}}
         (run_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
         (run_dir / "env.json").write_text(json.dumps(env_info(), indent=2) + "\n")
-        del model
     return run_dir
 
 
@@ -96,7 +97,9 @@ def _checkpoints(run_dir: Path, device: str):
 
         dtype = getattr(torch, ext["dtype"]) if ext.get("dtype") else None
         # Load the weights only if some view actually needs to run (big models take a while).
-        load = lambda: (load_any(ext["path"], device=device, dtype=dtype)[0], {"tokens_seen": 0})  # noqa: E731
+        keep = ext.get("keep_quantized", "auto")
+        load = lambda: (load_any(ext["path"], device=device, dtype=dtype, keep_quantized=keep)[0],  # noqa: E731
+                        {"tokens_seen": 0})
         return [(0, load)], load_tokenizer(ext["path"])
     tokenizer = Tokenizer.load(run_dir / "tokenizer.json")
     return [(s, (lambda d=d: load_model(d, device=device))) for s, d in list_snapshots(run_dir)], tokenizer

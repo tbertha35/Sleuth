@@ -13,12 +13,19 @@ VARIANTS = [
     dict(n_kv_heads=1),
     dict(ffn_type="gelu", norm_type="layernorm", bias=True, tie_embeddings=False),
     dict(pos_type="none"),
+    # Gemma 4-style: sliding + full layers with different head widths, KV heads and
+    # RoPE bases, no v_proj on full layers, sandwich norms, GeGLU, softcap, ...
+    dict(layer_types=["sliding", "full", "sliding"], sliding_window=5, head_size=32, n_kv_heads=1,
+         swa_head_size=16, swa_kv_heads=2, swa_rope_theta=100.0, full_v_from_k=True, qk_norm=True,
+         v_norm=True, attn_scale=1.0, post_norms=True, layer_scale=True, ffn_type="geglu",
+         embed_scale=8.0, final_softcap=30.0),
 ]
+GEMMA = VARIANTS[-1]
 
 
 def make(**kw):
     torch.manual_seed(0)
-    cfg = ModelConfig(vocab_size=300, d_model=64, n_layers=3, n_heads=4, max_seq_len=48, **kw)
+    cfg = ModelConfig(**{"vocab_size": 300, "d_model": 64, "n_layers": 3, "n_heads": 4, "max_seq_len": 48, **kw})
     return Transformer(cfg).eval()
 
 
@@ -123,3 +130,55 @@ def test_too_long_sequence_rejected():
 def test_flops_grow_with_seq_len():
     cfg = ModelConfig(vocab_size=1000)
     assert train_flops_per_token(cfg, 2048) > train_flops_per_token(cfg, 128) > 6 * param_counts(cfg)["matmul"] - 1
+
+
+def test_sliding_window_hides_old_tokens():
+    """In a model of only sliding layers (window 4), position t can't see token 0
+    once t >= 4 (one layer: information moves at most window-1 positions)."""
+    m = make(**{**GEMMA, "n_layers": 1, "layer_types": ["sliding"], "sliding_window": 4})
+    x = torch.randint(0, 300, (1, 12))
+    y = x.clone()
+    y[0, 0] = (y[0, 0] + 1) % 300
+    a, b = m(x).logits, m(y).logits
+    assert not torch.allclose(a[:, :4], b[:, :4])
+    torch.testing.assert_close(a[:, 4:], b[:, 4:])
+
+
+def test_attention_pattern_respects_window():
+    m = make(**GEMMA)
+    seen = {}
+    with listen(m, {"blocks.*.attn.pattern": lambda n, t: seen.setdefault(n, t)}):
+        m(torch.randint(0, 300, (1, 12)))
+    sliding, full = seen["blocks.0.attn.pattern"][0, 0], seen["blocks.1.attn.pattern"][0, 0]
+    q, k = torch.arange(12)[:, None], torch.arange(12)[None, :]
+    assert torch.all(sliding[(q - k >= 5)] == 0) and torch.all(full[k <= q] > 0)
+
+
+def test_softcap_bounds_logits_and_unembed_matches():
+    m = make(**{**GEMMA, "final_softcap": 0.5})
+    x = torch.randint(0, 300, (1, 8))
+    seen = {}
+    with listen(m, {"blocks.2.resid_post": lambda n, t: seen.setdefault("r", t)}):
+        logits = m(x).logits
+    assert logits.abs().max() <= 0.5
+    torch.testing.assert_close(m.unembed(seen["r"]), logits)
+
+
+def test_rope_freq_factors():
+    m = make(**GEMMA)
+    x = torch.randint(0, 300, (1, 10))
+    base = m(x).logits
+    m.set_rope_freq_factors("full", torch.ones(16))      # factors of 1 change nothing
+    torch.testing.assert_close(m(x).logits, base)
+    m.set_rope_freq_factors("full", torch.full((16,), 1e30))  # no rotation at all on full layers
+    assert not torch.allclose(m(x).logits, base)
+    assert torch.allclose(m.rope_cos_full, torch.ones_like(m.rope_cos_full))
+    with pytest.raises(ValueError, match="frequency factors"):
+        m.set_rope_freq_factors("full", torch.ones(5))
+
+
+def test_layer_types_validated():
+    with pytest.raises(ValueError, match="entries"):
+        ModelConfig(vocab_size=10, n_layers=2, layer_types=["full"])
+    with pytest.raises(ValueError, match="sliding_window"):
+        ModelConfig(vocab_size=10, n_layers=1, layer_types=["sliding"])

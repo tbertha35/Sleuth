@@ -23,34 +23,48 @@ from __future__ import annotations
 from .config import ModelConfig
 
 
-def param_counts(cfg: ModelConfig) -> dict[str, int]:
-    d, hd, H, K, L = cfg.d_model, cfg.head_dim, cfg.n_heads, cfg.kv_heads, cfg.n_layers
+def _layer_params(cfg: ModelConfig, i: int) -> tuple[int, int]:
+    """(all parameters, matmul weights) of block i."""
+    spec = cfg.attn_spec(i)
+    d, hd, H, K = cfg.d_model, spec.head_dim, cfg.n_heads, spec.kv_heads
     b = 1 if cfg.bias else 0
-    attn = d * H * hd + 2 * d * K * hd + H * hd * d
+    n_kv_proj = 1 if spec.v_from_k else 2                     # Gemma 4 full layers have no v_proj
+    attn = d * H * hd + n_kv_proj * d * K * hd + H * hd * d
     qkv_b = 1 if (cfg.bias or cfg.qkv_bias) else 0
-    attn_bias = qkv_b * (H * hd + 2 * K * hd) + b * d
-    n_ffn_in = 2 if cfg.ffn_type == "swiglu" else 1
+    attn_bias = qkv_b * (H * hd + n_kv_proj * K * hd) + b * d
+    n_ffn_in = 2 if cfg.ffn_type in ("swiglu", "geglu") else 1
     mlp = n_ffn_in * d * cfg.hidden + cfg.hidden * d
     mlp_bias = b * (n_ffn_in * cfg.hidden + d)
     norm_params = d if cfg.norm_type == "rmsnorm" else 2 * d
+    n_norms = 4 if cfg.post_norms else 2
     qk_norm = 2 * hd if cfg.qk_norm else 0
-    per_layer = attn + attn_bias + mlp + mlp_bias + 2 * norm_params + qk_norm
+    scale = 1 if cfg.layer_scale else 0
+    return attn + attn_bias + mlp + mlp_bias + n_norms * norm_params + qk_norm + scale, attn + mlp
+
+
+def param_counts(cfg: ModelConfig) -> dict[str, int]:
+    layers = [_layer_params(cfg, i) for i in range(cfg.n_layers)]
+    d = cfg.d_model
+    norm_params = d if cfg.norm_type == "rmsnorm" else 2 * d
     embedding = cfg.padded_vocab * d
     head = 0 if cfg.tie_embeddings else cfg.padded_vocab * d
-    total = embedding + L * per_layer + norm_params + head
+    total = embedding + sum(n for n, _ in layers) + norm_params + head
     return {
         "total": total,
         "embedding": embedding,
         "non_embedding": total - embedding,
-        "per_layer": per_layer,
+        "per_layer": layers[0][0],
         # weights that take part in matmuls (what the 6N rule counts)
-        "matmul": L * (attn + mlp) + cfg.padded_vocab * d,
+        "matmul": sum(m for _, m in layers) + cfg.padded_vocab * d,
     }
 
 
 def train_flops_per_token(cfg: ModelConfig, seq_len: int) -> float:
     n = param_counts(cfg)["matmul"]
-    return 6 * n + 12 * cfg.n_layers * cfg.n_heads * cfg.head_dim * seq_len
+    # Attention term per layer; a sliding layer only looks at `window` keys.
+    attn = sum(cfg.n_heads * cfg.attn_spec(i).head_dim * min(seq_len, cfg.attn_spec(i).window or seq_len)
+               for i in range(cfg.n_layers))
+    return 6 * n + 12 * attn
 
 
 def describe(cfg: ModelConfig, seq_len: int | None = None) -> str:

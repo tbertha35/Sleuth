@@ -355,7 +355,7 @@ function renderLogitLens(box, d, step) {
   box.append(
     cardHead(`Logit lens at step ${step}`),
     el("p", { class: "hint", text: "What each layer would predict if the model stopped there. Rows: embeddings, then after each layer (the last row is the real output). Color = probability given to the true next token. Hover to see each layer's top guess." }),
-    s.emb_top1_is_input === undefined ? "" : el("p", { class: "hint", text: `About the “emb” row: it's the input embedding sent straight to the output layer, before any layer has run. With tied embeddings that mostly predicts the *current* token again (here ${pct(s.emb_top1_is_input)} of positions), which is almost never the next token, so its loss (${num(s.loss[0])}) is far above a uniform guess (${num(s.uniform_loss)}). Read it as a starting point, not a prediction.` }),
+    s.emb_top1_is_input === undefined ? "" : el("p", { class: "hint", text: `About the “emb” row: it's the input embedding sent straight to the output layer, before any layer has run. With tied embeddings that mostly predicts the current token again (here in ${pct(s.emb_top1_is_input)} of positions), which is rarely the next token. Its loss is ${num(s.loss[0])}; a uniform guess would score ${num(s.uniform_loss)}. Read it as a starting point, not a prediction.` }),
     grid,
     el("details", { open: "" }, el("summary", { text: "Per-layer accuracy (whole suite)" }),
       table([...s.rows.keys()], cols)));

@@ -294,3 +294,85 @@ disagreement beyond quantization noise points at our loader or dequantizer.
   5-token prompt is mostly noise.
 - Still slow, as expected: decode ~90 tok/s at batch 1 (per-token overhead, see the
   inference backlog in PLAN §4.5.1).
+
+**2026-10-24: What the Qwen3 / TinyStories test round showed, and the fixes.**
+- *Loader correctness, settled:* safetensors vs ggml-org's Q8_0: KL 0.0075 nats, 96.9% top-1
+  agreement, word-for-word the same greedy text. The Q4_K_M per-tensor weight errors are
+  at the level 4-bit rounding *should* give: I simulated plain round-to-nearest on random
+  data (asymmetric 4-bit, blocks of 32: 7.8% Gaussian, 9.2–9.4% heavy-tailed; symmetric
+  6-bit, blocks of 16: 2.1–2.6%), and the file's Q4_K (7.3%) and Q6_K (1.8%) are slightly
+  *better*, as llama.cpp's scale search + imatrix should be. A misread bit layout gives
+  errors near 100%. So the dequantizers are right.
+- *Q4_K_M's large KL (0.66) is probably real, not a bug,* but that's not proven. New
+  `compare --requant q4_1` rounds the original weights through our own 4-bit quantizer:
+  if that alone gives a similar KL, Qwen3-0.6B is simply that sensitive (small models
+  usually are). `--requant-match` narrows it to some weights (e.g. only the embedding).
+- *Qwen3-0.6B, analyzed:* induction gain 14 nats/token (random-sequence loss 14.9 → 0.9),
+  top head L16H14 at 0.96. The logit lens is near useless until layer ~17 (top-1 < 10%),
+  then climbs to 36%: big models' middle layers don't use the "output language" yet
+  (the motivation for the tuned lens). Our 10M TinyStories model is the opposite: its top-1
+  accuracy climbs from layer 0.
+- *TinyStories induction looked weak* (top head 0.09; random-sequence loss only 12.2 →
+  11.3), yet the gain jumped between steps 256 and 500 (0.13 → 0.61), a classic induction
+  phase change, and the top induction heads L3H1/L3H2 are the most important single heads
+  for the *names* category in ablation. Hypothesis: the test drew random tokens from the
+  whole vocabulary, which for an 8k TinyStories tokenizer is full of tokens (raw bytes,
+  fragments) the model barely saw, so it can't match them. The view now draws from tokens
+  that occur in the suite, distinct within a sequence, and keeps the old number as
+  "induction gain, any token". To be checked on the owner's run.
+- *Ablation:* removing layer 0's MLP costs +5.4 nats on names, far more than any other
+  part: in small models the first MLP acts like an extension of the embedding (seen in
+  GPT-2 too), so nothing downstream works without it.
+- Things that were my mistakes, not bugs: the analysis covered 26 checkpoints because the
+  snapshots are 14 log-spaced (0, 1, 2, …, 4096) + 12 every-500 ones, not 19; and the
+  test count was 129, not 128.
+- Fixed: `inspect` printed only the first tensor's shape per group, which hid that Gemma's
+  full-attention layers are bigger (see below); `--show-key` prints one metadata value in
+  full. GGUF `output.weight` that is a byte-for-byte copy of `token_embd` is now tied
+  (if ggml-org's Qwen3-0.6B Q8_0 copy is exact, it should load as 596M params, not 751.6M:
+  −311 MB in bf16; to be confirmed). The dashboard's ablation
+  ranking follows the Measure/Category selectors. The logit lens explains its "emb" row
+  (with tied embeddings it re-predicts the current token: 105.8 nats for Qwen). External
+  runs are named `ext-<parent>-<name>-<path hash>` and refuse to mix two models' results.
+- Slow Qwen decode (19 tok/s): per-token overhead, as for the 10M model. A 28-layer model
+  launches ~1,500 small GPU kernels per token, at tens of µs each under Windows. CUDA
+  graphs stay first in the inference backlog.
+
+**2026-10-24: Gemma 4 adapter (GGUF, dense, text) and quantized-in-VRAM layers.**
+Built from the owner's `inspect` output plus llama.cpp's own code for this architecture
+(`src/models/gemma4.cpp`, tokenizer in `src/llama-vocab.cpp`, read online, nothing
+downloaded into the repo), which is the reference for how GGUF files run.
+- *Architecture, from the file:* 48 layers, d = 3840, 16 query heads, GeGLU MLP of 15,360.
+  Five *sliding-window* layers (window 1024, head width 256, 8 KV heads, RoPE base 10k)
+  per *full* layer (8 of them, the first is layer 5: head width 512, one KV head, RoPE
+  base 1M, no `attn_v`). The inspect sizes give this away even though the old inspect showed one
+  shape: attn_q's 472.5 MiB only adds up if 8 layers have 8192 rows instead of 4096.
+- *Surprises from llama.cpp's graph:* attention scale 1.0 instead of 1/√head_dim (q and k
+  are RMS-normalized, so their size is already fixed); on full layers the values *are* the
+  keys (before k_norm and RoPE); values get an RMS norm without a gain; every sublayer
+  output is normalized again before it's added ("sandwich" norm); after each layer the whole
+  residual stream is multiplied by a learned scalar (`layer_output_scale`); embeddings
+  × √3840; logits soft-capped at ±30; the full layers' RoPE frequencies are divided by
+  factors stored in `rope_freqs.weight`.
+- *Our model* gained all of these as config options (off by default), plus a per-layer
+  attention spec, one RoPE table per layer kind, and a KV cache with per-layer shapes.
+- *Tokenizer:* SentencePiece-style BPE: spaces → "▁", split into lines only (merges can
+  cross words), BPE over characters, unknown pieces → `<0xXX>` byte tokens.
+- *Quantized in VRAM:* bf16 would be ~24 GB, the 5060 Ti has 16. `QuantLinear` /
+  `QuantEmbedding` keep the file's blocks (Q4_0: 6.2 GiB) and dequantize one layer at a
+  time; the embedding gathers only the rows it needs, and the tied 262k-row output layer
+  dequantizes in chunks. Automatic when bf16 wouldn't fit in half the GPU. Cost: every
+  forward pass dequantizes every weight again (CPU: ~0.15 s per 59M-weight matrix), so
+  decoding will be slow; fused dequant+matmul kernels are the fix, later.
+- *How it's tested:* a tiny random Gemma 4 GGUF with the real file's structure, compared
+  against a plain-tensor transcription of llama.cpp's graph (matches to 2e-4, also with
+  Q8_0/Q4_0 weights kept quantized), and the tokenizer against a transcription of
+  llama.cpp's queue-based BPE. **Same caveat as the K-quants: both come from my reading of
+  llama.cpp, so the first real run is the actual check.** Unsupported variants (E2B/E4B
+  per-layer embeddings, KV sharing, MoE, partial RoPE) raise an error.
+- *Not yet:* the chat template (Jinja; we'll need to see it), the MTP "assistant" file
+  (4 layers of width 1024 with no K/V of their own, `shared_kv_layers = 4`: it reads
+  the main model's KV cache; `nextn.pre_projection` maps 7,680 = 2 × 3,840 inputs, plausibly
+  the main model's hidden state + a token embedding, to 1,024), and the mmproj file
+  (`block_count = 0`: only patch/position embeddings and projections, no encoder layers).
+  Both belong with speculative decoding (M9) and multimodal input, later.

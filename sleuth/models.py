@@ -42,7 +42,9 @@ def default_dtype(device: torch.device) -> torch.dtype:
 
 
 def load_any(path: str | Path, device: str | torch.device = "cpu", dtype: torch.dtype | None = None,
-             step: int | None = None, max_seq_len: int = 4096):
+             step: int | None = None, max_seq_len: int = 4096, keep_quantized: bool | str = "auto"):
+    """keep_quantized (GGUF only): keep quantized weights as blocks in memory
+    (True), dequantize them now (False), or decide by size ("auto")."""
     device = torch.device(device)
     kind = detect(path)
     if kind == "sleuth":
@@ -63,8 +65,34 @@ def load_any(path: str | Path, device: str | torch.device = "cpu", dtype: torch.
         return model, HFTokenizer.load(path), info
     from .formats.gguf_model import load_gguf_model, tokenizer_from_gguf
 
-    model, info = load_gguf_model(path, device=device, dtype=dtype or default_dtype(device), max_seq_len=max_seq_len)
+    model, info = load_gguf_model(path, device=device, dtype=dtype or default_dtype(device), max_seq_len=max_seq_len,
+                                  keep_quantized=keep_quantized)
     return model, tokenizer_from_gguf(path), info
+
+
+def read_config(path: str | Path, max_seq_len: int = 4096):
+    """(ModelConfig, info) of a Hugging Face folder or GGUF file, from its
+    metadata alone: no weights are read, so it's instant even for a 12B model."""
+    kind = detect(path)
+    if kind == "gguf":
+        from .formats.gguf import GGUFFile
+        from .formats.gguf_model import model_config
+
+        with GGUFFile(path) as g:
+            return model_config(g, max_seq_len), {"format": "gguf", "architecture": g.architecture,
+                                                  "name": g.metadata.get("general.name")}
+    if kind == "hf":
+        import json
+
+        from .formats.hf import Checkpoint, model_config
+
+        hf = json.loads((Path(path) / "config.json").read_text())
+        ck = Checkpoint(Path(path))
+        try:
+            return model_config(hf, ck, max_seq_len), {"format": "hf", "model_type": hf.get("model_type")}
+        finally:
+            ck.close()
+    raise ValueError("read_config works on Hugging Face folders and .gguf files")
 
 
 def load_tokenizer(path: str | Path):

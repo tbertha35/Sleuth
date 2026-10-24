@@ -61,3 +61,24 @@ def _has_triton() -> bool:
 def test_compile_optional(tiny_data, tmp_path, compile_model):
     cfg = tiny_run_config(tiny_data, tmp_path, device="cuda", max_steps=4, compile=compile_model)
     train(cfg, log=lambda s: None)
+
+
+def test_quantized_gemma_on_gpu(tmp_path):
+    """Gemma 4-style model kept as Q4_0 blocks in VRAM: same logits as on the CPU
+    (fp32), and generation with the bf16 KV cache works."""
+    from test_gemma import IDS, make_gemma_gguf
+
+    from sleuth.formats import gguf_quants as q
+    from sleuth.formats.gguf_model import load_gguf_model
+
+    path = tmp_path / "tiny-q4.gguf"
+    make_gemma_gguf(path, quant=q.Q4_0)
+    cpu, _ = load_gguf_model(path, dtype=torch.float32, keep_quantized=True)
+    gpu, info = load_gguf_model(path, device="cuda", dtype=torch.float32, keep_quantized=True)
+    assert info["kept_quantized"] > 0 and gpu.tok_emb.raw.is_cuda
+    x = torch.tensor([IDS])
+    with torch.no_grad():
+        torch.testing.assert_close(gpu(x.cuda()).logits.cpu(), cpu(x).logits, atol=1e-3, rtol=1e-3)
+    bf16, _ = load_gguf_model(path, device="cuda", dtype=torch.bfloat16, keep_quantized=True)
+    r = generate(bf16, IDS[:5], 20, SamplingConfig(temperature=0.0))
+    assert len(r.new_ids) == 20
