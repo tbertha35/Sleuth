@@ -5,11 +5,12 @@ while they run (**ANALYZER**), and running controlled experiments to make small
 models faster and better (**LAB**). An optional **ASSISTANT** explains things
 along the way.
 
-> Status (2026-10-25): **M0, M1, M3 done**; **M5 (external models)** mostly done (Qwen, Gemma 4
-> within 1% of llama.cpp's perplexity; decoding still 4.5× slower); **M2a (scaling ladder)** at
-> its third rung (mix-20m, mix-60m done; mix-100m training). **D1 (dashboard Jobs + Playground)**
-> built and CPU-tested, waiting for its first run on the 5060 Ti box. Next: document masking →
-> chat SFT (M11a), see [§8.1 Roadmap after round 4](#81-roadmap-after-round-4-2026-10-25). M2
+> Status (2026-10-25, after round 5): **M0, M1, M3 done**; **M5 (external models)** mostly done
+> (Qwen, Gemma 4 within 1% of llama.cpp's perplexity; decoding 10.3 tok/s, still 4.5× slower);
+> **M2a (scaling ladder)**: three rungs done (mix-20m 3.322, mix-60m 2.971, mix-100m 2.772 nats;
+> mix-100m answers its first facts). **D1 (dashboard Jobs + Playground)** built and CPU-tested,
+> waiting for its first run on the 5060 Ti box. **M11a** started: document masking built
+> (CPU-tested). Next: see [§8.2 Roadmap after round 5](#82-roadmap-after-round-5-2026-10-25). M2
 > (multi-GPU) waits on the GX10s. Sections marked ❓ still need a decision from you
 > (collected in [Open questions](#10-open-questions-for-you)).
 
@@ -371,19 +372,18 @@ multiplies in one go, never writing a bf16 copy (what llama.cpp does). **Decided
 (2026-10-24): Triton** (`triton-windows` on Windows). First kernel: Q4_0/Q8_0
 (`forge/model/triton_kernels.py`), checked on CPU in Triton's interpreter; GPU speed to be
 measured. Result: Gemma 4 12B decode 0.7 → 7.7 tok/s (llama.cpp: 46). Then a few-row kernel for
-batch-1 decoding and a fused RMSNorm. Next: CUDA graphs for the decode step (~4,000 kernel
-launches per token are now a large part of the time), then K-quants.
+batch-1 decoding and a fused RMSNorm: 10.3 tok/s (round 5). Next: CUDA graphs for the decode step
+(~4,000 kernel launches per token are now a large part of the time), then K-quants.
 
 ### 4.6 Chat SFT (M11a, moved earlier after round 4)
 Conversation jsonl → chat template with special tokens → loss only on
 assistant tokens. Reuses the trainer. The data is downloaded (docs/DATA.md, Stage 3):
 Hermes function calling, When2Call, MemGPT traces.
-1. **Document masking first** (§6, item 6). Training windows currently run across
-   document boundaries with no mask (see `loader.py`). For pretraining that's a small
-   loss; for SFT it means one conversation attends into the previous one. The shard
-   index (`.idx.npy`) already records where documents start, so the loader can hand
-   the model per-window document IDs and attention can use a block-diagonal causal
-   mask (SDPA with an explicit mask, or FlexAttention where available).
+1. **Document masking first** (§6, item 6) ✅ (CPU; GPU speed to be measured). Training
+   windows ran across document boundaries with no mask. For pretraining that's a small
+   loss; for SFT it means one conversation attends into the previous one. Now
+   `train.doc_mask = true`: document numbers from the `<|bos|>` tokens (`document_ids`),
+   a block-diagonal causal mask through SDPA. FlexAttention if the masked kernel is slow.
 2. **Chat format for our tokenizer.** `<|system|>`, `<|user|>`, `<|assistant|>` and
    `<|end|>` are already reserved specials (`forge/tokenizer/bpe.py`), so the 32k mix
    tokenizer needs no retraining. A tool role takes one of the 9 `<|reserved_i|>` slots:
@@ -529,7 +529,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 |---|---|---|---|
 | **M0** ✅ | Skeleton, PLAN, hardware probe | probe run on both GX10s, the 5060 Ti and the 3060 Ti (results stay local; summaries in LOG.md) | your machines |
 | **M1** ✅ (CPU) | Tokenizer + 10M model end-to-end | BPE trains on your data; round-trip tests; 10M model trains on 1 GPU; snapshot + resume checkpoints; `generate` prints text + tok/s; **one analyzer view (per-layer activation stats over checkpoints) in the dashboard** | code + CPU tests here; real run on 5060 Ti or GB10 |
-| M2a 🔶 | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them. *Done: mix-20m (3.322 nats on the whole mix, `sleuth eval`), mix-60m (2.971); mix-100m training. `suites/knowledge` grown from 40 to 220 items, `score` reports answer loss first with standard errors. Next: `mix-150m` on ~3B tokens (re-shard without caps, WSD continuation, activation checkpointing).* | 5060 Ti |
+| M2a 🔶 | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them. *Done: mix-20m (3.322 nats on the whole mix, `sleuth eval`), mix-60m (2.971), mix-100m (2.772; 10.4 h; few-shot answer loss 1.94, first real facts). `suites/knowledge` grown from 40 to 220 items, `score` reports answer loss first with standard errors, exact match needs the answer to end. Next: re-score the ladder on the 220 items; `mix-150m` on ~3B tokens (needs a data decision, §8.2).* | 5060 Ti |
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
 | **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |
@@ -540,7 +540,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 | M9 | Looped depth; MTP + speculative decoding | results in LOG.md | GB10 |
 | M10 | Low precision | FP8/FP4 training & inference, QAT | 5060 Ti + GB10 |
 | **D1** ✅ (CPU) | Dashboard: Jobs + Playground | run commands from the UI (allow-list, one-GPU queue, live logs, Stop with checkpoint, history); live training curves; Data page; Playground (streaming, next-token panel, compare, chat for chat models); session token + Host check; stale runs hidden | 5060 Ti (first real run pending) |
-| M11a | Document masking → chat SFT | block-diagonal attention from the shard index; chat format + loss-masked SFT shards; `sleuth sft`; When2Call MCQ score; chat with our own model in the Playground (Phase B) | 5060 Ti |
+| M11a 🔶 | Document masking → chat SFT | block-diagonal attention from the shard index (✅ CPU); chat format + loss-masked SFT shards; `sleuth sft`; When2Call MCQ score; chat with our own model in the Playground (Phase B) | 5060 Ti |
 | M11b | Memory harness | a local JSON "memory store" exposing the MemGPT trace functions (`core_memory_append`, `archival_memory_insert/search`, `conversation_search`) so tool calls do something in the Playground; LongMemEval `oracle` as the yardstick (`s`/`m` only with retrieval) | 5060 Ti |
 | M11c | SAEs | SAE feature browser | GB10 |
 
@@ -566,6 +566,28 @@ llama.cpp (a 0.34-logit margin in fp32; compare layer by layer), Gemma decode 4.
 than llama.cpp (CUDA graphs next, §4.5.1), `analyze` progress/ETA, `generate --compare`,
 per-run README cards, the git commit and command line in each run folder, total wall time
 in the training log.
+
+### 8.2 Roadmap after round 5 (2026-10-25)
+Round 5 (code from before §8.1's changes): mix-100m finished (2.772 nats, 10.4 h), its few-shot
+answers include the first real facts, Gemma decodes at 10.3 tok/s, and the first-token gap to
+llama.cpp survives fp32. Done since, on CPU: exact match needs the answer to end; default-guess
+notes; `--q8-activations`; document masking. In order:
+1. **Round 6 on the 5060 Ti (short jobs first):** the D1 checks from §8.1 (a short training job
+   started, stopped and resumed from the Jobs page; the Playground with Gemma); `next
+   --q8-activations` on Gemma's raw prompt; re-score mix-20m/60m/100m on the 220-item suite
+   with and without `--few-shot`; the speed of `doc_mask` (a few hundred steps of mix-60m with
+   and without it).
+2. **Document masking A/B** (GPU, ~1½ h): mix-20m again with `--set train.doc_mask=true`,
+   against the existing mix-20m, both measured with `eval` both ways. Decides whether mix-150m
+   uses it.
+3. **mix-150m** (~150M params, ~3B tokens, ~1½ days). ❓ Data: the capped mix has 1.76B
+   tokens. Either re-shard the files already downloaded without caps (the proportions
+   then follow whatever each source's files hold), or download more files of each source to keep the proportions. Prediction
+   from the ladder's trend: val ≈ 2.55–2.6 nats.
+4. **Then M11a continues:** chat format with a tool role, SFT shards with a loss mask, `sleuth
+   sft`, the When2Call MCQ score.
+5. **Gemma, lower priority:** CUDA graphs for decoding; if `--q8-activations` doesn't explain the
+   first-token gap, a layer-by-layer comparison with llama.cpp (`llama-eval-callback` dumps).
 
 ### About this cloud environment
 Claude Code sessions run in a cloud container with a few CPUs and **no GPU**. CPU

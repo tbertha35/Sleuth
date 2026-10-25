@@ -210,6 +210,24 @@ def _add_keep_quantized(s):
                         "dequantized weights would need more than half the GPU's memory (8 GiB on CPU)")
 
 
+def _add_q8_activations(s):
+    s.add_argument("--q8-activations", action="store_true",
+                   help="experiment: round the input of every quantized matmul to 8 bits the way llama.cpp does "
+                        "(blocks of 32, fp16 scale), to see whether that rounding explains a difference from "
+                        "llama.cpp's numbers. Needs layers kept quantized (GGUF, --keep-quantized yes/auto)")
+
+
+def _apply_q8_activations(a, model) -> None:
+    if not getattr(a, "q8_activations", False):
+        return
+    from .forge.model.quant import set_q8_activations
+
+    n = set_q8_activations(model)
+    if n == 0:
+        raise SystemExit("--q8-activations: no layers are kept quantized (use a GGUF file with --keep-quantized yes)")
+    print(f"[rounding the inputs of {n} quantized layers like llama.cpp (q8_1)]")
+
+
 def _dtype(name: str | None):
     import torch
 
@@ -235,6 +253,7 @@ def cmd_next(a):
 
     device = resolve_device(a.device)
     model, tok, _ = load_any(a.path, device=device, dtype=_dtype(a.dtype), keep_quantized=_keep_quantized(a.keep_quantized))
+    _apply_q8_activations(a, model)
     ids = _prompt_ids(tok, a)
     with torch.no_grad():
         logits = model(torch.tensor([ids], device=device)).logits[0, -1, :tok.vocab_size].float()
@@ -272,8 +291,13 @@ def cmd_eval(a):
     byte_lens = torch.tensor(tok.token_byte_lengths() + [0] * (model.cfg.padded_vocab - tok.vocab_size), device=device)
     autocast = ((lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if device.type == "cuda"
                 else contextlib.nullcontext)
-    ev = evaluate(model, ds, a.batch_size, seq_len, a.windows, byte_lens, device, autocast)
-    print(f"{run.name} step {meta['step']}: {a.windows} windows of {seq_len} tokens from {shards}")
+    # Default: measure the way the run was trained. --doc-mask yes on a run trained
+    # without it shows how much the model leans on text from the previous document.
+    masked = cfg["train"].get("doc_mask", False) if a.doc_mask == "run" else a.doc_mask == "yes"
+    ev = evaluate(model, ds, a.batch_size, seq_len, a.windows, byte_lens, device, autocast,
+                  tok.bos_id if masked else None)
+    print(f"{run.name} step {meta['step']}: {a.windows} windows of {seq_len} tokens from {shards}"
+          + (", document-masked attention" if masked else ""))
     print(f"val loss {ev['val_loss']:.4f} nats/token, {ev['val_bpb']:.4f} bits/byte")
     for k, v in (ev.get("val_by_source") or {}).items():
         print(f"  {k:14s} {v:.4f}")
@@ -308,7 +332,7 @@ def cmd_score(a):
             prefix = None
         enc += encode_cases(tok, cases, model.cfg.max_seq_len, prefix)
     per_case: list[dict] = []
-    res = score_cases(model, enc, min(tok.vocab_size, model.cfg.padded_vocab), device, per_case)
+    res = score_cases(model, enc, min(tok.vocab_size, model.cfg.padded_vocab), device, per_case, tokenizer=tok)
     se = standard_errors(per_case)
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
     print(f"{a.path} ({where}, {model.num_params() / 1e6:.1f}M params)")
@@ -322,20 +346,59 @@ def cmd_score(a):
         ex = (f"{r['exact_match']:7.1%} ± {s['exact_match']:6.1%}" if r["exact_match"] is not None
               else f"{'-':>17s}")
         print(f"{c:12s} {r['n_answers']:5d} {el} {ex} {r['loss']:7.3f} {r['n_tokens']:7d}")
+    for note in _default_guesses(per_case, tok):
+        print(note)
     if a.show_items:
-        print(f"\n{'test':12s} {'answer loss':>11s}  exact  model's top-1 guesses over the answer")
+        print(f"\n{'test':12s} {'answer loss':>11s}  exact  model's top-1 guesses over the answer "
+              "(+ what it would write next, for matches)")
         for row in per_case:
             if row["answer_loss"] is None:
                 continue
             guess = tok.decode(row["top1_ids"])
-            print(f"{row['id']:12s} {row['answer_loss']:11.3f}  {'yes' if row['exact'] else 'no':5s}  {guess!r}")
+            after = f" + {tok.decode(row['after_ids'])!r}" if "after_ids" in row else ""
+            print(f"{row['id']:12s} {row['answer_loss']:11.3f}  {'yes' if row['exact'] else 'no':5s}  {guess!r}{after}")
     if a.json:
         for row in per_case:
+            row.pop("answer_ids", None)
             row["top1_text"] = tok.decode(row.pop("top1_ids"))
+            if "after_ids" in row:
+                row["after_text"] = tok.decode(row.pop("after_ids"))
         out = {"model": a.path, "where": where, "params": model.num_params(), "suites": a.suite,
                "few_shot": a.few_shot, "chat": a.chat, "categories": res, "standard_errors": se, "cases": per_case}
         Path(a.json).write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
         print(f"wrote {a.json}")
+
+
+def _default_guesses(per_case: list[dict], tok, min_share: float = 0.2) -> list[str]:
+    """Notes for categories where one first answer token is the model's top
+    guess for many tests. mix-100m answered "3" to the soccer, golf, hexagon
+    and strikes questions alike, and got the strikes one "right" (round 5):
+    a match that comes from a default guess isn't knowledge. Answer loss is
+    the more reliable number then."""
+    from collections import Counter
+
+    def first_guess(r):
+        # The guess at the first answer token that isn't just a space: some
+        # tokenizers split " 11" into " " + "11", and every model gets the " " right.
+        for want, got in zip(r["answer_ids"], r["top1_ids"]):
+            if tok.decode([want]).strip():
+                return got
+        return r["top1_ids"][0]
+
+    by_cat: dict[str, list[tuple[dict, int]]] = {}
+    for r in per_case:
+        if r["answer_loss"] is not None and r["top1_ids"]:
+            by_cat.setdefault(r["category"], []).append((r, first_guess(r)))
+    notes = []
+    for c, rows in sorted(by_cat.items()):
+        guess, n = Counter(g for _, g in rows).most_common(1)[0]
+        if n >= 3 and n >= min_share * len(rows):
+            lucky = sum(1 for r, g in rows if r["exact"] and g == guess)
+            note = f"note: {c}: the model's first answer token is {tok.decode([guess])!r} in {n} of {len(rows)} tests"
+            if lucky:
+                note += f"; {lucky} of them {'is an exact match' if lucky == 1 else 'are exact matches'}, maybe by luck"
+            notes.append(note)
+    return notes
 
 
 def cmd_perplexity(a):
@@ -348,6 +411,7 @@ def cmd_perplexity(a):
     device = resolve_device(a.device)
     model, tok, _ = load_any(a.path, device=device, dtype=_dtype(a.dtype), keep_quantized=_keep_quantized(a.keep_quantized),
                              max_seq_len=max(4096, a.ctx))
+    _apply_q8_activations(a, model)
     text = Path(a.file).read_text(encoding="utf-8")
     if a.max_chars:
         text = text[:a.max_chars]
@@ -634,6 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--device", default="auto")
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
     _add_keep_quantized(s)
+    _add_q8_activations(s)
     _add_chat_args(s)
     s.set_defaults(fn=cmd_next)
 
@@ -643,6 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--step", type=int, default=None, help="which snapshot (default: latest)")
     s.add_argument("--windows", type=int, default=640, help="number of val windows (spread over the whole split)")
     s.add_argument("--batch-size", type=int, default=8)
+    s.add_argument("--doc-mask", choices=["run", "yes", "no"], default="run",
+                   help="stop attention at document boundaries (run = as the run was trained)")
     s.add_argument("--device", default="auto")
     s.set_defaults(fn=cmd_eval)
 
@@ -671,6 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--device", default="auto")
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
     _add_keep_quantized(s)
+    _add_q8_activations(s)
     s.set_defaults(fn=cmd_perplexity)
 
     s = sub.add_parser("inspect", help="show what's inside a .gguf file or Hugging Face model folder")

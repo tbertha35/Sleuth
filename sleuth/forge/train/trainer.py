@@ -30,7 +30,7 @@ import torch
 
 from ...config import to_dict
 from ...env import env_info, runs_root
-from ..data.loader import ShardDataset
+from ..data.loader import ShardDataset, document_ids
 from ..model.flops import describe, train_flops_per_token
 from ..model.transformer import Transformer
 from ..tokenizer.bpe import Tokenizer
@@ -61,7 +61,7 @@ class MetricsLog:
 
 @torch.no_grad()
 def evaluate(model, ds: ShardDataset, batch_size: int, seq_len: int, n_windows: int,
-             byte_lens: torch.Tensor, device: torch.device, autocast) -> dict:
+             byte_lens: torch.Tensor, device: torch.device, autocast, bos_id: int | None = None) -> dict:
     """Validation loss (nats/token) and bits-per-byte, overall and per source.
 
     Bits-per-byte = total loss in bits / number of raw-text bytes predicted.
@@ -71,6 +71,8 @@ def evaluate(model, ds: ShardDataset, batch_size: int, seq_len: int, n_windows: 
     The windows are spread evenly over the whole val split (ShardDataset.eval_windows),
     so a mix is measured in its real proportions. Shards that record where each
     source starts also give a loss per source ("val_by_source").
+
+    bos_id: if given, attention is document-masked (as in training with doc_mask).
     """
     was_training = model.training
     model.eval()
@@ -79,8 +81,9 @@ def evaluate(model, ds: ShardDataset, batch_size: int, seq_len: int, n_windows: 
     windows = ds.eval_windows(n_windows, seq_len)
     for x, y, sources in ds.window_batches(windows, batch_size, seq_len):
         x, y = x.to(device), y.to(device)
+        doc = document_ids(x, bos_id) if bos_id is not None else None
         with autocast():
-            logits = model(x).logits
+            logits = model(x, doc_ids=doc).logits
         loss = torch.nn.functional.cross_entropy(logits.float().transpose(1, 2), y, reduction="none")  # [B, T]
         per_window = loss.sum(1).tolist()
         loss_sum += sum(per_window)
@@ -193,6 +196,10 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     def autocast():
         return torch.autocast(device.type, dtype=torch.bfloat16) if use_bf16 else contextlib.nullcontext()
 
+    # Document masking: the model gets each window's document numbers, so
+    # attention stops at every <|bos|> (see data/loader.py: document_ids).
+    mask_bos = tokenizer.bos_id if tc.doc_mask else None
+
     tokens_per_step = tc.micro_batch_size * tc.seq_len * tc.grad_accum
     flops_per_token = train_flops_per_token(cfg.model, tc.seq_len)
     snaps = snapshot_steps(tc.max_steps, tc.snapshot_every, tc.snapshot_log_spaced)
@@ -200,6 +207,7 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     log(f"run dir: {run_dir}")
     log(f"model: {describe(cfg.model, tc.seq_len)}")
     log(f"device: {device}, precision: {'bf16 autocast' if use_bf16 else 'fp32'}, "
+        + ("document-masked attention, " if tc.doc_mask else "") +
         f"{tokens_per_step:,} tokens/step, {tc.max_steps * tokens_per_step / 1e6:.1f}M tokens total, "
         f"train tokens available: {train_ds.n_tokens / 1e6:.1f}M")
     epochs = tc.max_steps * tokens_per_step / max(1, train_ds.n_tokens)
@@ -228,8 +236,9 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
             for micro in range(tc.grad_accum):
                 x, y = train_ds.batch(tc.micro_batch_size, tc.seq_len, tc.seed, step, micro)
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                doc = document_ids(x, mask_bos) if mask_bos is not None else None
                 with autocast():
-                    loss = fwd(x, y).loss
+                    loss = fwd(x, y, doc_ids=doc).loss
                 (loss / tc.grad_accum).backward()
                 # Accumulate on-device: calling .item() here would force the
                 # CPU to wait for the GPU every micro-step.
@@ -268,7 +277,8 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
 
             if val_ds is not None and (completed % tc.eval_every == 0 or last):
                 t_eval = time.perf_counter()
-                ev = evaluate(fwd, val_ds, tc.micro_batch_size, tc.seq_len, n_eval, byte_lens, device, autocast)
+                ev = evaluate(fwd, val_ds, tc.micro_batch_size, tc.seq_len, n_eval, byte_lens, device, autocast,
+                              mask_bos)
                 metrics.write({"step": completed, "tokens": tokens_seen, **ev, "time": time.time()})
                 srcs = ev.get("val_by_source")
                 log(f"step {completed:6d} | val loss {ev['val_loss']:.4f} | val bpb {ev['val_bpb']:.4f}"

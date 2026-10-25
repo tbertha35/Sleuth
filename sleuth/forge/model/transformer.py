@@ -55,10 +55,10 @@ class Block(nn.Module):
         self.tap_mlp_out = Tap()
         self.tap_resid_post = Tap()
 
-    def forward(self, x, cos, sin, cache=None):
+    def forward(self, x, cos, sin, cache=None, same_doc=None):
         # attn_out / mlp_out tap exactly what gets added to the stream (after
         # the post-norm, if any), so ablating them removes the whole contribution.
-        a = self.attn(self.norm1(x), cos, sin, cache)
+        a = self.attn(self.norm1(x), cos, sin, cache, same_doc)
         if self.post_attn_norm is not None:
             a = self.post_attn_norm(a)
         x = self.tap_resid_mid(x + self.tap_attn_out(a))
@@ -191,9 +191,22 @@ class Transformer(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=self.cfg.init_std)
 
     # ------------------------------------------------------------------ #
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, cache=None) -> ModelOutput:
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, cache=None,
+                doc_ids: torch.Tensor | None = None) -> ModelOutput:
+        """doc_ids: [B, T] integers, one per position, equal within a document
+        (`document_ids` in data/loader.py). Given, a token attends only to
+        earlier tokens of its own document ("document masking"); without it, a
+        training window that spans two documents lets the second one read the
+        first. Positions keep counting across the boundary: RoPE scores depend
+        only on the distance between query and key, so a masked document behaves
+        the same wherever it starts in the window."""
         B, T = idx.shape
         offset = cache.pos if cache is not None else 0
+        same_doc = None
+        if doc_ids is not None:
+            if cache is not None:
+                raise ValueError("doc_ids is for training/scoring whole windows, not cached decoding")
+            same_doc = (doc_ids[:, :, None] == doc_ids[:, None, :])[:, None]  # [B, 1, T, T], shared by all layers
         if offset + T > self.cfg.max_seq_len:
             raise ValueError(f"sequence length {offset + T} exceeds max_seq_len {self.cfg.max_seq_len}")
         rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
@@ -204,7 +217,7 @@ class Transformer(nn.Module):
             x = x * self.cfg.embed_scale
         x = self.tap_embed(x)
         for block in self.blocks:
-            x = block(x, *rope[block.kind], cache)
+            x = block(x, *rope[block.kind], cache, same_doc)
         if cache is not None:
             cache.advance(T)
         logits = self._softcap(self.lm_head(self.tap_final_norm(self.norm_f(x))))

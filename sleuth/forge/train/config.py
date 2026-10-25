@@ -39,6 +39,7 @@ class TrainConfig:
     snapshot_dtype: str = "bf16"    # "bf16" | "fp32"
     resume_every: int = 500         # full resumable checkpoints (weights + optimizer)
     keep_resume: int = 2            # keep only the newest N resumable checkpoints
+    doc_mask: bool = False          # attention stops at document boundaries (<|bos|>); see data/loader.py
     compile: bool = False           # torch.compile the model (faster on GPU after a warm-up)
     peak_tflops: float = 0.0        # hardware peak for MFU (from hardware/<host>.json); 0 = don't report
 
