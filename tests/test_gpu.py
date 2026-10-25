@@ -114,13 +114,17 @@ def test_triton_kernel_on_gpu(tmp_path, monkeypatch):
     False,
     pytest.param(True, marks=pytest.mark.skipif(not _has_triton(), reason="torch.compile needs Triton")),
 ])
-def test_doc_mask_on_gpu(tiny_data, tmp_path, compile_model):
+@pytest.mark.parametrize("kernel", ["sdpa", "flex"])
+def test_doc_mask_on_gpu(tiny_data, tmp_path, compile_model, kernel):
     """Document-masked attention under bf16 autocast (and torch.compile): it
     trains, and a masked second document matches the same text on its own."""
     from sleuth.forge.data.loader import document_ids
+    from sleuth.forge.model.attention import doc_block_mask
 
-    train(tiny_run_config(tiny_data, tmp_path, device="cuda", max_steps=4, doc_mask=True, compile=compile_model),
-          log=lambda s: None)
+    if kernel == "flex" and not compile_model:
+        pytest.skip("FlexAttention without compile is only the slow reference version (CPU-tested)")
+    train(tiny_run_config(tiny_data, tmp_path, device="cuda", max_steps=4, doc_mask=True, compile=compile_model,
+                          doc_mask_kernel=kernel), log=lambda s: None)
     torch.manual_seed(0)
     m = Transformer(ModelConfig(vocab_size=300, d_model=128, n_layers=2, n_heads=4, n_kv_heads=2,
                                 max_seq_len=64)).cuda().eval()
@@ -129,5 +133,8 @@ def test_doc_mask_on_gpu(tiny_data, tmp_path, compile_model):
     both = torch.cat([torch.randint(2, 300, (1, 12), device="cuda"), b], 1)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         alone = m(b).logits.float()
-        masked = m(both, doc_ids=document_ids(both, 1)).logits[:, 12:].float()
+        doc = document_ids(both, 1)
+        masked = m(both, doc_ids=doc).logits[:, 12:].float()
+        flex = m(both, block_mask=doc_block_mask(doc)).logits[:, 12:].float() if kernel == "flex" else masked
     assert (masked - alone).abs().max().item() < 0.1   # bf16: a loose check
+    assert (flex - alone).abs().max().item() < 0.1

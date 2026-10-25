@@ -346,23 +346,22 @@ def cmd_score(a):
         ex = (f"{r['exact_match']:7.1%} ± {s['exact_match']:6.1%}" if r["exact_match"] is not None
               else f"{'-':>17s}")
         print(f"{c:12s} {r['n_answers']:5d} {el} {ex} {r['loss']:7.3f} {r['n_tokens']:7d}")
-    for note in _default_guesses(per_case, tok):
+    for note in _default_guesses(per_case, tok) + _spelling_notes(per_case):
         print(note)
     if a.show_items:
-        print(f"\n{'test':12s} {'answer loss':>11s}  exact  model's top-1 guesses over the answer "
-              "(+ what it would write next, for matches)")
+        print(f"\n{'test':12s} {'answer loss':>11s}  exact  the model's greedy answer")
         for row in per_case:
             if row["answer_loss"] is None:
                 continue
-            guess = tok.decode(row["top1_ids"])
-            after = f" + {tok.decode(row['after_ids'])!r}" if "after_ids" in row else ""
-            print(f"{row['id']:12s} {row['answer_loss']:11.3f}  {'yes' if row['exact'] else 'no':5s}  {guess!r}{after}")
+            said = tok.decode(row["greedy_ids"]) if "greedy_ids" in row else tok.decode(row["top1_ids"])
+            alt = f"   ({row['alt_share']:.0%} via ' ' + word)" if row.get("alt_share", 0) >= 0.05 else ""
+            print(f"{row['id']:12s} {row['answer_loss']:11.3f}  {'yes' if row['exact'] else 'no':5s}  {said!r}{alt}")
     if a.json:
         for row in per_case:
             row.pop("answer_ids", None)
             row["top1_text"] = tok.decode(row.pop("top1_ids"))
-            if "after_ids" in row:
-                row["after_text"] = tok.decode(row.pop("after_ids"))
+            if "greedy_ids" in row:
+                row["greedy_text"] = tok.decode(row.pop("greedy_ids"))
         out = {"model": a.path, "where": where, "params": model.num_params(), "suites": a.suite,
                "few_shot": a.few_shot, "chat": a.chat, "categories": res, "standard_errors": se, "cases": per_case}
         Path(a.json).write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
@@ -370,35 +369,46 @@ def cmd_score(a):
 
 
 def _default_guesses(per_case: list[dict], tok, min_share: float = 0.2) -> list[str]:
-    """Notes for categories where one first answer token is the model's top
-    guess for many tests. mix-100m answered "3" to the soccer, golf, hexagon
-    and strikes questions alike, and got the strikes one "right" (round 5):
-    a match that comes from a default guess isn't knowledge. Answer loss is
-    the more reliable number then."""
+    """Notes for categories where one first word is the model's greedy answer
+    to many tests. mix-100m answered "3" to the soccer, golf, hexagon and
+    strikes questions alike, and got the strikes one "right" (round 5): a match
+    that comes from a default guess isn't knowledge. Answer loss is the more
+    reliable number then."""
     from collections import Counter
 
-    def first_guess(r):
-        # The guess at the first answer token that isn't just a space: some
-        # tokenizers split " 11" into " " + "11", and every model gets the " " right.
-        for want, got in zip(r["answer_ids"], r["top1_ids"]):
-            if tok.decode([want]).strip():
-                return got
-        return r["top1_ids"][0]
+    def first_word(r) -> str:
+        words = tok.decode(r["greedy_ids"]).split()
+        return words[0].strip(".,;:!?") if words else ""
 
-    by_cat: dict[str, list[tuple[dict, int]]] = {}
+    by_cat: dict[str, list[tuple[dict, str]]] = {}
     for r in per_case:
-        if r["answer_loss"] is not None and r["top1_ids"]:
-            by_cat.setdefault(r["category"], []).append((r, first_guess(r)))
+        if r["answer_loss"] is not None and "greedy_ids" in r:
+            by_cat.setdefault(r["category"], []).append((r, first_word(r)))
     notes = []
     for c, rows in sorted(by_cat.items()):
-        guess, n = Counter(g for _, g in rows).most_common(1)[0]
+        counts = Counter(w for _, w in rows if w)
+        if not counts:
+            continue
+        guess, n = counts.most_common(1)[0]
         if n >= 3 and n >= min_share * len(rows):
-            lucky = sum(1 for r, g in rows if r["exact"] and g == guess)
-            note = f"note: {c}: the model's first answer token is {tok.decode([guess])!r} in {n} of {len(rows)} tests"
+            lucky = sum(1 for r, w in rows if r["exact"] and w == guess)
+            note = f"note: {c}: the model's answer starts with {guess!r} in {n} of {len(rows)} tests"
             if lucky:
                 note += f"; {lucky} of them {'is an exact match' if lucky == 1 else 'are exact matches'}, maybe by luck"
             notes.append(note)
     return notes
+
+
+def _spelling_notes(per_case: list[dict], min_share: float = 0.1) -> list[str]:
+    """How much of the answers' probability came through the " " + word spelling
+    (see analyzer/common.py). Large values mean the prompt taught the model to
+    start answers with a bare space, as few-shot examples with numbers do."""
+    by_cat: dict[str, list[float]] = {}
+    for r in per_case:
+        if "alt_share" in r:
+            by_cat.setdefault(r["category"], []).append(r["alt_share"])
+    return [f"note: {c}: {sum(v) / len(v):.0%} of the answer probability came through a ' ' + word spelling "
+            "(counted in answer loss)" for c, v in sorted(by_cat.items()) if sum(v) / len(v) >= min_share]
 
 
 def cmd_perplexity(a):

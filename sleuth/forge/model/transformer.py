@@ -192,20 +192,23 @@ class Transformer(nn.Module):
 
     # ------------------------------------------------------------------ #
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, cache=None,
-                doc_ids: torch.Tensor | None = None) -> ModelOutput:
+                doc_ids: torch.Tensor | None = None, block_mask=None) -> ModelOutput:
         """doc_ids: [B, T] integers, one per position, equal within a document
         (`document_ids` in data/loader.py). Given, a token attends only to
         earlier tokens of its own document ("document masking"); without it, a
         training window that spans two documents lets the second one read the
         first. Positions keep counting across the boundary: RoPE scores depend
         only on the distance between query and key, so a masked document behaves
-        the same wherever it starts in the window."""
+        the same wherever it starts in the window.
+
+        block_mask: the same, prepared for FlexAttention (`attention.doc_block_mask`),
+        used instead of doc_ids."""
         B, T = idx.shape
         offset = cache.pos if cache is not None else 0
-        same_doc = None
-        if doc_ids is not None:
-            if cache is not None:
-                raise ValueError("doc_ids is for training/scoring whole windows, not cached decoding")
+        same_doc = block_mask
+        if (doc_ids is not None or block_mask is not None) and cache is not None:
+            raise ValueError("doc_ids/block_mask are for training/scoring whole windows, not cached decoding")
+        if doc_ids is not None and block_mask is None:
             same_doc = (doc_ids[:, :, None] == doc_ids[:, None, :])[:, None]  # [B, 1, T, T], shared by all layers
         if offset + T > self.cfg.max_seq_len:
             raise ValueError(f"sequence length {offset + T} exceeds max_seq_len {self.cfg.max_seq_len}")

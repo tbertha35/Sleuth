@@ -141,23 +141,24 @@ def test_stories_suite_loads():
     assert {c.category for c in cases} == {"names", "objects", "dialogue", "narrative"}
 
 
-def _scripted(tok, enc, after: list[int]):
-    """A stub model that predicts each test's true tokens, then `after`
-    (what it would write once the answer is done), then <|eos|>."""
-    V = tok.vocab_size
-
+def _table_model(V: int, table: dict[tuple, dict[int, float]], default: int):
+    """A stub model: after the tokens `key`, the logits are table[key] (token ->
+    logit, everything else -30); after anything else it predicts `default`."""
     def model(ids):
         seq = ids[0].tolist()
-        for e in enc:
-            full = e.ids[0].tolist()
-            if seq[:len(full)] == full:
-                script = full + after + [tok.eos_id]
-                break
         logits = torch.full((1, len(seq), V), -30.0)
         for t in range(len(seq)):
-            logits[0, t, script[min(t + 1, len(script) - 1)]] = 30.0
+            for tok_id, v in table.get(tuple(seq[:t + 1]), {default: 30.0}).items():
+                logits[0, t, tok_id] = v
         return SimpleNamespace(logits=logits)
     return model
+
+
+def _scripted(tok, prompt: list[int], script: list[int]):
+    """Writes `script` greedily after `prompt`, then <|eos|>."""
+    full = prompt + script
+    return _table_model(tok.vocab_size, {tuple(full[:i]): {full[i]: 30.0} for i in range(len(prompt), len(full))},
+                        tok.eos_id)
 
 
 @pytest.mark.parametrize("after, exact", [
@@ -171,28 +172,58 @@ def _scripted(tok, enc, after: list[int]):
 def test_exact_match_needs_the_answer_to_end(tok, after, exact):
     """Round 5: mix-100m's top tokens matched " 0" for "water freezes at", but it
     was about to write "0.5 degrees Fahrenheit". An answer only counts when the
-    model's own next token doesn't carry on the word or number."""
+    model's own greedy text is the answer and ends there."""
     enc = encode_cases(tok, [TestCase("w", "facts", "Q: At what Celsius temperature does water freeze?\nA:", " 0")], 128)
+    prompt, answer = enc[0].ids[0, :enc[0].n_prompt].tolist(), enc[0].ids[0, enc[0].n_prompt:].tolist()
     cont = [i for part in after.split("|") if part for i in tok.encode(part)]
-    model = _scripted(tok, enc, cont)
+    model = _scripted(tok, prompt, answer + cont)
     rows = []
     s = score_cases(model, enc, tok.vocab_size, "cpu", rows, tokenizer=tok)
     assert s["facts"]["exact_match"] == float(exact)
-    # It reads only as far as it needs to decide: "0" + " d" is enough.
-    assert rows[0]["after_ids"] == (cont + [tok.eos_id])[:len(rows[0]["after_ids"])]
+    assert s["facts"]["expected_loss"] < 1e-6
+    assert rows[0]["greedy_ids"] == (answer + cont)[:len(rows[0]["greedy_ids"])]   # stops once it knows
     # Without a tokenizer (ablation), matching the answer's tokens is enough.
     assert score_cases(model, enc, tok.vocab_size, "cpu")["facts"]["exact_match"] == 1.0
+
+
+def test_a_wrong_greedy_answer_is_not_a_match(tok):
+    enc = encode_cases(tok, [TestCase("w", "facts", "Q: 2 + 2?\nA:", " 4")], 128)
+    prompt = enc[0].ids[0, :enc[0].n_prompt].tolist()
+    model = _scripted(tok, prompt, tok.encode(" 5\n"))
+    assert score_cases(model, enc, tok.vocab_size, "cpu", tokenizer=tok)["facts"]["exact_match"] == 0.0
+
+
+def test_both_spellings_of_an_answer_count(tok):
+    """Round 6: in few-shot prompts, half the example answers are numbers, which
+    our tokenizer writes as " " + "7". The models copy that and start " Paris"
+    as " " + "Paris": the right text, which scoring the one-token spelling missed."""
+    word = next(w for w in (" dog", " the", " cat", " and", " a")
+                if len(tok.encode(w)) == 1 and len(tok.encode(w[1:])) == 1)
+    space, canon, rest = tok.encode(" ")[0], tok.encode(word)[0], tok.encode(word[1:])[0]
+    enc = encode_cases(tok, [TestCase("w", "facts", "Q: which?\nA:", word)], 128)
+    prompt = tuple(enc[0].ids[0, :enc[0].n_prompt].tolist())
+    nl = tok.encode("\n")[0]
+    table = {prompt: {space: 30.0, canon: 29.0},          # P(" ") = 0.73, P(word) = 0.27
+             prompt + (space,): {rest: 30.0},
+             prompt + (space, rest): {nl: 30.0},
+             prompt + (canon,): {nl: 30.0}}
+    model = _table_model(tok.vocab_size, table, tok.eos_id)
+    rows = []
+    s = score_cases(model, enc, tok.vocab_size, "cpu", rows, tokenizer=tok)["facts"]
+    assert s["expected_loss"] < 1e-3                       # the text has probability ~1
+    assert rows[0]["alt_share"] == pytest.approx(1 / (1 + math.exp(-1)), abs=1e-3)
+    assert s["exact_match"] == 1.0                         # greedy: " " + "dog" = " dog"
+    token_level = score_cases(model, enc, tok.vocab_size, "cpu")["facts"]
+    assert token_level["exact_match"] == 0.0 and token_level["expected_loss"] == pytest.approx(1.313, abs=1e-3)
 
 
 def test_default_guess_note(tok):
     from sleuth.cli import _default_guesses
 
-    space, three = tok.encode(" ")[0], tok.encode("3")[0]
-    want = [space, tok.encode("7")[0]]
-    rows = [{"category": "sports", "answer_loss": 1.0, "answer_ids": want, "top1_ids": [space, three],
-             "exact": i == 0} for i in range(4)]
-    rows += [{"category": "sports", "answer_loss": 1.0, "answer_ids": want, "top1_ids": [space, three + 1 + i],
-              "exact": False} for i in range(6)]
-    notes = _default_guesses(rows, tok)   # the shared " " doesn't count as a guess
+    rows = [{"category": "sports", "answer_loss": 1.0, "greedy_ids": tok.encode(" 3 points"), "exact": i == 0}
+            for i in range(4)]
+    rows += [{"category": "sports", "answer_loss": 1.0, "greedy_ids": tok.encode(f" {5 + i}."), "exact": False}
+             for i in range(6)]
+    notes = _default_guesses(rows, tok)
     assert len(notes) == 1 and "'3' in 4 of 10" in notes[0] and "1 of them is an exact match" in notes[0]
     assert _default_guesses(rows[3:], tok) == []   # 1 of 7: not a pattern

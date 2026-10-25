@@ -19,18 +19,30 @@ is how loss is measured during training too, and it's cheap: one forward pass
 per test, no sampling.
 
   token loss      mean cross-entropy (nats) over every next-token prediction
-  expected loss   mean cross-entropy over just the expected answer's tokens
-  exact match     1 if every answer token was the model's top choice *and* the
-                  model would end the answer there, else 0
+  expected loss   mean cross-entropy of the expected answer's *text* per answer token
+                  (both spellings, see below)
+  exact match     1 if the model's own greedy answer is the expected text and ends
+                  there, else 0
 
-"End the answer there": with a tokenizer, an answer only counts when the model's
-own next token after it doesn't carry on the same word or number. Matching the
-answer's tokens alone counted " 0" as right when mix-100m was about to say
-"0.5 degrees Fahrenheit" (round 5). See `answer_ends`.
+With a tokenizer (`score`), both answer numbers are about the text, not one token
+sequence:
+  * Spelling. Our tokenizer splits " 7" into " " + "7", so in a few-shot prompt
+    half the example answers start with a bare " ". A model that copies that and
+    writes " " + "Paris" has written the right text, but scoring only " Paris"
+    called it wrong (round 6: mix-20m's top guess was " " on 54 of 70 facts).
+    The answer's probability is now P(canonical tokens) + P(" " + the rest), and
+    `alt_share` says how much came through the second spelling.
+  * Exact match generates the answer greedily (a few tokens) and compares the
+    decoded text. The answer must also *end* there: " 0" followed by ".5" is
+    "0.5", not "0" (round 5: "water freezes at 0.5 degrees Fahrenheit"). See
+    `greedy_match`.
+Without a tokenizer (ablation, which only compares losses), it's the plain
+token-level version: canonical tokens only, exact = every answer token top-1.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -109,50 +121,99 @@ def _ends_word(text: str) -> bool | None:
     return None
 
 
-@torch.no_grad()
-def answer_ends(model, ids: torch.Tensor, next_id: int, tokenizer, vocab: int,
-                max_extra: int = 3) -> tuple[bool, list[int]]:
-    """Would the model stop the answer at the end of `ids`?
+def _space_spelling(tokenizer, expected: str, canonical: list[int]) -> list[int] | None:
+    """The other common way to write `expected` in tokens: a bare " " and then
+    the rest (" Paris" -> " " + "Paris"). None if there's no such second
+    spelling (no leading space, the tokenizer has no lone-space token, or it's
+    the canonical one already, as for numbers: " 7" is always " " + "7")."""
+    if len(expected) < 2 or expected[0] != " " or expected[1].isspace():
+        return None
+    space = tokenizer.encode(" ")
+    if len(space) != 1:
+        return None
+    alt = space + tokenizer.encode(expected[1:])
+    return alt if alt != canonical else None
 
-    next_id is the model's top choice right after the answer (free: it comes
-    out of the scoring pass). A special token (end of text, end of turn) or
-    whitespace ends the answer; a letter or digit carries it on. After
-    punctuation we can't tell yet ("0." could become "0.5" or end a sentence),
-    so we let the model write up to `max_extra` more tokens greedily. Returns
-    (ends, the continuation's token IDs)."""
+
+def _seq_logprob(model, prompt: torch.Tensor, answer: list[int], vocab: int) -> float:
+    """log P(answer tokens | prompt), teacher-forced."""
+    ids = torch.cat([prompt, torch.tensor([answer], device=prompt.device)], dim=1)
+    logits = model(ids).logits[0, prompt.shape[1] - 1:-1, :vocab].float()
+    return float(logits.log_softmax(-1).gather(1, ids[0, prompt.shape[1]:, None]).sum())
+
+
+@torch.no_grad()
+def greedy_match(model, prompt: torch.Tensor, expected: str, tokenizer, vocab: int,
+                 max_new: int) -> tuple[bool, list[int]]:
+    """Let the model answer greedily and compare the *text* with `expected`.
+
+    It matches if the decoded answer starts with the expected text and the
+    model ends the word or number there (`_ends_word`): whitespace, an end-of-
+    text/turn token, or punctuation followed by whitespace. Generation stops as
+    soon as the outcome is known, after at most `max_new` tokens. Uses a KV
+    cache when the model has one (ours and external models alike). Returns
+    (match, the generated token IDs)."""
     special = set(getattr(tokenizer, "special_tokens", {}).values())
-    room = getattr(getattr(model, "cfg", None), "max_seq_len", None)
-    cont = [int(next_id)]
-    while True:
-        if cont[-1] in special:
-            return True, cont
-        verdict = _ends_word(tokenizer.decode(cont))
-        if verdict is not None:
-            return verdict, cont
-        if len(cont) > max_extra or (room is not None and ids.shape[1] + len(cont) > room):
-            return True, cont  # nothing but punctuation ("!!!!"), or no room to look further
-        seq = torch.cat([ids, torch.tensor([cont], device=ids.device)], dim=1)
-        cont.append(int(model(seq).logits[0, -1, :vocab].argmax()))
+    cfg = getattr(model, "cfg", None)
+    out: list[int] = []
+    room = cfg.max_seq_len - prompt.shape[1] if cfg is not None else max_new
+    max_new = max(0, min(max_new, room))
+    if cfg is not None:
+        from ..forge.infer.kv_cache import KVCache
+
+        cache = KVCache.for_model(model, 1, prompt.shape[1] + max_new + 1, dtype=_cache_dtype(model))
+        logits = model(prompt, cache=cache).logits[0, -1, :vocab]
+    else:  # a test stub: full forward passes
+        cache = None
+        logits = model(prompt).logits[0, -1, :vocab]
+    while len(out) < max_new:
+        t = int(logits.argmax())
+        if t in special:
+            break
+        out.append(t)
+        text = tokenizer.decode(out).rstrip("\ufffd")  # a character still cut in half
+        n = min(len(text), len(expected))
+        if text[:n] != expected[:n]:
+            return False, out
+        if len(text) > len(expected):
+            verdict = _ends_word(text[len(expected):])
+            if verdict is not None:
+                return verdict, out
+        if cache is not None:
+            logits = model(torch.tensor([[t]], device=prompt.device), cache=cache).logits[0, -1, :vocab]
+        else:
+            ids = torch.cat([prompt, torch.tensor([out], device=prompt.device)], dim=1)
+            logits = model(ids).logits[0, -1, :vocab]
+    # Stopped (end token, or out of tokens/room): right if the whole answer is there.
+    text = tokenizer.decode(out)
+    return text.startswith(expected), out
+
+
+def _cache_dtype(model):
+    """The KV cache's dtype: the model's compute dtype (bf16 for big external models)."""
+    for p in model.parameters():
+        if p.is_floating_point():
+            return p.dtype
+    return torch.float32
 
 
 @torch.no_grad()
 def score_cases(model, enc: list[EncodedCase], vocab: int, device, per_case: list | None = None,
                 tokenizer=None) -> dict:
-    """Teacher-forced loss/accuracy per category (see module docstring).
+    """Loss/accuracy per category (see module docstring).
 
     per_case: if a list is given, one dict per test is appended to it (id,
-    category, answer loss, exact, the model's top-1 token IDs over the
-    answer span and, with a tokenizer, what it would write next), so callers
+    category, answer loss, exact, the model's top-1 token IDs over the answer
+    span, and with a tokenizer its greedy answer and `alt_share`), so callers
     can show what the model got wrong and compute error bars.
 
-    tokenizer: if given, an exact match also needs the model to end the
-    answer there (`answer_ends`). Without one (ablation, which only compares
-    losses), matching the answer's tokens is enough."""
+    tokenizer: if given, answer loss counts both spellings of the answer and
+    exact match compares the model's greedy answer as text. Without one, the
+    token-level version."""
     acc: dict[str, dict[str, float]] = {}
     for e in enc:
         ids = e.ids.to(device)
-        full = model(ids).logits[0, :, :vocab].float()
-        logits = full[:-1]
+        logits = model(ids).logits[0, :-1, :vocab].float()
         targets = ids[0, 1:]
         nll = F.cross_entropy(logits, targets, reduction="none")
         a = acc.setdefault(e.category, {"loss_sum": 0.0, "n_tok": 0, "exp_loss_sum": 0.0, "n_exp_tok": 0,
@@ -163,16 +224,30 @@ def score_cases(model, enc: list[EncodedCase], vocab: int, device, per_case: lis
         row = {"id": e.case.id, "category": e.category, "answer_loss": None, "exact": None, "top1_ids": []}
         if span.stop > span.start:
             top1 = logits[span].argmax(-1)
+            answer = targets[span].tolist()
+            n = len(answer)
+            ans_nll = float(nll[span].sum())
             exact = bool((top1 == targets[span]).all())
-            if exact and tokenizer is not None:
-                exact, after = answer_ends(model, ids, int(full[-1].argmax()), tokenizer, vocab)
-                row["after_ids"] = after
-            a["exp_loss_sum"] += float(nll[span].sum())
-            a["n_exp_tok"] += span.stop - span.start
+            # (Skipped if max_seq_len cut the answer short.)
+            if tokenizer is not None and e.case.expected and n == len(tokenizer.encode(e.case.expected)):
+                prompt = ids[:, :e.n_prompt]
+                alt = _space_spelling(tokenizer, e.case.expected, answer)
+                if alt is not None and prompt.shape[1] + len(alt) <= getattr(getattr(model, "cfg", None),
+                                                                           "max_seq_len", 1 << 30):
+                    lp_alt = _seq_logprob(model, prompt, alt, vocab)
+                    total = torch.logaddexp(torch.tensor(-ans_nll), torch.tensor(lp_alt)).item()
+                    row["alt_share"] = math.exp(lp_alt - total)
+                    ans_nll = -total
+                else:
+                    row["alt_share"] = 0.0
+                # Compare with the answer as this tokenizer writes it back.
+                exact, greedy = greedy_match(model, prompt, tokenizer.decode(answer), tokenizer, vocab, max_new=n + 4)
+                row["greedy_ids"] = greedy
+            a["exp_loss_sum"] += ans_nll
+            a["n_exp_tok"] += n
             a["exact"] += int(exact)
             a["n_exp_cases"] += 1
-            row.update(answer_loss=float(nll[span].mean()), exact=exact, top1_ids=top1.tolist(),
-                       answer_ids=targets[span].tolist())
+            row.update(answer_loss=ans_nll / n, exact=exact, top1_ids=top1.tolist(), answer_ids=answer)
         if per_case is not None:
             per_case.append(row)
     return {c: _finish(a) for c, a in acc.items()} | {"overall": _finish(_merge(acc.values()))}
@@ -187,8 +262,6 @@ def standard_errors(per_case: list[dict]) -> dict[str, dict[str, float]]:
     within ~8 points of each other are indistinguishable. For answer loss we
     use the spread of the per-test losses (an approximation: the reported loss
     is averaged over tokens, the SE over tests)."""
-    import math
-
     groups: dict[str, list[dict]] = {}
     for r in per_case:
         if r["answer_loss"] is not None:

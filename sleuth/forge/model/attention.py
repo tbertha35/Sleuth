@@ -27,9 +27,15 @@ Per-layer variations (see ModelConfig.attn_spec), used by Gemma 4:
 Document masking (training): `same_doc` [B, 1, T, T] is True where query and
 key belong to the same document. It's ANDed with the causal mask, so the
 attention matrix becomes block-diagonal: one causal triangle per document.
-With a mask, SDPA can't use its FlashAttention kernel and falls back to the
-"memory-efficient" one, which takes masks; the speed cost is measured on the
-GPU (round 6), and FlexAttention is the fix if it's large.
+Two ways to run it:
+  * SDPA with a boolean mask (default). SDPA can't use its FlashAttention
+    kernel then and takes the "memory-efficient" one: 14.5% slower training
+    on mix-60m (round 6), though it used less memory.
+  * FlexAttention (`train.doc_mask_kernel = "flex"`): `same_doc` is then a
+    BlockMask from `doc_block_mask`. The kernel is generated (by torch.compile,
+    through Triton) for this mask and skips every 128×128 tile that is fully
+    masked, so the cross-document part of the window costs nothing. Without
+    torch.compile it runs an unfused reference version: correct, but slow.
 """
 
 from __future__ import annotations
@@ -44,6 +50,23 @@ from .config import ModelConfig
 from .norm import RMSNorm
 from .rope import apply_rope
 from .taps import Tap
+
+def doc_block_mask(doc_ids: torch.Tensor):
+    """[B, T] document numbers -> a FlexAttention BlockMask: causal, and only
+    within a document. Build it outside a compiled model, once per batch; every
+    layer shares it."""
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def same_doc_causal(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
+
+    B, T = doc_ids.shape
+    return create_block_mask(same_doc_causal, B, None, T, T, device=doc_ids.device)
+
+
+def _is_block_mask(m) -> bool:
+    return m is not None and not isinstance(m, torch.Tensor)
+
 
 # SDPA can broadcast K/V heads itself from PyTorch 2.5; before that we
 # repeat them explicitly (same result, a little more memory traffic).
@@ -75,7 +98,9 @@ class Attention(nn.Module):
         self.tap_z = Tap()
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache=None,
-                same_doc: torch.Tensor | None = None) -> torch.Tensor:
+                same_doc=None) -> torch.Tensor:
+        """same_doc: document mask, a [B, 1, T, T] bool tensor (SDPA) or a
+        BlockMask (FlexAttention); see the module docstring."""
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.n_heads, self.hd).transpose(1, 2)  # [B, H, T, hd]
         k = self.k_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)     # [B, K, T, hd]
@@ -93,7 +118,15 @@ class Attention(nn.Module):
         S = k.shape[2]
         offset = S - T  # how many earlier tokens are in the cache
 
-        if self.tap_pattern.active:
+        if _is_block_mask(same_doc):
+            if self.tap_pattern.active or self.window or offset:
+                raise NotImplementedError("FlexAttention document masks are for training: no attention "
+                                          "taps, sliding windows or KV cache")
+            from torch.nn.attention.flex_attention import flex_attention
+
+            y = flex_attention(q, k, v, block_mask=same_doc, scale=self.scale,
+                               enable_gqa=self.n_kv != self.n_heads)
+        elif self.tap_pattern.active:
             y = self._explicit(q, k, v, offset, same_doc)
         else:
             y = self._fused(q, k, v, offset, same_doc)

@@ -31,6 +31,7 @@ import torch
 from ...config import to_dict
 from ...env import env_info, runs_root
 from ..data.loader import ShardDataset, document_ids
+from ..model.attention import doc_block_mask
 from ..model.flops import describe, train_flops_per_token
 from ..model.transformer import Transformer
 from ..tokenizer.bpe import Tokenizer
@@ -142,6 +143,12 @@ def train(cfg: RunConfig, run_dir: Path | None = None, resume: bool = False,
 def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: bool,
            stop_at_step: int | None, log: Callable[[str], None]) -> Path:
     tc = cfg.train
+    # Config checks that would otherwise fail later, after the run folder exists.
+    if tc.doc_mask_kernel not in ("sdpa", "flex"):
+        raise ValueError(f"train.doc_mask_kernel must be 'sdpa' or 'flex', not {tc.doc_mask_kernel!r}")
+    if tc.doc_mask and tc.doc_mask_kernel == "flex" and device.type != "cuda":
+        raise ValueError("train.doc_mask_kernel = 'flex' needs a GPU (FlexAttention has no backward pass on CPU); "
+                         "use 'sdpa'")
     torch.manual_seed(tc.seed)
 
     # ---- data + tokenizer -------------------------------------------------
@@ -199,6 +206,18 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     # Document masking: the model gets each window's document numbers, so
     # attention stops at every <|bos|> (see data/loader.py: document_ids).
     mask_bos = tokenizer.bos_id if tc.doc_mask else None
+    use_flex = tc.doc_mask and tc.doc_mask_kernel == "flex"
+    if use_flex and not compile_model:
+        log("warning: doc_mask_kernel = 'flex' without torch.compile runs FlexAttention's slow reference "
+            "version; set compile = true (or use 'sdpa')")
+
+    def masks(x) -> dict:
+        """The document-mask arguments for one batch (none without doc_mask)."""
+        if mask_bos is None:
+            return {}
+        doc = document_ids(x, mask_bos)
+        # The BlockMask is built here, outside the compiled model, once per micro-batch.
+        return {"block_mask": doc_block_mask(doc)} if use_flex else {"doc_ids": doc}
 
     tokens_per_step = tc.micro_batch_size * tc.seq_len * tc.grad_accum
     flops_per_token = train_flops_per_token(cfg.model, tc.seq_len)
@@ -207,7 +226,7 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     log(f"run dir: {run_dir}")
     log(f"model: {describe(cfg.model, tc.seq_len)}")
     log(f"device: {device}, precision: {'bf16 autocast' if use_bf16 else 'fp32'}, "
-        + ("document-masked attention, " if tc.doc_mask else "") +
+        + (f"document-masked attention ({tc.doc_mask_kernel}), " if tc.doc_mask else "") +
         f"{tokens_per_step:,} tokens/step, {tc.max_steps * tokens_per_step / 1e6:.1f}M tokens total, "
         f"train tokens available: {train_ds.n_tokens / 1e6:.1f}M")
     epochs = tc.max_steps * tokens_per_step / max(1, train_ds.n_tokens)
@@ -236,9 +255,8 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
             for micro in range(tc.grad_accum):
                 x, y = train_ds.batch(tc.micro_batch_size, tc.seq_len, tc.seed, step, micro)
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                doc = document_ids(x, mask_bos) if mask_bos is not None else None
                 with autocast():
-                    loss = fwd(x, y, doc_ids=doc).loss
+                    loss = fwd(x, y, **masks(x)).loss
                 (loss / tc.grad_accum).backward()
                 # Accumulate on-device: calling .item() here would force the
                 # CPU to wait for the GPU every micro-step.
@@ -321,8 +339,17 @@ def _install_stop_signals():
     stop training like Ctrl-C: save a resumable checkpoint first. A process run
     in the background often never sees Ctrl-C (the owner lost ~460 steps that
     way); the STOP file is the most reliable way to stop one. Returns a function
-    that puts the old handlers back."""
+    that puts the old handlers back.
+
+    Only the first signal raises. The dashboard re-sends Ctrl-Break while a
+    job hasn't exited (Windows can drop one that arrives during start-up), and
+    a second one must not interrupt the checkpoint the first one is saving."""
+    requested = []
+
     def handler(signum, frame):
+        if requested:
+            return
+        requested.append(signum)
         raise _StopRequested(f"signal {signum}")
 
     old = {}

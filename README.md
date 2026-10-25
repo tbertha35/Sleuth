@@ -183,13 +183,16 @@ a run's validation loss (overall and per data source), and `python -m sleuth sco
 --suite suites/knowledge` checks its answers (220 questions). `score` shows answer loss first,
 since at these sizes it moves long before exact matches do, with ± one standard error;
 `--show-items` lists every question with the model's top guess, and `--json FILE` saves it all.
-An exact match also needs the model to *end* the answer there (" 0" followed by ".5" doesn't
-count), and `score` warns when one guess (say "3") is the model's answer to many questions.
-Base models answer in the right format with `--few-shot` (worked examples first).
+Scores are about the answer's *text*: answer loss counts both ways to spell it in tokens
+(" Paris", or " " + "Paris"), and an exact match means the model's greedy answer is the
+expected text and ends there (" 0" followed by ".5" doesn't count). `score` warns when one
+answer (say "3") is the model's reply to many questions. Base models answer in the right
+format with `--few-shot` (worked examples first).
 
 Document masking: `--set train.doc_mask=true` stops attention at document boundaries, so a
 training window that holds the end of one document and the start of the next doesn't let the
-second read the first (needed for chat fine-tuning). `eval --doc-mask yes` measures a run
+second read the first (needed for chat fine-tuning). On a GPU with `compile = true`,
+`--set train.doc_mask_kernel=flex` uses FlexAttention, which can skip the masked-out parts. `eval --doc-mask yes` measures a run
 trained without it that way, to see how much it leans on the previous document.
 
 Small models loop when decoded greedily ("The capital of France is the capital of France…").

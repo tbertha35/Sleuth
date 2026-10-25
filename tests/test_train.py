@@ -1,5 +1,7 @@
 import json
 import math
+import os
+import signal
 from pathlib import Path
 
 import pytest
@@ -110,3 +112,18 @@ def test_eval_command(tiny_data, tmp_path, capsys):
     run = train(tiny_run_config(tiny_data, tmp_path, max_steps=3), log=lambda s: None)
     assert main(["eval", str(run), "--windows", "6", "--device", "cpu"]) == 0
     assert "val loss" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sends SIGTERM to itself (POSIX)")
+def test_only_the_first_stop_signal_interrupts():
+    """The dashboard may re-send its stop signal; the second one must not
+    interrupt the checkpoint the first one is saving."""
+    from sleuth.forge.train.trainer import _install_stop_signals, _StopRequested
+
+    restore = _install_stop_signals()
+    try:
+        with pytest.raises(_StopRequested):
+            os.kill(os.getpid(), signal.SIGTERM)   # the handler runs as soon as kill returns
+        os.kill(os.getpid(), signal.SIGTERM)   # ignored: would raise here otherwise
+    finally:
+        restore()

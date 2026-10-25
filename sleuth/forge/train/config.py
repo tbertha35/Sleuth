@@ -40,6 +40,7 @@ class TrainConfig:
     resume_every: int = 500         # full resumable checkpoints (weights + optimizer)
     keep_resume: int = 2            # keep only the newest N resumable checkpoints
     doc_mask: bool = False          # attention stops at document boundaries (<|bos|>); see data/loader.py
+    doc_mask_kernel: str = "sdpa"   # "sdpa" (boolean mask) | "flex" (FlexAttention; fast only with compile = true)
     compile: bool = False           # torch.compile the model (faster on GPU after a warm-up)
     peak_tflops: float = 0.0        # hardware peak for MFU (from hardware/<host>.json); 0 = don't report
 
