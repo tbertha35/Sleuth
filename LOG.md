@@ -652,3 +652,78 @@ dashboard changes above, so the suite was still the 40-item one). All 181 CPU + 
     run trained without masking, that measures how much the model leans on the previous
     document). CPU demo model: 0.538 → 0.544 nats with the mask.
 - Tests: 227 → 243 CPU tests; GPU tests 6 → 8 (masking under bf16, with and without torch.compile).
+
+**2026-10-25: Round 6: masking helps a little, the space-token trap in few-shot scoring, mix-150m planned.**
+Run by the owner's agent on the 5060 Ti box at `9f8ff84` (PR #7). The owner checked the
+dashboard by hand: Jobs (a training job streamed, stopped with a checkpoint and resumed),
+Playground (mix-100m; Gemma 4 in chat mode) and the logit-lens note all work.
+- *Three Windows-only test failures, fixed by the owner's agent (commit `57b5ba3`):* a test wrote a
+  file with `write_text` (`\r\n` makes it 13 bytes, not 12); `read_log` with a negative offset always
+  dropped the first line, even when the window started exactly at one (`finished\r\n` is 10 bytes);
+  and **a Ctrl-Break sent right after a process starts is lost on Windows**: the dashboard now
+  re-sends it every second, up to 5 times. Plus a Playground fix: the model box's `<datalist>` only
+  suggested runs matching the pre-filled text, so a Run `<select>` now lists every run. Follow-up
+  here: the trainer ignores every stop signal after the first, so a re-sent one can't interrupt the
+  checkpoint the first one is saving.
+- *Gemma's first token: llama.cpp's activation rounding is not the reason.* With
+  `--q8-activations` the margin of "0" over "1" only shrinks from 0.344 to 0.333 logits; perplexity
+  moves 22.461 → 22.487 (llama.cpp 22.59). I'm parking this: it's one position of raw text, where
+  Gemma IT is badly out of its element (~19 nats/token at positions 1–7, round 3) and small
+  differences get amplified, while perplexity agrees within 0.6% and the chat-format answers agree.
+  If it matters later: llama-server's `n_probs` for the same prompt, then a layer-by-layer dump.
+- *The ladder on the 220-item suite* (answer loss / exact; few-shot answer loss / exact):
+  mix-20m 3.280 / 3.2%, 3.241 / 3.6%; mix-60m 2.856 / 4.5%, 2.801 / 3.6%; mix-100m 2.803 / 4.5%,
+  **2.112 / 14.1%**. mix-100m few-shot gets 10 capitals, 1914, French, Wimbledon, FIFA, Cricket,
+  Tennis and Brazil right. The "answer must end" rule removed round 5's "0.5 degrees" match and
+  kept "32" + " degrees". Several "3"s are default guesses, as the notes said.
+- *A scoring trap, found from those notes:* in few-shot, mix-20m's "default guess" for facts was
+  a bare " " in 54 of 70 tests. Our tokenizer writes numbers without their space (" 7" = " " +
+  "7"), and two of the four `_fewshot.txt` answers are numbers, so the prompt teaches "after `A:`
+  comes a lone space". A model that then writes " " + "Paris" has the right text, but we scored
+  only the one-token spelling " Paris" (and its top-1 " " failed exact match). That hit the small
+  models hardest, so "few-shot only helps at 100M" may be partly an artifact. Fixed (below);
+  the ladder needs one more re-score.
+- *Document masking, speed (mix-60m, 300 steps):* 63.0k → 53.9k tok/s (−14.5%, MFU 65 → 56%), but
+  less memory (5.7 → 4.8 GB). The SDPA kernel that accepts a mask is slower than FlashAttention.
+- *Document masking, A/B (mix-20m, same 0.5B tokens; 62 min with compile vs 95 min before):*
+
+  | val loss (640 windows) | eval unmasked | eval masked |
+  |---|---|---|
+  | mix-20m, trained unmasked | **3.3221** | 3.3302 |
+  | mix-20m-docmask, trained masked | 3.3500 | **3.3095** |
+
+  Each model is best measured the way it was trained, and masked/masked beats unmasked/unmasked by
+  0.013 nats (0.0044 bits/byte) on every source. The masked model loses more when the mask is taken
+  away (+0.041) than the unmasked one when it's added (+0.008): the unmasked model barely used the
+  previous document anyway, while the masked one never learned to ignore it. Caveat (the agent's):
+  the runs also differ in micro-batch (16×4 vs 8×8), so they saw different batches, and run-to-run
+  noise at this size is probably of the same order; the direction on all six sources is the
+  evidence. Knowledge (few-shot score) is the same within error bars. Decision: mix-150m trains
+  masked (cheap, slightly better, and the chat fine-tune needs it). Unexplained: the masked run's
+  peak memory grew from 5.1 to 7.8 GB during the run.
+- *Data:* without caps the downloaded files hold ~20 GB of text (≈ 4.7B tokens), but Cosmopedia
+  (1.4 GB) limits a mix with the same shares to ~2.2B. With one more Cosmopedia file, ~3.6B
+  (docs/DATA.md, "A bigger mix for mix-150m").
+
+**2026-10-25: After round 6: scoring the answer text, FlexAttention for masks, mix-150m config.**
+- *Scoring the text, not one token sequence* (`score`; ablation keeps the token-level version):
+  - **Answer loss** counts both spellings, P(" Paris") + P(" " + "Paris"), normalized by the
+    canonical token count as before. Numbers (" 7") have only one spelling, so they don't change.
+    `score` reports per category how much probability came through the " " + word spelling.
+  - **Exact match** is now the model's *greedy answer*, decoded and compared as text, which
+    must also end there (whitespace, an end token, or punctuation then whitespace). It replaces
+    last round's "top-1 at every answer token, then look ahead". It stops as soon as the outcome is
+    known (≤ answer length + 4 tokens, with a KV cache). Cost: on the tiny test Gemma,
+    `score --few-shot` went 2.4 → 5.9 s; on the 12B, expect a few minutes per suite.
+  - `--show-items` prints the greedy answer, and the default-guess note now counts the first *word*
+    of the greedy answers ("3", "The"), not the first token (" " was a spelling, not a guess).
+- *FlexAttention for document masks:* `train.doc_mask_kernel = "flex"` builds a BlockMask per
+  micro-batch (outside the compiled model) and runs `flex_attention`, which torch.compile turns
+  into a Triton kernel that skips fully masked 128×128 tiles. Checked on CPU against the SDPA path
+  (same logits to 1e-5); it has no backward pass on CPU, so the trainer refuses it there, before
+  making a run folder. GPU speed and Windows support (triton-windows) are untested: that's round 7.
+- *`configs/mix-150m.toml`:* d=896, 14 layers, 14 heads (head size 64), 7 KV heads: 155M params
+  (125M non-embedding), 23,000 steps × 131k = 3.0B tokens, 1082 MFLOPs/token, ~30 h at 68% MFU
+  (~35 h with the SDPA mask). Same LR (6e-4) and cosine schedule as mix-100m, document-masked,
+  shards `data/shards/mix-3b`.
+- Tests: 243 → 248 CPU; GPU 8 → 10 cases (FlexAttention; the case without compile skips).

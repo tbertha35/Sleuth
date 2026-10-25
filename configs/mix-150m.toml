@@ -1,0 +1,54 @@
+# Scaling ladder, rung 4: d=896, 14 layers: ~155M parameters (125M non-embedding).
+# Same tokenizer and context as mix-20m / mix-60m / mix-100m, and the same source
+# proportions, from a bigger re-shard of the mix (data/shards/mix-3b; docs/DATA.md
+# "A bigger mix for mix-150m").
+#
+# 23000 steps x 8 x 1024 x 16 = 3.01B tokens (~24 per non-embedding parameter).
+# 1082 MFLOPs/token: at mix-100m's ~68% MFU about 30 h on the RTX 5060 Ti
+# (document masking with the SDPA kernel costs ~15% more; FlexAttention may win it back).
+# Resumable; stop cleanly with Ctrl-C or by creating runs/<run-id>/STOP.
+#
+# Two things differ from the earlier rungs besides size, both small next to the
+# ~0.2 nats the ladder's trend predicts (val ~2.55-2.6):
+#   * document masking: in the mix-20m A/B it was 0.013 nats better (round 6), and
+#     the chat fine-tune (M11a) wants a base model that never read across documents;
+#   * the val set: the bigger shards hold more val documents, so re-run
+#     `sleuth eval <run> --shards data/shards/mix-3b` on the old rungs to compare.
+#
+#   python -m sleuth train configs/mix-150m.toml
+name = "mix-150m"
+
+[data]
+shards = "data/shards/mix-3b"
+
+[model]
+vocab_size = 0          # from the shards (the same 32k tokenizer as data/shards/mix)
+d_model = 896
+n_layers = 14
+n_heads = 14            # head_dim 64, as in every rung
+n_kv_heads = 7
+max_seq_len = 1024
+
+[train]
+micro_batch_size = 8
+grad_accum = 16
+max_steps = 23000
+lr = 6e-4               # as mix-60m/100m (GPT-3 used 6e-4 at 125M, 3e-4 at 350M)
+warmup_steps = 600
+device = "auto"
+precision = "bf16"
+seq_len = 1024
+min_lr_ratio = 0.1
+schedule = "cosine"
+weight_decay = 0.1
+grad_clip = 1.0
+log_every = 25
+eval_every = 500
+eval_batches = 40
+eval_windows = 640      # val windows spread over the whole split
+doc_mask = true         # attention stops at document boundaries
+doc_mask_kernel = "sdpa"  # or "flex" if the round-7 speed test shows FlexAttention is faster
+compile = true          # torch.compile (needs Triton; on Windows: pip install -e .[triton])
+snapshot_every = 1000
+resume_every = 500
+peak_tflops = 44.75     # RTX 5060 Ti measured bf16 matmul peak; enables the MFU column. Change per machine.

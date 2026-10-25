@@ -110,6 +110,37 @@ never repeats data. For comparison, SmolLM2's mature recipe was roughly 60% web,
 Deliberately *not* in training: GSM8K and similar benchmark sets. They stay clean for
 evaluation (training on a test set makes its score meaningless).
 
+### A bigger mix for mix-150m (proposed 2026-10-25, needs one download)
+
+mix-150m wants ~3B tokens; the capped mix above has 1.76B. Uncompressed text in the files
+already downloaded (measured by the owner's agent, round 6):
+
+| source | text on disk | current cap | needed at its share of 15.3 GB |
+|---|---|---|---|
+| fineweb-edu | 6,942 MB | 3,000 | 6,117 (40%) |
+| cosmopedia | 1,411 MB | 1,100 | 2,294 (15%): **one more file needed** |
+| wikipedia | 1,835 MB | 900 | 1,835 (12%): all of it, so this sets the total |
+| python-edu | 3,621 MB | 1,100 | 2,294 (15%) |
+| finemath | 2,131 MB | 750 | 1,529 (10%) |
+| sports | 4,035 MB | 600 | 1,223 (8%) |
+
+Keeping the shares, Cosmopedia runs out first (1.4 GB at 15% allows only ~2.2B tokens).
+With **one more Cosmopedia file** (`cosmopedia-v2`, the next `train-…-of-00104.parquet`,
+~1.18 GB, same licence) Wikipedia becomes the limit: 15.3 GB of text, ≈ 3.6B tokens at
+4.21 bytes/token. Re-sharding everything without caps would give ~4.7B tokens but shift the
+mix (sports 20%, python 18%).
+
+Re-shard with the **same tokenizer** (so every rung shares it), into a new folder:
+
+```
+python -m sleuth shard --input data/raw/fineweb-edu@6117 data/raw/cosmopedia@2294 data/raw/wikipedia@1835 data/raw/python-edu@2294 data/raw/finemath@1529 data/raw/sports@1223 --tokenizer data/shards/mix/tokenizer.json --out data/shards/mix-3b
+```
+
+Caps read each source's files from the start, in name order, so the new shards contain
+everything the old ones did, and the validation split (chosen by document hash) keeps every
+old val document. It also gains new ones, so the val windows differ: compare rungs with
+`sleuth eval <run> --shards data/shards/mix-3b`.
+
 ## Stage 3: fine-tuning and memory (downloaded 2026-10-25, approved)
 
 For chat SFT (PLAN §4.6, milestone M11a) and the memory experiments (M11b). Stored in

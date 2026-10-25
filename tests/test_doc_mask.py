@@ -7,6 +7,7 @@ import torch
 
 from sleuth.forge.data.loader import document_ids
 from sleuth.forge.infer.kv_cache import KVCache
+from sleuth.forge.model.attention import doc_block_mask
 from sleuth.forge.model.config import ModelConfig
 from sleuth.forge.model.taps import listen
 from sleuth.forge.model.transformer import Transformer
@@ -78,3 +79,31 @@ def test_training_with_doc_mask(tiny_data, tmp_path):
     recs = [json.loads(line) for line in (run / "metrics.jsonl").read_text().splitlines()]
     assert all(torch.isfinite(torch.tensor(r["loss"])) for r in recs if "loss" in r)
     assert any("val_loss" in r for r in recs)
+
+
+def test_flex_attention_gives_the_same_result(model):
+    """The FlexAttention path (train.doc_mask_kernel = "flex") computes what the
+    SDPA mask does. On CPU without compile it's FlexAttention's reference version."""
+    a, b, both = _two_docs()
+    doc = document_ids(both, BOS)
+    with torch.no_grad(), pytest.warns(UserWarning, match="without torch.compile"):
+        flex = model(both, block_mask=doc_block_mask(doc)).logits
+    with torch.no_grad():
+        sdpa = model(both, doc_ids=doc).logits
+        alone = model(b).logits
+    torch.testing.assert_close(flex, sdpa, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(flex[:, a.shape[1]:], alone, atol=1e-5, rtol=1e-5)
+
+
+def test_the_flex_kernel_is_checked_before_training(tiny_data, tmp_path):
+    """Training with it runs on the GPU only (test_gpu.py): FlexAttention has no
+    backward pass on CPU, so the trainer says so instead of failing mid-step."""
+    with pytest.raises(ValueError, match="needs a GPU"):
+        train(tiny_run_config(tiny_data, tmp_path / "cpu", doc_mask=True, doc_mask_kernel="flex"), log=quiet)
+    with pytest.raises(ValueError, match="doc_mask_kernel"):
+        train(tiny_run_config(tiny_data, tmp_path / "bad", doc_mask=True, doc_mask_kernel="fast"), log=quiet)
+    assert not (tmp_path / "cpu").exists() and not (tmp_path / "bad").exists()   # no half-made run folders
+
+
+def quiet(_):
+    pass
