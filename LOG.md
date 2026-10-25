@@ -575,3 +575,80 @@ done here, plus bug 2. PLAN §8.1 now holds the roadmap.
   the Playground on the GPU (peak memory, GPU lane), loading Gemma 4 in the Playground, and the
   page in Edge/Chrome on Windows. Round 5 should start a short training job from the Jobs page,
   stop it, and resume it.
+
+**2026-10-25: Round 5: mix-100m knows its first facts; Gemma at 10.3 tok/s; the gap to llama.cpp isn't bf16.**
+Run by the owner's agent on the 5060 Ti box, code at `728495e` (before the knowledge-suite and
+dashboard changes above, so the suite was still the 40-item one). All 181 CPU + 6 GPU tests passed.
+- *Gemma 4 12B decoding* with the few-row kernel and fused norms: **7.7 → 10.3 tok/s**, prompt
+  127 → 97 ms, peak 7.68 GiB. llama.cpp: 46, so still 4.5× slower. Next is CUDA graphs (§4.5.1).
+- *First-token difference, fp32:* `next --dtype fp32` still puts "0" (30.1%) ahead of "1" (21.3%),
+  by 0.344 logits (bf16: 0.375). So it is **not** bf16 rounding. New hypothesis: llama.cpp's own
+  rounding. Its CUDA code doesn't multiply Q4_0 weights by the activations as they are: it first
+  rounds the activations to 8 bits (q8_1, 32 values per fp16 scale) and takes integer dot products;
+  its KV cache is fp16 too. Our kernel uses the activations unrounded, so llama.cpp is the one
+  further from the exact result of the quantized weights. Experiment added: `next --q8-activations`
+  (and `perplexity --q8-activations`) rounds every quantized layer's input the same way. If "1"
+  then wins, that settles it; if not, a layer-by-layer comparison is next.
+- *Corrected validation (re-sharded, 640 windows over the whole mix):* mix-20m **3.322** nats
+  (1.139 bits/byte), mix-60m **2.971** (1.019). The 40-window numbers last round (3.34 / 2.99) were
+  close; the old FineWeb-only number (3.90) was not. Python is the easiest source (1.85 for 60m),
+  FineWeb-Edu the hardest (3.53).
+- *mix-100m* (101M params, 76M non-embedding, 1.57B tokens): **10.4 h** at 65–72% MFU, 6.1 GB
+  (config estimate ~12 h). Val **2.772 nats, 0.951 bits/byte**: cosmopedia 2.47, finemath 2.46,
+  fineweb-edu 3.34, python-edu 1.68, sports 3.17, wikipedia 3.01. Every source improved by about
+  the same amount from 60m (0.17–0.24 nats), so no single kind of text is holding it back.
+- *The ladder:* 3.322 → 2.971 → 2.772. Per decade of training compute (6 · non-embedding params ·
+  tokens: 2.8e16, 2.6e17, 7.1e17) that's −0.36, then −0.45 nats: no sign of flattening yet. If the
+  trend holds, mix-150m on ~3B tokens (~2.2e18) should land near 2.55–2.6 (a prediction to check,
+  not a promise: with three points and size and tokens growing together it's a rough line).
+- *Knowledge, few-shot is what shows it.* Answer loss with `score --few-shot`: 2.945 → 2.502 →
+  **1.943**; on facts alone 4.74 → 3.73 → **2.23**. Without examples, answer loss barely moved from
+  60m to 100m (2.79 → 2.72), because then it's mostly measuring that a base model doesn't know to
+  answer briefly. So for base models, few-shot answer loss is the number to track. That also
+  answers last round's question: the facts answer loss does keep falling with size.
+- *First real facts:* greedy few-shot answers right on 10/40 for mix-100m (60m: 4, 20m: 3), the
+  first non-Python ones being Paris, Tokyo, Egypt and Wimbledon. Two of the ten were flukes, found
+  by the owner's agent: "water freezes at" → "0.5 degrees Fahrenheit" counted as " 0", and "3
+  strikes" came from a default guess: the model said "3" to soccer players, golf holes, a
+  hexagon's sides and more. So ~8 genuine. Maths: 0/10, mostly echoing a number from the question.
+- *Samples (greedy, no penalties):* "Photosynthesis is the process of converting sunlight into
+  energy" (20m/60m had "carbon dioxide into carbon dioxide"); Fibonacci has the two-term recursion
+  but a wrong base case. Every size still loops; `--no-repeat-ngram` (added since) is for that.
+- *Induction heads:* random-token gain 0.16 at step 256, 2.33 at 500, 8.82 at 1000, 10.08 at the
+  end (first copy 10.82 → repeat 0.75). This time **two layers** hold them: L5H7 (0.85), L5H6
+  (0.77), L8H5 (0.75). (20m: layer 5 of 6; 60m: layer 4 of 10.) They formed between steps 256 and
+  1000 at every size; 100m's longer warmup puts it a little later. *Logit lens:* final 2.619 /
+  49.8% top-1; the biggest single step is L9 → L10 (−0.72 nats, +14 points).
+- *Not Sleuth:* the agent's download filter also fetched LongMemEval `m` (2.6 GB), which isn't
+  needed (docs/DATA.md: can be deleted).
+
+**2026-10-25: After round 5: exact match needs the answer to end, a llama.cpp rounding experiment, document masking.**
+- *Exact match (bug from round 5).* An answer now counts only if the model's own next token
+  after it doesn't carry on the word or number: whitespace, an end-of-text/turn token, or
+  punctuation followed by whitespace ends it; a letter or digit doesn't ("Paris" + "ian",
+  "0" + ".5"). The token after the answer comes free from the scoring pass; only after punctuation
+  does it look up to 3 tokens further (greedy). `--show-items` prints that continuation next to
+  each match. Ablation still compares losses only, so it doesn't use this.
+- *Default guesses.* `score` adds a note when one first answer token is the model's top guess in
+  at least 20% (and 3+) of a category's tests, and how many of those count as exact matches. It
+  skips a leading space token (some tokenizers split " 11" into " " + "11"). The tiny CPU demo
+  model already shows it: "3" in 8 of 12 math tests.
+- *`--q8-activations`* for `next` and `perplexity` (see round 5 above). The rounding matches our
+  Q8_0 quantizer to within one step (a test checks it), and only applies to layers kept quantized.
+- *Document masking (M11a, step 1).* `train.doc_mask = true` gives the model each window's
+  document numbers (`document_ids`: +1 at every `<|bos|>`; every shard document starts with one,
+  so this finds the same boundaries as the `.idx.npy` files without reading them). Attention then
+  ANDs the causal mask with "same document": one causal triangle per document. Decisions:
+  - Positions keep counting across the boundary. RoPE scores depend only on query–key distance,
+    so a masked document gives the same logits wherever it starts (a test checks exactly that:
+    the second document in a masked window equals the same text on its own).
+  - The `<|eos|>` belongs to the document it ends (it's predicted from that text); the next
+    `<|bos|>` only sees itself.
+  - With a mask, SDPA can't use FlashAttention and uses its memory-efficient kernel. K/V heads
+    are repeated by hand in that case, because that kernel may not accept `enable_gqa` and SDPA
+    would then fall back to the math kernel, which stores the whole attention matrix. The speed
+    cost on the 5060 Ti is unmeasured; FlexAttention is the fallback if it's large.
+  - Validation follows the run's setting; `sleuth eval RUN --doc-mask yes/no` overrides it (on a
+    run trained without masking, that measures how much the model leans on the previous
+    document). CPU demo model: 0.538 → 0.544 nats with the mask.
+- Tests: 227 → 243 CPU tests; GPU tests 6 → 8 (masking under bf16, with and without torch.compile).

@@ -6,9 +6,10 @@ trivial (just know the step number) and keeps multi-GPU ranks from seeing
 the same data, with no data-loader state to checkpoint.
 
 Windows are taken at random offsets and can span document boundaries. The
-<|bos|>/<|eos|> tokens tell the model where one document ends. (Masking
-attention at document boundaries is a later LAB experiment; the .idx.npy
-files already record where documents start.)
+<|bos|>/<|eos|> tokens tell the model where one document ends. With
+`train.doc_mask = true`, attention also stops at those boundaries:
+`document_ids` numbers the documents inside each window and the model masks
+attention between different numbers (see Transformer.forward).
 """
 
 from __future__ import annotations
@@ -19,6 +20,19 @@ from typing import Iterator
 
 import numpy as np
 import torch
+
+
+def document_ids(x: torch.Tensor, bos_id: int) -> torch.Tensor:
+    """[B, T] token IDs -> [B, T] document numbers: 0 until the first <|bos|>
+    in the window, then +1 at every <|bos|>. Every document in a shard starts
+    with <|bos|> (shard.py), so this finds the same boundaries as the .idx.npy
+    files, with no lookup: a window cut mid-document gets number 0 for that
+    document's tail.
+
+    Why <|bos|> and not <|eos|>: the <|eos|> is the last token of its own
+    document (it's predicted from that document's text), and the <|bos|> the
+    first of the next, which then sees only itself."""
+    return (x == bos_id).cumsum(dim=1)
 
 
 class ShardDataset:

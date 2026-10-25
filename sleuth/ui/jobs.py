@@ -115,6 +115,8 @@ COMMANDS = {c.name: c for c in [
         Field("run", "run", None, "Run", required=True), _step(),
         Field("windows", "int", "--windows", "Windows", "validation windows, spread over the whole split",
               default=640, min=1),
+        Field("doc_mask", "choice", "--doc-mask", "Document mask", "stop attention at document boundaries "
+              "(run = as the run was trained)", default="run", choices=["run", "yes", "no"]),
         _device(),
     ]),
     Command("score", "Score on a suite", ["score"], "gpu",

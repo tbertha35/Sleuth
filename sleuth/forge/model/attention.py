@@ -23,6 +23,13 @@ Per-layer variations (see ModelConfig.attn_spec), used by Gemma 4:
   * v_norm: values are RMS-normalized (no learned gain), like q and k.
   * attn_scale: Gemma 4 uses 1 instead of 1/√hd, since q_norm and k_norm
     already control the size of the scores.
+
+Document masking (training): `same_doc` [B, 1, T, T] is True where query and
+key belong to the same document. It's ANDed with the causal mask, so the
+attention matrix becomes block-diagonal: one causal triangle per document.
+With a mask, SDPA can't use its FlashAttention kernel and falls back to the
+"memory-efficient" one, which takes masks; the speed cost is measured on the
+GPU (round 6), and FlexAttention is the fix if it's large.
 """
 
 from __future__ import annotations
@@ -67,7 +74,8 @@ class Attention(nn.Module):
         self.tap_pattern = Tap()
         self.tap_z = Tap()
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache=None,
+                same_doc: torch.Tensor | None = None) -> torch.Tensor:
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.n_heads, self.hd).transpose(1, 2)  # [B, H, T, hd]
         k = self.k_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)     # [B, K, T, hd]
@@ -86,9 +94,9 @@ class Attention(nn.Module):
         offset = S - T  # how many earlier tokens are in the cache
 
         if self.tap_pattern.active:
-            y = self._explicit(q, k, v, offset)
+            y = self._explicit(q, k, v, offset, same_doc)
         else:
-            y = self._fused(q, k, v, offset)
+            y = self._fused(q, k, v, offset, same_doc)
 
         y = y.transpose(1, 2)            # [B, T, H, hd]
         y = self.tap_z(y)                # per-head outputs (head ablation hooks in here)
@@ -106,16 +114,22 @@ class Attention(nn.Module):
             mask &= qpos - kpos < self.window
         return mask
 
-    def _fused(self, q, k, v, offset):
+    def _fused(self, q, k, v, offset, same_doc=None):
         T, S = q.shape[2], k.shape[2]
         kwargs = {"scale": self.scale}
         if self.n_kv != self.n_heads:
-            if _SDPA_HAS_GQA:
+            # With a document mask, repeat K/V ourselves: the masked (memory-efficient)
+            # kernel may not take enable_gqa, and SDPA would then quietly fall back to
+            # the math kernel, which stores the whole [B, H, T, T] attention matrix.
+            if _SDPA_HAS_GQA and same_doc is None:
                 kwargs["enable_gqa"] = True
             else:
                 k = k.repeat_interleave(self.n_heads // self.n_kv, dim=1)
                 v = v.repeat_interleave(self.n_heads // self.n_kv, dim=1)
         windowed = self.window and S > self.window
+        if same_doc is not None:
+            mask = self._mask(T, S, offset, q.device) & same_doc
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **kwargs)
         if offset == 0 and not windowed:
             return F.scaled_dot_product_attention(q, k, v, is_causal=True, **kwargs)
         if T == 1 and not windowed:
@@ -124,12 +138,15 @@ class Attention(nn.Module):
         mask = self._mask(T, S, offset, q.device)
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, **kwargs)
 
-    def _explicit(self, q, k, v, offset):
+    def _explicit(self, q, k, v, offset, same_doc=None):
         T, S = q.shape[2], k.shape[2]
         rep = self.n_heads // self.n_kv
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
         scores = (q.float() @ k.float().transpose(-2, -1)) * self.scale  # [B, H, T, S]
-        scores = scores.masked_fill(~self._mask(T, S, offset, q.device), float("-inf"))
+        mask = self._mask(T, S, offset, q.device)
+        if same_doc is not None:
+            mask = mask & same_doc
+        scores = scores.masked_fill(~mask, float("-inf"))
         probs = self.tap_pattern(scores.softmax(dim=-1))
         return (probs @ v.float()).to(q.dtype)

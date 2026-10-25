@@ -300,3 +300,42 @@ def test_lean_dequantizers_match_reference(qtype, quant):
     for dt in (torch.float32, torch.bfloat16, torch.float16):
         got = q.dequantize(raw, qtype, x.size, dt)
         assert got.dtype == dt and torch.equal(got, ref.to(dt)), dt
+
+
+def test_q8_activation_rounding_matches_q8_0():
+    """round_like_q8 (llama.cpp's activation rounding) gives the same values as
+    quantizing to Q8_0 and back: both use d = max|x|/127 per block of 32 and
+    store d as fp16."""
+    from sleuth.forge.model.quant import round_like_q8
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 128) * torch.logspace(-2, 1, 128)
+    x[1, :32] = 0.0                                   # an all-zero block stays zero
+    ref = q.dequantize(q.quantize(x, q.Q8_0), q.Q8_0, x.numel(), torch.float32).reshape(x.shape)
+    got = round_like_q8(x)
+    step = x.reshape(3, 4, 32).abs().amax(-1, keepdim=True).expand(3, 4, 32).reshape(3, 128) / 127
+    assert ((got - ref).abs() <= step * 1.001).all()  # at most one rounding step apart (x/d vs x*(1/d))...
+    assert (got == ref).float().mean() > 0.99          # ...and almost always identical
+    assert (got[1, :32] == 0).all()
+    # Rounding error: half a step, plus up to 127 steps times fp16's relative error in d (2^-11).
+    assert ((got - x).abs() <= step * (0.5 + 127 * 2 ** -11) + 1e-7).all()
+
+
+def test_set_q8_activations_rounds_the_input_of_quantized_layers():
+    import torch.nn.functional as F
+
+    from sleuth.forge.model.quant import QuantLinear, round_like_q8, set_q8_activations
+
+    torch.manual_seed(0)
+    w = torch.randn(48, 64)
+    lin = QuantLinear(64, 48, q.Q4_0)
+    lin.raw = q.quantize(w, q.Q4_0)
+    x = torch.randn(2, 5, 64)
+    plain = lin(x)
+    holder = torch.nn.Sequential(lin)
+    assert set_q8_activations(holder) == 1
+    rounded = lin(x)
+    torch.testing.assert_close(rounded, F.linear(round_like_q8(x), lin.weight))
+    assert not torch.equal(rounded, plain)
+    set_q8_activations(holder, False)
+    torch.testing.assert_close(lin(x), plain)

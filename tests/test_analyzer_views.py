@@ -139,3 +139,60 @@ def test_ablating_nothing_changes_nothing(model, tok):
 def test_stories_suite_loads():
     cases = load_suite("suites/stories")
     assert {c.category for c in cases} == {"names", "objects", "dialogue", "narrative"}
+
+
+def _scripted(tok, enc, after: list[int]):
+    """A stub model that predicts each test's true tokens, then `after`
+    (what it would write once the answer is done), then <|eos|>."""
+    V = tok.vocab_size
+
+    def model(ids):
+        seq = ids[0].tolist()
+        for e in enc:
+            full = e.ids[0].tolist()
+            if seq[:len(full)] == full:
+                script = full + after + [tok.eos_id]
+                break
+        logits = torch.full((1, len(seq), V), -30.0)
+        for t in range(len(seq)):
+            logits[0, t, script[min(t + 1, len(script) - 1)]] = 30.0
+        return SimpleNamespace(logits=logits)
+    return model
+
+
+@pytest.mark.parametrize("after, exact", [
+    ("\n", True),                # "0" then a new line: the answer is over
+    (" degrees", True),          # "0 degrees": still the answer 0
+    ("5", False),                # "05"
+    (".|5", False),              # "0.5", as two tokens: needs one more look
+    (".|\n", True),              # "0." at the end of a sentence
+    ("", True),                  # straight to <|eos|>
+])
+def test_exact_match_needs_the_answer_to_end(tok, after, exact):
+    """Round 5: mix-100m's top tokens matched " 0" for "water freezes at", but it
+    was about to write "0.5 degrees Fahrenheit". An answer only counts when the
+    model's own next token doesn't carry on the word or number."""
+    enc = encode_cases(tok, [TestCase("w", "facts", "Q: At what Celsius temperature does water freeze?\nA:", " 0")], 128)
+    cont = [i for part in after.split("|") if part for i in tok.encode(part)]
+    model = _scripted(tok, enc, cont)
+    rows = []
+    s = score_cases(model, enc, tok.vocab_size, "cpu", rows, tokenizer=tok)
+    assert s["facts"]["exact_match"] == float(exact)
+    # It reads only as far as it needs to decide: "0" + " d" is enough.
+    assert rows[0]["after_ids"] == (cont + [tok.eos_id])[:len(rows[0]["after_ids"])]
+    # Without a tokenizer (ablation), matching the answer's tokens is enough.
+    assert score_cases(model, enc, tok.vocab_size, "cpu")["facts"]["exact_match"] == 1.0
+
+
+def test_default_guess_note(tok):
+    from sleuth.cli import _default_guesses
+
+    space, three = tok.encode(" ")[0], tok.encode("3")[0]
+    want = [space, tok.encode("7")[0]]
+    rows = [{"category": "sports", "answer_loss": 1.0, "answer_ids": want, "top1_ids": [space, three],
+             "exact": i == 0} for i in range(4)]
+    rows += [{"category": "sports", "answer_loss": 1.0, "answer_ids": want, "top1_ids": [space, three + 1 + i],
+              "exact": False} for i in range(6)]
+    notes = _default_guesses(rows, tok)   # the shared " " doesn't count as a guess
+    assert len(notes) == 1 and "'3' in 4 of 10" in notes[0] and "1 of them is an exact match" in notes[0]
+    assert _default_guesses(rows[3:], tok) == []   # 1 of 7: not a pattern

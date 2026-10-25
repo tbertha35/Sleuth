@@ -19,6 +19,16 @@ Two ways to run a QuantLinear:
 
 The quantized bytes are buffers, not Parameters: they can't be trained, and
 `num_params()` counts their *logical* weights (see `n_weights`).
+
+llama.cpp's activation rounding (an experiment, off by default): llama.cpp does
+not multiply quantized weights by the activations as they are. On CUDA it first
+rounds the activations to 8 bits too (q8_1: blocks of 32 values sharing one fp16
+scale), then takes integer dot products. On CPU it does the same with q8_0/q8_K.
+So llama.cpp's logits carry a rounding error ours don't. `emulate_q8_activations`
+applies the same rounding to x before each quantized matmul, to test whether
+that rounding explains a difference between the two (round 5: Gemma 4's first
+token after "The capital of France is" is "0" here, "1" in llama.cpp, with a
+0.34-logit margin that survives fp32).
 """
 
 from __future__ import annotations
@@ -48,8 +58,23 @@ def dequantize_rows(raw: torch.Tensor, ggml_type: int, row_len: int, start: int,
     return w.reshape(stop - start, row_len)
 
 
+def round_like_q8(x: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """x after llama.cpp's activation quantization (CUDA's quantize_q8_1):
+    per block of 32 values along the last dimension, d = max|x| / 127,
+    q = round(x / d) (halves away from zero, as C's roundf), and the value
+    used is q · d with d stored as fp16. Returns x's shape and dtype."""
+    shape, dtype = x.shape, x.dtype
+    xb = x.float().reshape(*shape[:-1], shape[-1] // block, block)
+    d = xb.abs().amax(-1, keepdim=True) / 127
+    qv = torch.where(d > 0, xb / d.clamp_min(1e-30), torch.zeros_like(xb))
+    qv = torch.sign(qv) * torch.floor(qv.abs() + 0.5)        # roundf, not round-half-to-even
+    return (qv * d.half().float()).reshape(shape).to(dtype)
+
+
 class QuantLinear(nn.Module):
     """A bias-free Linear layer stored as GGUF blocks: weight [out_features, in_features]."""
+
+    emulate_q8_activations = False  # see the module docstring; set_q8_activations() turns it on
 
     def __init__(self, in_features: int, out_features: int, ggml_type: int, device=None):
         super().__init__()
@@ -73,6 +98,8 @@ class QuantLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from . import triton_kernels  # imported on first use: loading Triton takes a moment
 
+        if self.emulate_q8_activations:
+            x = round_like_q8(x)
         if triton_kernels.usable(x, self.ggml_type):
             return triton_kernels.qmatmul(x, self.raw, self.ggml_type, self.out_features)
         rows = max(1, CHUNK_ELEMENTS // self.in_features)
@@ -124,3 +151,12 @@ class QuantEmbedding(nn.Module):
 
 def quantized_modules(model: nn.Module):
     return [m for m in model.modules() if isinstance(m, (QuantLinear, QuantEmbedding))]
+
+
+def set_q8_activations(model: nn.Module, on: bool = True) -> int:
+    """Round the input of every quantized matmul like llama.cpp does (see the
+    module docstring). Returns how many layers it applies to."""
+    layers = [m for m in quantized_modules(model) if isinstance(m, QuantLinear)]
+    for m in layers:
+        m.emulate_q8_activations = on
+    return len(layers)

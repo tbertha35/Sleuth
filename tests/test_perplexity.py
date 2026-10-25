@@ -76,3 +76,16 @@ def test_score_command(gemma, capsys):
 def test_score_few_shot(gemma, capsys):
     assert main(["score", str(gemma), "--suite", "suites/knowledge", "--few-shot", "--dtype", "fp32"]) == 0
     assert "overall" in capsys.readouterr().out
+
+
+def test_next_with_llama_cpp_activation_rounding(tmp_path, capsys):
+    """--q8-activations rounds the inputs of the kept-quantized layers (the
+    round-5 experiment for Gemma's first-token difference from llama.cpp)."""
+    from sleuth.formats import gguf_quants as q
+
+    path = tmp_path / "tiny-q4.gguf"
+    make_gemma_gguf(path, quant=q.Q4_0)
+    assert main(["next", str(path), "--prompt", "the cat", "--top", "3", "--dtype", "fp32",
+                 "--keep-quantized", "yes", "--q8-activations"]) == 0
+    out = capsys.readouterr().out
+    assert "rounding the inputs of" in out and "entropy" in out
