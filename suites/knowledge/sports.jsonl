@@ -8,3 +8,43 @@
 {"id": "sports-07", "prompt": "Q: In which sport is the Stanley Cup awarded?\nA:", "expected": " Ice hockey"}
 {"id": "sports-08", "prompt": "Q: How many players does a basketball team have on the court?\nA:", "expected": " 5"}
 {"id": "sports-09", "prompt": "Q: In baseball, how many strikes make an out?\nA:", "expected": " 3"}
+{"id": "sports-10", "prompt": "Q: How many players does a volleyball team have on the court?\nA:", "expected": " 6"}
+{"id": "sports-11", "prompt": "Q: How many players does a rugby union team have on the field?\nA:", "expected": " 15"}
+{"id": "sports-12", "prompt": "Q: How many players does a cricket team have?\nA:", "expected": " 11"}
+{"id": "sports-13", "prompt": "Q: How many players does a baseball team have in the field?\nA:", "expected": " 9"}
+{"id": "sports-14", "prompt": "Q: How many miles long is a marathon?\nA:", "expected": " 26.2"}
+{"id": "sports-15", "prompt": "Q: How many rings are on the Olympic flag?\nA:", "expected": " 5"}
+{"id": "sports-16", "prompt": "Q: In tennis, what is a score of zero called?\nA:", "expected": " Love"}
+{"id": "sports-17", "prompt": "Q: How many pins are used in ten-pin bowling?\nA:", "expected": " 10"}
+{"id": "sports-18", "prompt": "Q: In which sport do players hit a home run?\nA:", "expected": " Baseball"}
+{"id": "sports-19", "prompt": "Q: In which sport is the Tour de France?\nA:", "expected": " Cycling"}
+{"id": "sports-20", "prompt": "Q: In which sport do players try for a birdie or an eagle?\nA:", "expected": " Golf"}
+{"id": "sports-21", "prompt": "Q: In which sport do players score a try?\nA:", "expected": " Rugby"}
+{"id": "sports-22", "prompt": "Q: In which sport is the Ryder Cup played?\nA:", "expected": " Golf"}
+{"id": "sports-23", "prompt": "Q: Which sport is played with a puck?\nA:", "expected": " Ice hockey"}
+{"id": "sports-24", "prompt": "Q: Which organization runs the soccer World Cup?\nA:", "expected": " FIFA"}
+{"id": "sports-25", "prompt": "Q: How many years apart are the FIFA World Cups held?\nA:", "expected": " 4"}
+{"id": "sports-26", "prompt": "Q: How many points is a free throw worth in basketball?\nA:", "expected": " 1"}
+{"id": "sports-27", "prompt": "Q: How many points is a field goal worth in American football?\nA:", "expected": " 3"}
+{"id": "sports-28", "prompt": "Q: How many points is a basket from behind the three-point line worth?\nA:", "expected": " 3"}
+{"id": "sports-29", "prompt": "Q: How many quarters are in an American football game?\nA:", "expected": " 4"}
+{"id": "sports-30", "prompt": "Q: How many periods are in an ice hockey game?\nA:", "expected": " 3"}
+{"id": "sports-31", "prompt": "Q: How many innings are in a standard baseball game?\nA:", "expected": " 9"}
+{"id": "sports-32", "prompt": "Q: How many minutes does a regular soccer match last?\nA:", "expected": " 90"}
+{"id": "sports-33", "prompt": "Q: How many minutes long is each half of a soccer match?\nA:", "expected": " 45"}
+{"id": "sports-34", "prompt": "Q: How many players are on each side in doubles tennis?\nA:", "expected": " 2"}
+{"id": "sports-35", "prompt": "Q: What is the highest score you can get with three darts?\nA:", "expected": " 180"}
+{"id": "sports-36", "prompt": "Q: What is the maximum break in snooker?\nA:", "expected": " 147"}
+{"id": "sports-37", "prompt": "Q: In which country did the ancient Olympic Games begin?\nA:", "expected": " Greece"}
+{"id": "sports-38", "prompt": "Q: Which sport's championship game is called the Super Bowl?\nA:", "expected": " American football"}
+{"id": "sports-39", "prompt": "Q: In which sport do players use a bat, a ball and wickets?\nA:", "expected": " Cricket"}
+{"id": "sports-40", "prompt": "Q: In which sport do fighters throw jabs, hooks and uppercuts?\nA:", "expected": " Boxing"}
+{"id": "sports-41", "prompt": "Q: What color card does a soccer referee show to send a player off?\nA:", "expected": " Red"}
+{"id": "sports-42", "prompt": "Q: What color jersey does the leader of the Tour de France wear?\nA:", "expected": " Yellow"}
+{"id": "sports-43", "prompt": "Q: What is a score of one under par on a golf hole called?\nA:", "expected": " A birdie"}
+{"id": "sports-44", "prompt": "Q: How many meters long is an Olympic swimming pool?\nA:", "expected": " 50"}
+{"id": "sports-45", "prompt": "Q: In which sport is the Davis Cup played?\nA:", "expected": " Tennis"}
+{"id": "sports-46", "prompt": "Q: How many feet high is a basketball hoop?\nA:", "expected": " 10"}
+{"id": "sports-47", "prompt": "Q: Which country hosted the 2016 Summer Olympics?\nA:", "expected": " Brazil"}
+{"id": "sports-48", "prompt": "Q: Which city hosted the 2012 Summer Olympics?\nA:", "expected": " London"}
+{"id": "sports-49", "prompt": "Q: How many players does an ice hockey team have on the ice, including the goalie?\nA:", "expected": " 6"}

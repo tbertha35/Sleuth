@@ -68,3 +68,36 @@ def test_stream_text_handles_split_utf8():
     pieces = list(stream_text(tok, iter(ids)))
     assert "".join(pieces) == "héllo 🧠!"
     assert all("�" not in p for p in pieces)
+
+
+def test_ngram_blocker_bans_only_repeats():
+    from sleuth.forge.infer.sampling import NgramBlocker
+
+    b = NgramBlocker(3, [1, 2, 3, 1, 2])
+    assert b.banned() == [3]        # "1 2 3" already happened
+    b.add(4)
+    assert b.banned() == []         # "2 4" never seen before
+    assert NgramBlocker(1, [5, 6]).banned() == [5, 6]   # n=1: no token twice
+    assert NgramBlocker(3, [1]).banned() == []
+
+
+def test_no_repeat_ngram_breaks_greedy_loops():
+    m = tiny_model()
+    loop = generate(m, [1, 2, 3], 30, SamplingConfig(temperature=0))
+    seq = [1, 2, 3] + loop.new_ids
+    grams = [tuple(seq[i:i + 3]) for i in range(len(seq) - 2)]
+    assert len(set(grams)) < len(grams)  # this random model does loop when greedy
+    r = generate(m, [1, 2, 3], 30, SamplingConfig(temperature=0, no_repeat_ngram=3))
+    seq = [1, 2, 3] + r.new_ids
+    grams = [tuple(seq[i:i + 3]) for i in range(len(seq) - 2)]
+    assert len(set(grams)) == len(grams)
+
+
+def test_repetition_penalty_window():
+    logits = torch.tensor([[2.0, 2.0, 2.0, 1.0]])
+    ctx = torch.tensor([[0, 1, 2]])
+    cfg = SamplingConfig(temperature=0, repetition_penalty=4.0, repeat_last_n=1)
+    # Only token 2 (the last one) is penalized, so 0 (first of the ties) wins.
+    assert sample_next(logits, cfg, ctx).item() == 0
+    cfg = SamplingConfig(temperature=0, repetition_penalty=4.0, repeat_last_n=0)
+    assert sample_next(logits, cfg, ctx).item() == 3  # 0, 1 and 2 all drop to 0.5, below token 3's 1.0

@@ -91,8 +91,13 @@ def layer_of(tap_name: str) -> int:
 
 
 @torch.no_grad()
-def score_cases(model, enc: list[EncodedCase], vocab: int, device) -> dict:
-    """Teacher-forced loss/accuracy per category (see module docstring)."""
+def score_cases(model, enc: list[EncodedCase], vocab: int, device, per_case: list | None = None) -> dict:
+    """Teacher-forced loss/accuracy per category (see module docstring).
+
+    per_case: if a list is given, one dict per test is appended to it (id,
+    category, answer loss, exact, and the model's top-1 token IDs over the
+    answer span), so callers can show what the model got wrong and compute
+    error bars."""
     acc: dict[str, dict[str, float]] = {}
     for e in enc:
         ids = e.ids.to(device)
@@ -104,12 +109,45 @@ def score_cases(model, enc: list[EncodedCase], vocab: int, device) -> dict:
         a["loss_sum"] += float(nll[e.scored].sum())
         a["n_tok"] += int(nll[e.scored].numel())
         span = e.answer_positions
+        row = {"id": e.case.id, "category": e.category, "answer_loss": None, "exact": None, "top1_ids": []}
         if span.stop > span.start:
+            top1 = logits[span].argmax(-1)
+            exact = bool((top1 == targets[span]).all())
             a["exp_loss_sum"] += float(nll[span].sum())
             a["n_exp_tok"] += span.stop - span.start
-            a["exact"] += int(bool((logits[span].argmax(-1) == targets[span]).all()))
+            a["exact"] += int(exact)
             a["n_exp_cases"] += 1
+            row.update(answer_loss=float(nll[span].mean()), exact=exact, top1_ids=top1.tolist())
+        if per_case is not None:
+            per_case.append(row)
     return {c: _finish(a) for c, a in acc.items()} | {"overall": _finish(_merge(acc.values()))}
+
+
+def standard_errors(per_case: list[dict]) -> dict[str, dict[str, float]]:
+    """{category (and "overall"): {"answer_loss": SE, "exact_match": SE}}.
+
+    How far a score could move by chance, given how many tests there are.
+    With n tests and an exact-match rate p, the standard error is
+    sqrt(p(1-p)/n): on 40 tests at 7.5% that's ±4.2 points, so two models
+    within ~8 points of each other are indistinguishable. For answer loss we
+    use the spread of the per-test losses (an approximation: the reported loss
+    is averaged over tokens, the SE over tests)."""
+    import math
+
+    groups: dict[str, list[dict]] = {}
+    for r in per_case:
+        if r["answer_loss"] is not None:
+            groups.setdefault(r["category"], []).append(r)
+            groups.setdefault("overall", []).append(r)
+    out = {}
+    for c, rows in groups.items():
+        n = len(rows)
+        losses = [r["answer_loss"] for r in rows]
+        mean = sum(losses) / n
+        var = sum((x - mean) ** 2 for x in losses) / max(1, n - 1)
+        p = sum(r["exact"] for r in rows) / n
+        out[c] = {"answer_loss": math.sqrt(var / n), "exact_match": math.sqrt(p * (1 - p) / n)}
+    return out
 
 
 def _merge(items) -> dict:

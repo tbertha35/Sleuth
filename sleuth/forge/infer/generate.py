@@ -19,7 +19,7 @@ from typing import Callable, Iterator
 import torch
 
 from .kv_cache import KVCache
-from .sampling import SamplingConfig, sample_next
+from .sampling import NgramBlocker, SamplingConfig, sample_next
 
 
 @dataclass
@@ -83,14 +83,17 @@ def generate(model, prompt_ids: list[int], max_new_tokens: int = 200, sampling: 
     t0 = time.perf_counter()
     with autocast:
         logits = model(ctx, cache=cache).logits[:, -1]
+    blocker = NgramBlocker(sampling.no_repeat_ngram, prompt_ids) if sampling.no_repeat_ngram > 0 else None
     new: list[int] = []
     stop_reason = "max_new_tokens"
     t1 = t0
     for i in range(max_new_tokens):
         if vocab_limit is not None:
             logits = logits[..., :vocab_limit]
-        nxt = sample_next(logits, sampling, ctx, gen)
+        nxt = sample_next(logits, sampling, ctx, gen, banned=blocker.banned() if blocker else None)
         tok = int(nxt.item())  # .item() syncs, so timing below is accurate
+        if blocker:
+            blocker.add(tok)
         if i == 0:
             t1 = time.perf_counter()  # prefill ends once the first token exists
         new.append(tok)

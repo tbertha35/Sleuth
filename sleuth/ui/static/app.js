@@ -1,11 +1,15 @@
 // Sleuth dashboard: fetches JSON from the local server and draws it.
 //
-// Layout: training curves, then one tab per analyzer view. Each tab shows
-// (1) any of the view's timeline series across checkpoints and (2) a detail
-// panel for the selected checkpoint, drawn by that view's renderer below.
+// Four pages (the part after # in the address): Runs (this file: training
+// curves, then one tab per analyzer view), Jobs (jobs.js), Playground
+// (playground.js) and Data (data.js). On Runs, each tab shows (1) any of the
+// view's timeline series across checkpoints and (2) a detail panel for the
+// selected checkpoint, drawn by that view's renderer below.
 import { emptyState, fmtNum, heatmap, lineChart, ordinalColors, tokens } from "./charts.js";
-
-const $ = (id) => document.getElementById(id);
+import { $, api, el, fillSelect, labeled, selectEl } from "./common.js";
+import { initData, showData } from "./data.js";
+import { hideJobs, initJobs, showJobs } from "./jobs.js";
+import { initPlayground, showPlayground } from "./playground.js";
 
 const VIEWS = {
   neuron_stats: { title: "Neurons", def: "frac_selective", render: renderNeurons },
@@ -14,49 +18,13 @@ const VIEWS = {
   ablation: { title: "Ablation", def: "mlp_delta_loss", render: renderAblation },
 };
 
-const state = { runs: [], run: null, metrics: null, suite: null, view: null, timeline: null, ckpt: null };
-
-async function api(path) {
-  const r = await fetch(`/api/${path}`);
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-  return j;
-}
+const state = { runs: [], run: null, metrics: null, suite: null, view: null, timeline: null, ckpt: null, liveTimer: null };
+const LIVE_POLL_MS = 5000;
 
 function setStatus(msg, isError = false) {
   const s = $("status");
   s.textContent = msg;
   s.classList.toggle("error", isError);
-}
-
-function fillSelect(sel, options, value) {
-  sel.replaceChildren();
-  for (const [v, label] of options) {
-    const o = document.createElement("option");
-    o.value = v;
-    o.textContent = label;
-    sel.appendChild(o);
-  }
-  if (value !== undefined && options.some(([v]) => String(v) === String(value))) sel.value = value;
-}
-
-/** Small DOM builder: el("div", {class: "x"}, child, "text", ...). Text always via textContent. */
-function el(tag, attrs = {}, ...children) {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "class") e.className = v;
-    else if (k === "text") e.textContent = v;
-    else e.setAttribute(k, v);
-  }
-  for (const c of children) e.append(c);
-  return e;
-}
-
-function selectEl(id, options, value, onChange) {
-  const s = el("select", { id });
-  fillSelect(s, options, value);
-  s.addEventListener("change", onChange);
-  return s;
 }
 
 const stepDir = (s) => `step_${String(s).padStart(7, "0")}`;
@@ -70,15 +38,27 @@ const tok = (s, max = 10) => {
 };
 
 // ------------------------------------------------------------------ loading
+function runLabel(r) {
+  const what = r.external ? "external model" : `step ${r.step}/${r.max_steps}`;
+  return `${r.id}  (${what})${r.live ? "  ● live" : ""}${r.stale ? "  [stale]" : ""}`;
+}
+
 async function loadRuns() {
   state.runs = await api("runs");
-  if (!state.runs.length) {
-    setStatus("No runs yet. Train one with: python -m sleuth train configs/smoke-cpu.toml");
+  // Stale runs (left over from older versions, see `sleuth runs --prune`) are
+  // hidden unless asked for; a run named in the address is always shown.
+  const wanted = new URLSearchParams(location.search).get("run");
+  const shown = state.runs.filter((r) => !r.stale || $("show-stale").checked || r.id === wanted);
+  const nStale = state.runs.filter((r) => r.stale).length;
+  $("show-stale").parentElement.title = `${nStale} stale run(s): left over from older Sleuth versions. ` +
+    "`sleuth runs --prune` lists them, `--prune --yes` deletes them.";
+  $("show-stale").parentElement.hidden = nStale === 0;
+  if (!shown.length) {
+    setStatus("No runs yet. Train one with: python -m sleuth train configs/smoke-cpu.toml (or from the Jobs page)");
     return;
   }
-  const wanted = new URLSearchParams(location.search).get("run");
-  fillSelect($("run-select"), state.runs.map((r) => [r.id, `${r.id}  (step ${r.step}/${r.max_steps})`]),
-    wanted || state.runs[0].id);
+  const keep = [wanted, state.run?.id].find((id) => id && shown.some((r) => r.id === id));
+  fillSelect($("run-select"), shown.map((r) => [r.id, runLabel(r)]), keep || shown[0].id);
   await loadRun($("run-select").value);
 }
 
@@ -90,19 +70,46 @@ async function loadRun(id) {
   $("training-card").hidden = Boolean(run.config.external);
   renderTiles();
   renderLoss();
+  watchLive();
   const suites = [...new Set(run.analyses.map((a) => a.suite))];
   fillSelect($("suite-select"), suites.map((s) => [s, s]), state.suite);
   if (!suites.length) {
     $("tabs").replaceChildren();
     for (const i of ["timeline-chart", "timeline-heat"]) {
-      emptyState($(i), `No analysis yet. Run: python -m sleuth analyze runs/${run.id}`);
+      emptyState($(i), `No analysis yet. Start an “Analyze checkpoints” job, or run: python -m sleuth analyze runs/${run.id}`);
     }
     $("detail").replaceChildren();
+    $("detail").hidden = true;  // an empty card is just a gray box
     setStatus("");
     return;
   }
   await selectSuite($("suite-select").value);
-  setStatus("");
+  const info = state.runs.find((r) => r.id === id);
+  setStatus(info?.stale ? `Stale run: ${info.stale}. \`sleuth runs --prune\` can delete it.` : "", Boolean(info?.stale));
+}
+
+// While a run is training, re-read its metrics every few seconds so the
+// curves and tiles move on their own (they used to need a page reload).
+function watchLive() {
+  clearTimeout(state.liveTimer);
+  const id = state.run?.id;
+  const live = state.runs.find((r) => r.id === id)?.live;
+  $("live-badge").hidden = !live;
+  if (!live || currentPage() !== "runs") return;
+  state.liveTimer = setTimeout(async () => {
+    try {
+      const [runs, metrics] = await Promise.all([api("runs"), api(`runs/${id}/metrics`)]);
+      if (state.run?.id !== id) return;
+      state.runs = runs;
+      state.metrics = metrics;
+      const opt = [...$("run-select").options].find((o) => o.value === id);
+      const r = runs.find((x) => x.id === id);
+      if (opt && r) opt.textContent = runLabel(r);
+      renderTiles();
+      renderLoss();
+    } catch { /* the next poll will try again */ }
+    watchLive();
+  }, LIVE_POLL_MS);
 }
 
 function availableViews() {
@@ -231,6 +238,7 @@ function renderTimeline() {
 function renderDetail() {
   const box = $("detail");
   box.replaceChildren();
+  box.hidden = false;
   if (state.ckpt) VIEWS[state.view].render(box, state.ckpt, $("ckpt-select").value);
 }
 
@@ -249,7 +257,6 @@ function cardHead(title, ...controls) {
   return el("div", { class: "card-head" }, el("h2", { text: title }), el("div", { class: "controls" }, ...controls));
 }
 
-const labeled = (text, control) => el("label", {}, `${text} `, control);
 
 // ------------------------------------------------------------------ view: neurons
 function renderNeurons(box, d, step) {
@@ -453,18 +460,15 @@ function renderAll() {
 }
 
 $("run-select").addEventListener("change", guard(async (e) => {
-  history.replaceState(null, "", `?run=${encodeURIComponent(e.target.value)}`);
+  history.replaceState(null, "", `?run=${encodeURIComponent(e.target.value)}${location.hash}`);
   await loadRun(e.target.value);
 }));
+$("show-stale").addEventListener("change", guard(loadRuns));
 $("suite-select").addEventListener("change", guard((e) => selectSuite(e.target.value)));
 $("ckpt-select").addEventListener("change", guard(loadCheckpoint));
 $("metric-select").addEventListener("change", renderTimeline);
 $("logx").addEventListener("change", renderTimeline);
-$("refresh").addEventListener("click", guard(async () => {
-  const keep = $("run-select").value;
-  await loadRuns();
-  if (keep && state.runs.some((r) => r.id === keep)) { $("run-select").value = keep; await loadRun(keep); }
-}));
+$("refresh").addEventListener("click", guard(loadRuns));
 $("theme").addEventListener("click", () => {
   const dark = getComputedStyle(document.documentElement).getPropertyValue("--surface").trim() === "#1a1a19";
   document.documentElement.dataset.theme = dark ? "light" : "dark";
@@ -479,4 +483,33 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", renderAll)
 let resizeTimer;
 addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderAll, 150); });
 
-guard(loadRuns)();
+// ------------------------------------------------------------------ pages
+const PAGES = ["runs", "jobs", "play", "data"];
+const currentPage = () => (PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "runs");
+
+async function showPage() {
+  const page = currentPage();
+  for (const p of PAGES) $(`page-${p}`).hidden = p !== page;
+  for (const a of document.querySelectorAll("[data-page]")) a.setAttribute("aria-current", String(a.dataset.page === page));
+  $("runs-filters").hidden = page !== "runs";
+  if (page !== "jobs") hideJobs();
+  if (page === "runs") {
+    // Coming back from another page: a run may have started or finished meanwhile.
+    await loadRuns();
+    return;
+  }
+  clearTimeout(state.liveTimer);
+  const runs = await api("runs");
+  state.runs = runs;
+  if (page === "jobs") await showJobs(runs);
+  else if (page === "play") await showPlayground(runs);
+  else await showData();
+}
+
+addEventListener("hashchange", guard(showPage));
+guard(async () => {
+  initPlayground();
+  initData();
+  await initJobs();
+  await showPage();
+})();

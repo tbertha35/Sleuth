@@ -127,7 +127,8 @@ def cmd_generate(a):
         from .forge.tokenizer.bpe import Tokenizer
 
         tok = Tokenizer.load(a.tokenizer)
-    sampling = SamplingConfig(a.temperature, a.top_k, a.top_p, a.min_p, a.repetition_penalty)
+    sampling = SamplingConfig(a.temperature, a.top_k, a.top_p, a.min_p, a.repetition_penalty,
+                              a.repeat_last_n, a.no_repeat_ngram)
     if a.step is not None and meta.get("step") is not None and int(meta["step"]) != a.step:
         print(f"(no snapshot at step {a.step}; using the nearest one, step {meta['step']})", file=sys.stderr)
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
@@ -281,8 +282,8 @@ def cmd_eval(a):
 
 
 def cmd_score(a):
-    """Per-category loss / answer loss / exact match of one model on a suite."""
-    from .analyzer.common import analysis_prefix, encode_cases, score_cases
+    """Per-category answer loss / exact match / loss of one model on a suite."""
+    from .analyzer.common import analysis_prefix, encode_cases, score_cases, standard_errors
     from .analyzer.suites import load_suite
     from .forge.train.trainer import resolve_device
     from .models import load_any
@@ -306,14 +307,35 @@ def cmd_score(a):
         else:
             prefix = None
         enc += encode_cases(tok, cases, model.cfg.max_seq_len, prefix)
-    res = score_cases(model, enc, min(tok.vocab_size, model.cfg.padded_vocab), device)
+    per_case: list[dict] = []
+    res = score_cases(model, enc, min(tok.vocab_size, model.cfg.padded_vocab), device, per_case)
+    se = standard_errors(per_case)
     where = f"step {meta['step']}" if meta.get("step") is not None else meta["format"]
     print(f"{a.path} ({where}, {model.num_params() / 1e6:.1f}M params)")
-    print(f"{'category':12s} {'tokens':>7s} {'loss':>7s} {'answer loss':>12s} {'exact':>7s}")
+    # Answer loss first: at these model sizes it moves long before exact
+    # matches do (mix-20m -> mix-60m: answer loss 3.16 -> 2.79, exact match
+    # unchanged), so it's the number to compare. "±" is one standard error.
+    print(f"{'category':12s} {'tests':>5s} {'answer loss':>16s} {'exact match':>17s} {'loss':>7s} {'tokens':>7s}")
     for c, r in res.items():
-        el = f"{r['expected_loss']:12.3f}" if r["expected_loss"] is not None else f"{'-':>12s}"
-        ex = f"{r['exact_match']:7.1%}" if r["exact_match"] is not None else f"{'-':>7s}"
-        print(f"{c:12s} {r['n_tokens']:7d} {r['loss']:7.3f} {el} {ex}")
+        s = se.get(c)
+        el = f"{r['expected_loss']:8.3f} ± {s['answer_loss']:5.3f}" if r["expected_loss"] is not None else f"{'-':>16s}"
+        ex = (f"{r['exact_match']:7.1%} ± {s['exact_match']:6.1%}" if r["exact_match"] is not None
+              else f"{'-':>17s}")
+        print(f"{c:12s} {r['n_answers']:5d} {el} {ex} {r['loss']:7.3f} {r['n_tokens']:7d}")
+    if a.show_items:
+        print(f"\n{'test':12s} {'answer loss':>11s}  exact  model's top-1 guesses over the answer")
+        for row in per_case:
+            if row["answer_loss"] is None:
+                continue
+            guess = tok.decode(row["top1_ids"])
+            print(f"{row['id']:12s} {row['answer_loss']:11.3f}  {'yes' if row['exact'] else 'no':5s}  {guess!r}")
+    if a.json:
+        for row in per_case:
+            row["top1_text"] = tok.decode(row.pop("top1_ids"))
+        out = {"model": a.path, "where": where, "params": model.num_params(), "suites": a.suite,
+               "few_shot": a.few_shot, "chat": a.chat, "categories": res, "standard_errors": se, "cases": per_case}
+        Path(a.json).write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
+        print(f"wrote {a.json}")
 
 
 def cmd_perplexity(a):
@@ -400,7 +422,54 @@ def cmd_ui(a):
     from .env import runs_root
     from .ui.server import serve
 
-    serve(a.runs or runs_root(), a.host, a.port)
+    serve(a.runs or runs_root(), a.host, a.port, data_dir=data_root())
+
+
+def cmd_runs(a):
+    """List runs; with --prune, delete the stale ones (left over from older versions)."""
+    from .env import runs_root
+    from .runs import prune, scan
+
+    root = Path(a.runs or runs_root())
+    if a.prune:
+        prune(root, yes=a.yes)
+        return
+    rows = scan(root)
+    if not rows:
+        print(f"no runs in {root}")
+        return
+    for r in rows:
+        cfg = r["config"]
+        kind = "external" if cfg.get("external") else f"{(cfg.get('train') or {}).get('max_steps', 0)} steps"
+        print(f"{r['id']:48s} {kind:14s}" + (f"  STALE: {r['stale']}" if r["stale"] else ""))
+    n = sum(1 for r in rows if r["stale"])
+    if n:
+        print(f"\n{n} stale run(s); `sleuth runs --prune` shows what it would delete, `--prune --yes` deletes")
+
+
+def cmd_data(a):
+    """Summarize what's in the data folder."""
+    from .ui.data import describe_data
+
+    d = describe_data(a.data or data_root())
+    if not d["exists"]:
+        print(f"no data folder at {d['root']}")
+        return
+    for sec in d["sections"]:
+        print(f"{sec['name']}/  {sec['title']}")
+        if not sec["entries"]:
+            print("  (empty)" if sec["exists"] else "  (missing)")
+        for e in sec["entries"]:
+            line = f"  {e['name']:40s} {e['bytes'] / 1e6:10.1f} MB {e['files']:7d} files"
+            sh = e.get("shards")
+            if sh and sh.get("train_tokens") is not None:
+                line += f"   {sh['train_tokens'] / 1e6:,.0f}M train / {sh['val_tokens'] / 1e6:,.1f}M val tokens"
+                line += ", vocab " + str(sh["vocab_size"])
+                if len(sh["sources"]) > 1:
+                    line += "\n" + "\n".join(f"      {s['name']:20s} {s['share']:6.1%}" for s in sh["sources"])
+            elif "vocab_size" in e:
+                line += f"   vocab {e['vocab_size']}"
+            print(line)
 
 
 def cmd_probe(a):
@@ -509,7 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--top-k", type=int, default=0)
     s.add_argument("--top-p", type=float, default=1.0)
     s.add_argument("--min-p", type=float, default=0.05)
-    s.add_argument("--repetition-penalty", type=float, default=1.0)
+    s.add_argument("--repetition-penalty", type=float, default=1.0,
+                   help="above 1 makes recently used tokens less likely, e.g. 1.1-1.3 (1 = off)")
+    s.add_argument("--repeat-last-n", type=int, default=64,
+                   help="the repetition penalty looks at this many recent tokens (0 = the whole context)")
+    s.add_argument("--no-repeat-ngram", type=int, default=0, metavar="N",
+                   help="never repeat a phrase of N tokens (3-4 breaks greedy loops in small models; 0 = off). "
+                        "For readable samples only: scoring (`score`, `analyze`) never samples")
     s.add_argument("--seed", type=int, default=None)
     s.add_argument("--samples", type=int, default=1)
     s.add_argument("--device", default="auto")
@@ -579,6 +654,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
     s.add_argument("--few-shot", action="store_true",
                    help="put the suite's _fewshot.txt (worked examples) before every test")
+    s.add_argument("--show-items", action="store_true",
+                   help="also list every test: its answer loss, exact match, and what the model would have said")
+    s.add_argument("--json", default=None, metavar="FILE", help="also write all results (per test too) to this file")
     _add_keep_quantized(s)
     _add_chat_suite_arg(s)
     s.set_defaults(fn=cmd_score)
@@ -607,6 +685,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
     s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("runs", help="list runs, and prune stale ones (--prune)")
+    s.add_argument("--runs", default=None, help="runs directory (default: $SLEUTH_RUNS or ./runs)")
+    s.add_argument("--prune", action="store_true", help="list stale runs that would be deleted")
+    s.add_argument("--yes", action="store_true", help="with --prune: really delete them")
+    s.set_defaults(fn=cmd_runs)
+
+    s = sub.add_parser("data", help="what's in the data folder: sources, sizes, token counts")
+    s.add_argument("--data", default=None, help="data folder (default: $SLEUTH_DATA or ./data)")
+    s.set_defaults(fn=cmd_data)
 
     s = sub.add_parser("probe", help="run scripts/probe_hardware.py (pass its options after --)")
     s.add_argument("args", nargs=argparse.REMAINDER)
