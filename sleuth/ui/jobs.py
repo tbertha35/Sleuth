@@ -540,6 +540,10 @@ class JobManager:
                 job.note = "STOP file created: stopping after the current step (with a checkpoint)"
             else:
                 _interrupt(proc)
+                # Windows drops a Ctrl-Break that arrives while the process is still
+                # starting up (seen with the venv launcher), so repeat it a few times.
+                threading.Thread(target=_interrupt_until_exit, args=(proc,), daemon=True,
+                                 name=f"stop-{job.id}").start()
                 job.note = "asked to stop"
             self._save(job)
             return job
@@ -590,8 +594,14 @@ class JobManager:
                 fh.seek(start)
                 data = fh.read(max_bytes)
             if offset < 0 and start > 0:
-                cut = data.find(b"\n") + 1  # start at a line boundary
-                start, data = start + cut, data[cut:]
+                # Start at a line boundary, unless the window already begins one
+                # (on Windows "finished\r\n" can be exactly the bytes asked for).
+                with open(path, "rb") as fh:
+                    fh.seek(start - 1)
+                    at_line_start = fh.read(1) == b"\n"
+                if not at_line_start:
+                    cut = data.find(b"\n") + 1
+                    start, data = start + cut, data[cut:]
             if not (finished and start + len(data) >= size):
                 # Send whole lines only: a line may still be being written,
                 # and a cut could split a multi-byte character.
@@ -639,3 +649,14 @@ def _interrupt(proc: subprocess.Popen) -> None:
             proc.terminate()
     except OSError:
         pass
+
+
+def _interrupt_until_exit(proc: subprocess.Popen, tries: int = 5, every: float = 1.0) -> None:
+    """Re-send the interrupt while the process is still alive (a second click on
+    Stop still kills it outright)."""
+    for _ in range(tries):
+        try:
+            proc.wait(timeout=every)
+            return
+        except subprocess.TimeoutExpired:
+            _interrupt(proc)

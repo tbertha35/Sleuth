@@ -29,7 +29,16 @@ export function initPlayground() {
     box.append(labeled(label, el("input", { type: "number", id: `ps-${id}`, value: def, step, min: 0 }), help));
   }
   for (const slot of [0, 1]) {
-    $(`pm-model-${slot}`).addEventListener("change", guarded(setStatus, () => loadSteps(slot)));
+    $(`pm-model-${slot}`).addEventListener("change", guarded(setStatus, () => { syncPick(slot); return loadSteps(slot); }));
+    // The text box's suggestion list only shows runs matching what's already
+    // typed, so a filled-in box hides every other run. This dropdown always
+    // lists them all; picking one fills the box.
+    $(`pm-pick-${slot}`).addEventListener("change", guarded(setStatus, () => {
+      const v = $(`pm-pick-${slot}`).value;
+      if (!v) return;
+      $(`pm-model-${slot}`).value = v;
+      return loadSteps(slot);
+    }));
   }
   $("play-compare").addEventListener("change", () => {
     for (const n of document.querySelectorAll(".slot-1")) n.hidden = !$("play-compare").checked;
@@ -62,10 +71,12 @@ export async function showPlayground(runs) {
   for (const slot of [0, 1]) {
     const input = $(`pm-model-${slot}`);
     $(`pm-list`).replaceChildren(...st.runs.map((r) => el("option", { value: r.id })));
+    fillSelect($(`pm-pick-${slot}`), [["", "(typed path)"], ...st.runs.map((r) => [r.id, r.id])]);
     if (!input.value && st.runs.length) {
       input.value = (st.runs.find((r) => !r.external) || st.runs[0]).id;
       await loadSteps(slot);
     }
+    syncPick(slot);
   }
   renderLoaded(await api("playground"));
   if (!hasToken()) setStatus("Read-only: open the link that `sleuth ui` printed (it ends in ?token=…) to use the Playground.", true);
@@ -79,6 +90,12 @@ function setMode(mode) {
   $("play-go").textContent = mode === "chat" ? "Send" : "Generate";
   $("play-append").hidden = mode !== "text";
   renderOutputs();
+}
+
+// Keep the run dropdown in step with the text box ("(typed path)" for anything else).
+function syncPick(slot) {
+  const v = $(`pm-model-${slot}`).value.trim();
+  $(`pm-pick-${slot}`).value = st.runs.some((r) => r.id === v) ? v : "";
 }
 
 async function loadSteps(slot) {

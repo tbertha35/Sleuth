@@ -34,7 +34,7 @@ def env(tiny_data, tmp_path_factory):
         (runs / name / "config.json").write_text(json.dumps({**cfg, "model": {}, "train": {"max_steps": 0}}))
     data = root / "data"
     (data / "raw" / "tiny").mkdir(parents=True)
-    (data / "raw" / "tiny" / "a.txt").write_text("hello world\n")
+    (data / "raw" / "tiny" / "a.txt").write_bytes(b"hello world\n")  # write_text would add \r on Windows
     (data / "shards").mkdir()
     import shutil
     shutil.copytree(tiny_data["shards"], data / "shards" / "tiny")
