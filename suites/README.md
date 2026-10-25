@@ -25,16 +25,23 @@ Some answers are one plausible continuation among several (e.g. "Yes, you" →
 " can"), so exact-match scores are noisy. Compare *changes* (across checkpoints,
 or with/without an ablation) rather than absolute values.
 
-`knowledge/` asks short questions with one clear answer, for comparing models of
-different sizes trained on general data (the `mix-*` configs):
+`knowledge/` asks short questions with one clear answer (220 of them: 70 facts, 50 each of
+sports, math and python), for comparing models of different sizes trained on general data
+(the `mix-*` configs):
 - `facts`: capitals, planets, science basics
 - `sports`: rules and numbers that don't change from year to year
 - `math`: arithmetic and one-step word problems
 - `python`: complete a line of Python, or say what it prints
 
 A base model (no chat tuning) only *continues* text, so the questions use a
-"Q: ... A:" format it will have seen in web text. Watch "expected loss" fall as
+"Q: ... A:" format it will have seen in web text. Watch "answer loss" fall as
 models grow: it moves long before exact matches start appearing.
+
+The first 10 items of each file are the original 40-item suite (same IDs), so scores
+on `facts-00`…`facts-09` etc. stay comparable with older runs; whole-suite numbers from
+before 2026-10-25 aren't comparable with the 220-item suite. With 220 items one answer moves
+exact match by 0.45 points, and `score` prints a standard error for each number.
+`tests/test_suites.py` runs every Python "# prints" item to check its expected output.
 
 `knowledge/_fewshot.txt` holds a few worked "Q: ... A: ..." examples (none of them
 from the tests). `sleuth score --suite suites/knowledge --few-shot` puts them before

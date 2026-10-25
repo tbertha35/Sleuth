@@ -138,3 +138,105 @@ th:first-child, td:first-child { text-align: left; }
 .chart.square { height: 420px; }
 
 [hidden] { display: none !important; }
+
+/* ------------------------------------------------------------ pages */
+.pages { display: flex; gap: 4px; }
+.pages a {
+  color: var(--ink-2); text-decoration: none; padding: 4px 10px; border-radius: 6px; font-weight: 500;
+}
+.pages a:hover { background: var(--page); }
+.pages a[aria-current="true"] { color: var(--ink); background: var(--page); box-shadow: inset 0 -2px 0 var(--accent); }
+#theme { margin-left: auto; }
+.stack { display: grid; gap: 16px; }
+code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+a { color: var(--accent); }
+.check { gap: 4px; }
+
+/* ------------------------------------------------------------ forms */
+input[type="text"], input[type="number"], textarea {
+  font: inherit; color: var(--ink); background: var(--page);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; min-width: 0;
+}
+input[type="number"] { width: 7em; }
+textarea { width: 100%; resize: vertical; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+input:focus, textarea:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+button.danger { color: var(--critical); }
+button:disabled { opacity: .5; cursor: default; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px 16px; margin: 8px 0; }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field input[type="text"], .field select { width: 100%; max-width: none; }
+.flabel { color: var(--ink-2); font-size: 13px; }
+.fhelp { color: var(--muted); font-size: 12px; }
+.checks { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
+label.wide { display: flex; margin: 4px 0 8px; }
+label.wide input { flex: 1; }
+
+/* ------------------------------------------------------------ jobs */
+table.jobs { width: 100%; min-width: 720px; }  /* narrow screens scroll the table instead of squashing it */
+table.jobs td { vertical-align: top; text-align: left; white-space: normal; }
+table.jobs th { text-align: left; }
+table.jobs tr.selected td { background: var(--page); }
+.jobcell code { display: block; color: var(--ink-2); word-break: break-all; max-width: 520px; }
+.jobcell .note { color: var(--muted); font-size: 12px; }
+.row-actions { display: flex; gap: 4px; }
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  border: 1px solid var(--border); color: var(--ink-2);
+}
+.badge.running, .badge.stopping { color: var(--accent); border-color: var(--accent); }
+.badge.done { color: var(--series-3); border-color: var(--series-3); }
+.badge.failed, .badge.orphaned { color: var(--critical); border-color: var(--critical); }
+.badge.queued, .badge.cancelled, .badge.stopped { color: var(--muted); }
+pre.log {
+  margin: 8px 0 0; max-height: 480px; overflow: auto; background: var(--page); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+/* ------------------------------------------------------------ playground */
+.slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px 24px; }
+.slot input[type="text"] { width: 18em; max-width: 60vw; }
+.pill {
+  display: inline-block; padding: 1px 8px; margin-right: 6px; border-radius: 999px; background: var(--page);
+  border: 1px solid var(--border); color: var(--ink-2); font-size: 12px;
+}
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.segmented button { border: none; border-radius: 0; background: none; color: var(--ink-2); }
+.segmented button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.settings { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; }
+.outputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-top: 12px; }
+pre.out {
+  margin: 0; min-height: 140px; max-height: 520px; overflow: auto; background: var(--page);
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word;
+}
+pre.out .prompt-echo { color: var(--muted); }
+pre.out.chat { font-family: inherit; display: flex; flex-direction: column; gap: 8px; }
+.bubble { padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); }
+.bubble.user { align-self: flex-end; max-width: 85%; }
+.bubble.assistant { align-self: flex-start; max-width: 95%; }
+.bubble .role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.stats { min-height: 1.2em; }
+table.next tr.clickable { cursor: pointer; }
+table.next tr.clickable:hover td { background: var(--page); }
+table.next td, table.next th { text-align: left; }
+.probcell { display: flex; align-items: center; gap: 6px; }
+.barwrap { display: inline-block; width: 120px; height: 8px; background: var(--grid); border-radius: 2px; overflow: hidden; }
+.bar { display: block; height: 100%; background: var(--accent); }
+
+/* ------------------------------------------------------------ data */
+.mix { min-width: 220px; }
+.mixbar { display: flex; height: 8px; border-radius: 2px; overflow: hidden; background: var(--grid); }
+.mixbar .seg { display: block; height: 100%; }
+.mixlabels { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 11px; color: var(--ink-2); margin-top: 3px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
+.s0 { background: #2a78d6; } .s1 { background: #eb6834; } .s2 { background: #1baf7a; }
+.s3 { background: #9b6bd6; } .s4 { background: #d6a52a; } .s5 { background: #898781; }
+
+@media (max-width: 640px) {
+  .topbar { gap: 8px 12px; }
+  .slot input[type="text"] { width: 100%; }
+  .barwrap { width: 60px; }
+}

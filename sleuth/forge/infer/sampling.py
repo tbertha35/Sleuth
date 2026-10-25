@@ -1,7 +1,11 @@
 """Turning logits into the next token.
 
 Applied in this order (the usual order in llama.cpp / vLLM):
-  1. repetition penalty: make tokens already in the context less likely
+  0. no-repeat n-gram: forbid any token that would repeat an n-token phrase
+     already in the text (Hugging Face's no_repeat_ngram_size). A hard ban,
+     so it also works with greedy decoding.
+  1. repetition penalty: make tokens seen in the last `repeat_last_n`
+     tokens less likely (llama.cpp's repeat_penalty / repeat_last_n)
   2. temperature: divide logits by T. T < 1 sharpens (safer, more
      repetitive), T > 1 flattens (more varied, more mistakes). T = 0 means
      greedy: always pick the most likely token.
@@ -25,6 +29,39 @@ class SamplingConfig:
     top_p: float = 1.0              # 1.0 = off
     min_p: float = 0.0              # 0.0 = off
     repetition_penalty: float = 1.0  # 1.0 = off; >1 discourages repeats
+    repeat_last_n: int = 64         # the penalty looks at this many recent tokens; 0 = the whole context
+    no_repeat_ngram: int = 0        # 0 = off; n = never repeat an n-token phrase
+
+
+class NgramBlocker:
+    """Remembers every n-gram in the text so far, to ban the tokens that would
+    repeat one. Small models decoded greedily fall into loops ("The capital of
+    France is the capital of France is ..."): the most likely continuation of
+    a phrase is the phrase again. Banning repeats of n tokens breaks the loop
+    while leaving short, legitimate repeats ("of the") alone when n is 3-4.
+
+    Incremental (a dict from the last n-1 tokens to the tokens that followed
+    them), so each step costs O(1) instead of rescanning the whole context.
+    The prompt counts too, as in Hugging Face's no_repeat_ngram_size."""
+
+    def __init__(self, n: int, ids: list[int] = ()):
+        self.n = n
+        self.ids: list[int] = []
+        self.followers: dict[tuple[int, ...], set[int]] = {}
+        for t in ids:
+            self.add(t)
+
+    def add(self, token: int) -> None:
+        self.ids.append(token)
+        if self.n > 0 and len(self.ids) >= self.n:
+            self.followers.setdefault(tuple(self.ids[len(self.ids) - self.n:-1]), set()).add(token)
+
+    def banned(self) -> list[int]:
+        """Tokens that would complete an n-gram already seen."""
+        if self.n <= 0 or len(self.ids) < self.n - 1:
+            return []
+        key = tuple(self.ids[len(self.ids) - (self.n - 1):]) if self.n > 1 else ()
+        return sorted(self.followers.get(key, ()))
 
 
 def apply_repetition_penalty(logits: torch.Tensor, context: torch.Tensor, penalty: float) -> torch.Tensor:
@@ -60,10 +97,18 @@ def filter_logits(logits: torch.Tensor, cfg: SamplingConfig) -> torch.Tensor:
 
 
 def sample_next(logits: torch.Tensor, cfg: SamplingConfig, context: torch.Tensor | None = None,
-                generator: torch.Generator | None = None) -> torch.Tensor:
-    """logits: [B, V] float. context: [B, S] token IDs so far. Returns [B] token IDs."""
+                generator: torch.Generator | None = None, banned: list[int] | None = None) -> torch.Tensor:
+    """logits: [B, V] float. context: [B, S] token IDs so far. banned: token IDs
+    that must not be chosen (from NgramBlocker; batch size 1). Returns [B] token IDs."""
     logits = logits.float()
+    if banned:
+        ban = torch.tensor([b for b in banned if b < logits.size(-1)], dtype=torch.long, device=logits.device)
+        masked = logits.index_fill(-1, ban, torch.finfo(logits.dtype).min)
+        # If every token is banned (only possible with a tiny vocab), ignore the ban.
+        logits = masked if bool((masked > torch.finfo(logits.dtype).min).any()) else logits
     if context is not None:
+        if cfg.repeat_last_n > 0:
+            context = context[..., -cfg.repeat_last_n:]
         logits = apply_repetition_penalty(logits, context, cfg.repetition_penalty)
     if cfg.temperature <= 0:
         return logits.argmax(-1)

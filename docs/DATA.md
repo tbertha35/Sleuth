@@ -110,12 +110,32 @@ never repeats data. For comparison, SmolLM2's mature recipe was roughly 60% web,
 Deliberately *not* in training: GSM8K and similar benchmark sets. They stay clean for
 evaluation (training on a test set makes its score meaningless).
 
-## Stage 3: chat data (later, for SFT)
+## Stage 3: fine-tuning and memory (downloaded 2026-10-25, approved)
 
-We'll look at permissively licensed conversation datasets when we get to SFT, or
-generate synthetic conversations from a larger local model you already have. That
-second option makes the same "model-generated text" trade-off as TinyStories, but with
-local, open-weight models whose licences usually allow it. Check each model's licence.
+For chat SFT (PLAN §4.6, milestone M11a) and the memory experiments (M11b). Stored in
+**`data/finetune/<name>/`**, apart from the pretraining text in `data/raw/`, so `sleuth shard`
+can't pick them up by accident. Git ignores both.
+
+| Folder | Source (Hugging Face) | Licence | Contents |
+|---|---|---|---|
+| `memgpt-traces/` | MemGPT/function-call-traces | Apache-2.0 | 1,394 multi-session chat and document-QA agent traces with real `core_memory_*`, `archival_memory_*` and `conversation_search` calls, plus "no functions" variants |
+| `hermes-fc-v1/` | NousResearch/hermes-function-calling-v1 | Apache-2.0 | 11,578 examples: single- and multi-turn function calling, Glaive 5k, JSON mode (`conversations`, `tools`) |
+| `when2call/` | nvidia/When2Call | **CC BY 4.0** (attribution required) | 15,000 SFT + 9,000 preference training examples (`tools`, `messages`); 3,652 multiple-choice + 300 LLM-judge test items |
+| `longmemeval/` | xiaowu0162/longmemeval | MIT | 500 questions, as `oracle` (15 MB), `s` (278 MB) and `m` (2.7 GB; can be deleted to save space) |
+
+Obligations and caveats:
+- **When2Call (CC BY 4.0)**: anything we publish that uses it (a model, a report, derived
+  data) must credit NVIDIA's When2Call dataset and link the licence.
+- **LongMemEval (MIT)**: keep its copyright and licence notice if we ever redistribute it.
+- **Model-generated text**: Hermes (including the Glaive examples) and When2Call were written
+  largely by other models, like Cosmopedia in Stage 2a. Their style and mistakes come with them,
+  and each upstream model's terms may apply to what was generated: fine for local research,
+  but check them before publishing a model trained on this data.
+- When2Call's test splits stay out of training: they are our SFT evaluation.
+
+Considered and not added: Salesforce xLAM-60k (needs accepting terms and logging in),
+APIGen-MT-5k (non-commercial licence), BEAM (share-alike), Glaive v2, ToolACE and
+Toucan-1.5M (fine, but larger; can be added later if SFT needs more data).
 
 ---
 
@@ -133,4 +153,8 @@ local, open-weight models whose licences usually allow it. Check each model's li
 - Python-Edu with file contents: https://huggingface.co/datasets/Avelina/python-edu-cleaned
 - FineMath (ODC-By) and the SmolLM2 paper: https://huggingface.co/datasets/HuggingFaceTB/finemath, https://arxiv.org/abs/2502.02737
 - Wikipedia on Hugging Face (CC BY-SA 3.0 + GFDL): https://huggingface.co/datasets/wikimedia/wikipedia
+- MemGPT function-call traces: https://huggingface.co/datasets/MemGPT/function-call-traces
+- Hermes function calling v1: https://huggingface.co/datasets/NousResearch/hermes-function-calling-v1
+- When2Call (CC BY 4.0): https://huggingface.co/datasets/nvidia/When2Call
+- LongMemEval (MIT): https://huggingface.co/datasets/xiaowu0162/longmemeval
 - OnlySports dataset and paper: https://huggingface.co/datasets/Chrisneverdie/OnlySports_Dataset, https://arxiv.org/abs/2409.00286, licence: https://github.com/chrischenhub/OnlySportsLM

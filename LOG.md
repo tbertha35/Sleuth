@@ -493,3 +493,85 @@ downloaded into the repo), which is the reference for how GGUF files run.
   copy of its tokenizer); `tokenizer` prints bytes/token; compile is skipped with a warning if
   Triton is missing; `score --few-shot` (worked examples first, so a base model knows to answer
   briefly).
+
+**2026-10-25: After the round-4 review: a bigger knowledge suite, loop-free samples, stale runs, and a dashboard that runs jobs (D1).**
+The owner's round-4 review (all 181 CPU + 6 GPU tests passing on Windows) suggested an order:
+first the knowledge suite and repetition controls, then dashboard Jobs + Playground. Both are
+done here, plus bug 2. PLAN §8.1 now holds the roadmap.
+- *`suites/knowledge`: 40 → 220 items* (70 facts, 50 sports, 50 math, 50 python). The first 10 of
+  each file are the old items with the same IDs. With 40 items one answer moved exact match by
+  2.5 points and every model got the same 3 Python items right. `score` now prints **answer loss
+  first** (it's the signal at these sizes: 3.16 → 2.79 from mix-20m to mix-60m while exact match
+  sat still) with **± one standard error** per category, and `--show-items` / `--json` show
+  each item and the model's top guess. A test runs every Python "# prints" item and checks the
+  expected output, so a wrong answer key can't quietly make every model look worse. Old
+  whole-suite numbers aren't comparable with the new suite; re-score the ladder once.
+  Note: exact match at 0% shows "± 0.0%" (the formula's SE is 0 when p = 0). With 220 items the
+  honest reading is "under ~1.4%".
+- *Sampling:* `--repetition-penalty` already existed, but looked at the whole context. Now it
+  looks at the last `--repeat-last-n` tokens (64, as in llama.cpp), and `--no-repeat-ngram N` bans
+  any token that would repeat an N-token phrase (Hugging Face's no_repeat_ngram_size; incremental,
+  O(1) per step). It's a hard ban, so it also works greedily: the tiny test model's greedy loop
+  disappears with N = 3. Scoring never samples, so none of this touches `score`/`analyze`.
+- *Bug 2, stale `runs/ext-hf`:* a run is stale when it's an external-model folder whose name
+  doesn't end in its model path's hash and whose config lacks `keep_quantized` (added in the same
+  round as the hash; a hand-picked `--name` from a current Sleuth has it). If another run holds
+  the same model, it says which. The dashboard hides stale runs (a "stale" checkbox shows them);
+  `sleuth runs` lists them, `sleuth runs --prune` shows what it would delete, `--prune --yes`
+  deletes. Nothing is deleted automatically.
+- *Dashboard Jobs (D1).* Decisions:
+  - **Allow-list, not a command box.** Each command (train, resume, eval, score, analyze,
+    generate, next, tokenizer, shard) has typed fields; the server validates every value and
+    builds the argument list itself (`subprocess.Popen([python, -m, sleuth, ...])`, no shell).
+    Options are passed as `--flag=value`, so a prompt starting with "-" can't turn into an option;
+    positional values starting with "-" are refused. The page builds its forms from the same
+    list (`/api/jobs/specs`).
+  - **Two lanes, one GPU.** GPU jobs run one at a time, the rest queue; tokenizer/shard (and
+    anything with device=cpu) use a CPU lane alongside. The Playground takes the GPU lane while
+    it has a model on the GPU, so a training run and Gemma's 7.7 GB can't collide.
+  - **Stopping training uses the STOP file**, but only once the trainer has printed "to stop
+    cleanly…": it deletes any old STOP file when it starts, so earlier we send SIGTERM / Ctrl-Break.
+    Why not always a signal: it can land in the middle of `optimizer.step()`, and the checkpoint
+    saved then would hold half-updated weights. The STOP file is checked between steps. Second
+    click = kill.
+  - **Jobs outlive the dashboard**: each child gets its own session/process group. Surprise worth
+    noting: on Linux, Ctrl-C in the terminal goes to the whole foreground process group, so without
+    this, closing the dashboard would have interrupted every training job it started. After a
+    restart, running jobs show as "orphaned" (the log keeps growing and is still shown).
+  - **Logs** go to `runs/_jobs/<id>.log` and stream to the page with Server-Sent Events (plain
+    HTTP; whole lines only, so a multi-byte character is never cut; resumes from the last offset
+    on reconnect). Job history is one JSON file per job in the same folder.
+  - **Security, now that the page can start processes:** a random per-session token (printed in
+    `sleuth ui`'s link, kept by the page, sent as `X-Sleuth-Token`) on every POST; POSTs from
+    another Origin are refused; and every request must name the server as 127.0.0.1/localhost in
+    its Host header. The last one is DNS-rebinding protection: an attacker's domain can resolve
+    to 127.0.0.1, which would let their page *read* our API as same-origin; their requests still
+    carry their own host name.
+- *Live curves:* a run counts as live if a job is working on it or its metrics.jsonl changed in
+  the last 2 minutes; the Runs page then re-reads metrics every 5 s.
+- *Playground:* models load inside the dashboard process on first use and stay loaded (at most
+  two, least recently used dropped first; **Unload** frees them and the GPU). Generation streams
+  over SSE from a POST (`fetch` + a stream reader, since EventSource can't POST); the Stop button
+  aborts the request, the server's next write fails, and generation stops. Next-token panel (top
+  10 with probabilities and entropy; click one to extend the prompt), side-by-side compare (two
+  models or two snapshots; run one after the other on the shared GPU), chat mode with a
+  per-model conversation for chat-format models (our base models refuse it with a clear message).
+- *Data page / `sleuth data`:* sizes of `data/raw`, `data/finetune`, `data/shards`,
+  `data/tokenizers`, with token counts and source mix from each shard folder's meta.json.
+- *docs/DATA.md Stage 3:* the four fine-tuning/memory datasets the owner downloaded (MemGPT traces,
+  Hermes FC v1, When2Call, LongMemEval) with licences: When2Call is CC BY 4.0 (credit it in
+  anything published), LongMemEval MIT, the others Apache-2.0; Hermes/Glaive and When2Call are
+  largely model-generated.
+- *A plan correction:* the review's SFT step 1 ("add role tokens to the 32k tokenizer") is mostly
+  done already. `<|system|>`, `<|user|>`, `<|assistant|>` and `<|end|>` have been reserved since M1,
+  plus 9 spare slots for a tool role. No tokenizer retraining is needed.
+- Tests: 181 → 227 CPU tests. New: the job runner with a fake `sleuth` (allow-list rejections,
+  queueing, STOP-file and signal stops, history after a restart), the real trainer started,
+  stopped with a checkpoint and resumed as jobs, the HTTP layer (token, Origin, Host, SSE logs,
+  Playground generate/next/errors/GPU-busy), stale runs, the suite checks. The pages were also
+  driven in headless Chromium (Playwright, outside the test suite): every page works at desktop
+  and phone width, in light and dark, with no console errors.
+- **Not yet tested on the owner's machines:** Ctrl-Break stopping on Windows (`CREATE_NEW_PROCESS_GROUP`),
+  the Playground on the GPU (peak memory, GPU lane), loading Gemma 4 in the Playground, and the
+  page in Edge/Chrome on Windows. Round 5 should start a short training job from the Jobs page,
+  stop it, and resume it.

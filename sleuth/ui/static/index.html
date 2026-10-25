@@ -9,24 +9,32 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">Sleuth <span class="muted">brain viewer</span></div>
-    <div class="filters" role="toolbar" aria-label="Filters">
+    <div class="brand">Sleuth <span class="muted">lab dashboard</span></div>
+    <nav class="pages" aria-label="Pages">
+      <a href="#runs" data-page="runs">Runs</a>
+      <a href="#jobs" data-page="jobs">Jobs</a>
+      <a href="#play" data-page="play">Playground</a>
+      <a href="#data" data-page="data">Data</a>
+    </nav>
+    <div class="filters" role="toolbar" aria-label="Filters" id="runs-filters">
       <label>Run <select id="run-select"></select></label>
+      <label class="check" title="Runs left over from older Sleuth versions (see `sleuth runs --prune`)"><input type="checkbox" id="show-stale"> stale</label>
       <label>Suite <select id="suite-select"></select></label>
       <label>Checkpoint <select id="ckpt-select"></select></label>
       <button id="refresh" type="button" title="Reload data">Refresh</button>
-      <button id="theme" type="button" title="Toggle light/dark">Theme</button>
     </div>
+    <button id="theme" type="button" title="Toggle light/dark">Theme</button>
   </header>
 
-  <main>
+  <!-- ============================================================ Runs -->
+  <main id="page-runs" data-page-body="runs">
     <p id="status" class="status" role="status"></p>
 
     <section class="tiles" id="tiles" aria-label="Run summary"></section>
 
     <section class="card" id="training-card">
       <div class="card-head">
-        <h2>Training</h2>
+        <h2>Training <span id="live-badge" class="badge running" hidden title="Training right now: the curves refresh every few seconds">live</span></h2>
         <p class="hint">Loss in nats per token. Validation is measured on held-out text; a gap that grows means overfitting.</p>
       </div>
       <div class="chart" id="loss-chart"></div>
@@ -51,6 +59,126 @@
 
     <section class="card" id="detail"></section>
   </main>
+
+  <!-- ============================================================ Jobs -->
+  <main id="page-jobs" data-page-body="jobs" hidden>
+    <p id="jobs-status" class="status" role="status"></p>
+    <section class="card">
+      <div class="card-head">
+        <h2>New job</h2>
+        <label>Command <select id="job-command"></select></label>
+      </div>
+      <p class="hint" id="job-help"></p>
+      <form id="job-form">
+        <div class="form-grid" id="job-fields"></div>
+        <div class="actions"><button type="submit" class="primary">Start</button>
+          <span class="hint">One GPU job runs at a time; later ones wait in the queue. Jobs keep running if you close the dashboard.</span></div>
+      </form>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Jobs</h2></div>
+      <div class="table-wrap">
+        <table class="jobs">
+          <thead><tr><th>status</th><th>job</th><th>lane</th><th>started</th><th>time</th><th>exit</th><th>run</th><th></th></tr></thead>
+          <tbody id="jobs-body"></tbody>
+        </table>
+      </div>
+      <p class="hint" id="jobs-empty">No jobs yet.</p>
+    </section>
+    <section class="card" id="log-card" hidden>
+      <div class="card-head"><h2 id="log-title">Log</h2></div>
+      <pre id="job-log" class="log"></pre>
+    </section>
+  </main>
+
+  <!-- ============================================================ Playground -->
+  <main id="page-play" data-page-body="play" hidden>
+    <p id="play-status" class="status" role="status"></p>
+    <section class="card">
+      <div class="card-head">
+        <h2>Models</h2>
+        <div class="controls">
+          <label class="check"><input type="checkbox" id="play-compare"> compare with a second model</label>
+          <button type="button" id="play-unload" title="Free the models' memory (and the GPU, for jobs)">Unload</button>
+        </div>
+      </div>
+      <datalist id="pm-list"></datalist>
+      <div class="slots">
+        <div class="slot">
+          <h3>A</h3>
+          <div class="controls">
+            <label>Model <input type="text" id="pm-model-0" list="pm-list" placeholder="a run, or a .gguf / model folder path"></label>
+            <label>Snapshot <select id="pm-step-0"></select></label>
+            <label>Device <select id="pm-device-0"><option>auto</option><option>cuda</option><option>cpu</option></select></label>
+            <label>Weights <select id="pm-dtype-0"><option>auto</option><option>bf16</option><option>fp32</option><option>fp16</option></select></label>
+          </div>
+        </div>
+        <div class="slot slot-1" hidden>
+          <h3>B</h3>
+          <div class="controls">
+            <label>Model <input type="text" id="pm-model-1" list="pm-list" placeholder="a run, or a .gguf / model folder path"></label>
+            <label>Snapshot <select id="pm-step-1"></select></label>
+            <label>Device <select id="pm-device-1"><option>auto</option><option>cuda</option><option>cpu</option></select></label>
+            <label>Weights <select id="pm-dtype-1"><option>auto</option><option>bf16</option><option>fp32</option><option>fp16</option></select></label>
+          </div>
+        </div>
+      </div>
+      <p class="hint">Loaded: <span id="play-loaded"></span> <span id="play-gpu"></span></p>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div class="segmented" role="group" aria-label="Mode">
+          <button type="button" data-mode="text" aria-pressed="true">Text</button>
+          <button type="button" data-mode="chat" aria-pressed="false" title="Chat models only (Gemma 4, Qwen): uses their chat format">Chat</button>
+        </div>
+        <div class="controls">
+          <button type="button" id="play-go" class="primary" title="Ctrl+Enter">Generate</button>
+          <button type="button" id="play-stop" disabled>Stop</button>
+          <button type="button" id="play-next" title="The model's top 10 guesses for the next token">Next-token candidates</button>
+          <button type="button" id="play-append" title="Add the output to the prompt, to continue from there">Append output to prompt</button>
+          <button type="button" id="play-clear">Clear</button>
+        </div>
+      </div>
+      <div id="play-text">
+        <textarea id="play-prompt" rows="4" placeholder="Once upon a time">Once upon a time</textarea>
+      </div>
+      <div id="play-chat" hidden>
+        <label class="wide">System <input type="text" id="play-system" placeholder="(optional) You are a helpful assistant."></label>
+        <textarea id="play-user" rows="3" placeholder="Your message (Ctrl+Enter to send)"></textarea>
+        <label class="check" title="Gemma 4: let the model think before answering"><input type="checkbox" id="play-think"> let it think first</label>
+      </div>
+      <details>
+        <summary>Sampling settings</summary>
+        <div class="settings" id="play-settings"></div>
+        <p class="hint">Scoring (<code>score</code>, <code>analyze</code>) never samples; these only change what you read here.</p>
+      </details>
+      <div class="outputs">
+        <div><pre class="out" id="play-out-0"></pre><p class="hint stats" id="play-stats-0"></p></div>
+        <div class="slot-1" hidden><pre class="out" id="play-out-1"></pre><p class="hint stats" id="play-stats-1"></p></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>What comes next?</h2></div>
+      <p class="hint">The model's top candidates for the very next token, with probabilities. In Text mode, click one to add it and ask again.</p>
+      <div id="play-next-out"></div>
+    </section>
+  </main>
+
+  <!-- ============================================================ Data -->
+  <main id="page-data" data-page-body="data" hidden>
+    <p id="data-status" class="status" role="status"></p>
+    <section class="card">
+      <div class="card-head">
+        <h2>Data folder <code id="data-root" class="muted"></code></h2>
+        <button type="button" id="data-refresh">Refresh</button>
+      </div>
+      <p class="hint">Also on the command line: <code>sleuth data</code>. Licences are in docs/DATA.md.</p>
+    </section>
+    <div id="data-sections" class="stack"></div>
+  </main>
+
   <div id="tooltip" class="tooltip" hidden></div>
 </body>
 </html>

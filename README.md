@@ -21,6 +21,9 @@ RTX 5060 Ti. **M3** (analyzer core: attention heads, logit lens, ablation) is bu
 CPU-tested. **M5** (external models: safetensors + GGUF) is partly built: Llama/Qwen-family
 models load (checked on real Qwen3-0.6B files); Gemma 4 (GGUF, dense, text) runs and matches
 llama.cpp's perplexity; with Triton, its 4-bit weights are unpacked inside a fused GPU kernel.
+**M2a** (a scaling ladder of 20M → 60M → 100M models on a general mix) is under way. The
+**dashboard** can now run jobs (training, eval, scoring, analysis…) and has a Playground for
+talking to any model.
 
 | Piece | Where |
 |---|---|
@@ -29,10 +32,10 @@ llama.cpp's perplexity; with Triton, its 4-bit weights are unpacked inside a fus
 | Ingest + memory-mapped shards + loader | `sleuth/forge/data/` |
 | Transformer (RoPE, RMSNorm, SwiGLU, GQA, QK-norm, tying, taps) | `sleuth/forge/model/` |
 | Trainer (bf16, grad accumulation, cosine/WSD, snapshots, exact resume) | `sleuth/forge/train/` |
-| Generation (KV cache, temperature/top-k/top-p/min-p, tok/s) | `sleuth/forge/infer/` |
+| Generation (KV cache, temperature/top-k/top-p/min-p, repetition penalty, no-repeat n-grams, tok/s) | `sleuth/forge/infer/` |
 | Our own `.safetensors` reader/writer | `sleuth/formats/safetensors.py` |
 | Analyzer: neurons, attention heads, logit lens, ablation, across checkpoints | `sleuth/analyzer/` |
-| Local dashboard | `sleuth/ui/` |
+| Local dashboard: runs, analyzer views, jobs, playground, data | `sleuth/ui/` |
 | Hardware probe | `scripts/probe_hardware.py` |
 
 ## Setup (each machine)
@@ -87,7 +90,7 @@ python -m sleuth info configs/tiny-10m.toml             # params, FLOPs, token b
 python -m sleuth train configs/tiny-10m.toml --set data.shards=data/shards/synthetic
 python -m sleuth generate runs/<run-id> --prompt "Once upon a time"
 python -m sleuth analyze runs/<run-id>                   # all views, suites/basic
-python -m sleuth ui                                      # http://127.0.0.1:8765
+python -m sleuth ui                                      # open the link it prints
 ```
 
 Then the TinyStories model (download and prepare the data first: see `docs/DATA.md`):
@@ -112,6 +115,26 @@ checkpoint, and the dashboard shows each as a tab:
 Options: `--views attention,logit_lens` (a subset), `--steps 0,500,6000` (some
 checkpoints), `--ablation zero` (instead of mean), `--force` (recompute). Re-running
 skips finished checkpoints, so you can analyze while training is still going.
+
+## The dashboard: Runs, Jobs, Playground, Data
+
+`python -m sleuth ui` prints a link like `http://127.0.0.1:8765/?token=…`. Open that link (the
+token lets the page start jobs; it changes every time the dashboard starts).
+
+| Page | What it does |
+|---|---|
+| **Runs** | Training curves and the analyzer views. A run that is training right now is marked *live* and its curves refresh every few seconds. |
+| **Jobs** | Start `train`, `train --resume`, `eval`, `score`, `analyze`, `generate`, `next`, `tokenizer` and `shard` from forms, and watch their logs live. One GPU job runs at a time; later ones wait in a queue (CPU-only jobs have their own lane). **Stop** on a training job creates its STOP file, so it saves a checkpoint first; a second click kills it. Jobs keep running if you close the dashboard; their logs are in `runs/_jobs/`. |
+| **Playground** | Type a prompt and watch the tokens stream in, with tok/s and peak GPU memory. Sampling settings (temperature, top-k/p, min-p, repetition penalty, no-repeat n-gram, seed). **Next-token candidates** shows the model's top 10 guesses with probabilities; click one to add it and ask again. **Compare** runs the same prompt on two models, or two snapshots of one run. **Chat** mode for chat models (Gemma 4, Qwen). Models stay loaded (at most two) until you press **Unload**; while one is on the GPU, GPU jobs wait. |
+| **Data** | What's in `data/`: raw text, fine-tuning sets, shards (token counts, source mix) and tokenizers. Also `python -m sleuth data`. |
+
+Only the commands above can be started, with validated values, never through a shell. Every
+request that does something must carry the session token, and the server only answers
+requests addressed to 127.0.0.1/localhost, so another website open in your browser can't use it.
+
+`python -m sleuth runs` lists runs and flags stale ones (left over from older versions, e.g.
+`runs/ext-hf`); `python -m sleuth runs --prune` shows what it would delete, `--prune --yes`
+deletes. The dashboard hides stale runs unless you tick "stale".
 
 ## Other people's models (Milestone 5, in progress)
 
@@ -157,7 +180,13 @@ Ctrl-C saves a checkpoint, and so does creating a file named `STOP` in the run f
 that for a run in the background, which may never see Ctrl-C). Continue with
 `python -m sleuth train --resume runs/<run-id>`. `python -m sleuth eval runs/<run-id>` re-measures
 a run's validation loss (overall and per data source), and `python -m sleuth score runs/<run-id>
---suite suites/knowledge` checks its answers.
+--suite suites/knowledge` checks its answers (220 questions). `score` shows answer loss first,
+since at these sizes it moves long before exact matches do, with ± one standard error;
+`--show-items` lists every question with the model's top guess, and `--json FILE` saves it all.
+
+Small models loop when decoded greedily ("The capital of France is the capital of France…").
+For readable samples, add `--no-repeat-ngram 3` (never repeat a 3-token phrase) or
+`--repetition-penalty 1.2` (looks at the last 64 tokens; `--repeat-last-n` changes that).
 
 Things to try:
 - `python -m sleuth tokenize --tokenizer data/tokenizers/synthetic-1k.json "any text"`
@@ -174,5 +203,5 @@ another drive, set `SLEUTH_DATA=/mnt/fast/sleuth-data` and `SLEUTH_RUNS=/mnt/fas
 
 ```bash
 pytest -q          # CPU tests
-pytest -m gpu -q   # GPU-only tests (none yet; they arrive with M2)
+pytest -m gpu -q   # GPU-only tests (on a machine with an NVIDIA GPU)
 ```

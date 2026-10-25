@@ -8,3 +8,43 @@
 {"id": "python-07", "prompt": "x = 10\nif x > 5:\n    print('big')\nelse:\n    print('small')\n# prints", "expected": " big"}
 {"id": "python-08", "prompt": "def greet(name):\n    return 'Hello, ' +", "expected": " name"}
 {"id": "python-09", "prompt": "print(type(3.5).__name__)  # prints", "expected": " float"}
+{"id": "python-10", "prompt": "x = 5\ny = 3\nprint(x * y)  # prints", "expected": " 15"}
+{"id": "python-11", "prompt": "print('hello'.upper())  # prints", "expected": " HELLO"}
+{"id": "python-12", "prompt": "print(10 // 3)  # prints", "expected": " 3"}
+{"id": "python-13", "prompt": "print(10 % 3)  # prints", "expected": " 1"}
+{"id": "python-14", "prompt": "print(2 ** 5)  # prints", "expected": " 32"}
+{"id": "python-15", "prompt": "print(max([4, 9, 2]))  # prints", "expected": " 9"}
+{"id": "python-16", "prompt": "print(min(7, 3, 5))  # prints", "expected": " 3"}
+{"id": "python-17", "prompt": "print(sum([1, 2, 3, 4]))  # prints", "expected": " 10"}
+{"id": "python-18", "prompt": "print('abc'[0])  # prints", "expected": " a"}
+{"id": "python-19", "prompt": "print('abc'[-1])  # prints", "expected": " c"}
+{"id": "python-20", "prompt": "print(list(range(3)))  # prints", "expected": " [0, 1, 2]"}
+{"id": "python-21", "prompt": "print('a,b,c'.split(','))  # prints", "expected": " ['a', 'b', 'c']"}
+{"id": "python-22", "prompt": "print(len('hello'))  # prints", "expected": " 5"}
+{"id": "python-23", "prompt": "print(3 == 3)  # prints", "expected": " True"}
+{"id": "python-24", "prompt": "print(5 < 2)  # prints", "expected": " False"}
+{"id": "python-25", "prompt": "print(int('42') + 1)  # prints", "expected": " 43"}
+{"id": "python-26", "prompt": "print(str(7) + '7')  # prints", "expected": " 77"}
+{"id": "python-27", "prompt": "print(abs(-8))  # prints", "expected": " 8"}
+{"id": "python-28", "prompt": "print(round(3.7))  # prints", "expected": " 4"}
+{"id": "python-29", "prompt": "print([1, 2, 3][1])  # prints", "expected": " 2"}
+{"id": "python-30", "prompt": "d = {'a': 1, 'b': 2}\nprint(d['b'])  # prints", "expected": " 2"}
+{"id": "python-31", "prompt": "print(sorted([3, 1, 2], reverse=True))  # prints", "expected": " [3, 2, 1]"}
+{"id": "python-32", "prompt": "print('hello world'.title())  # prints", "expected": " Hello World"}
+{"id": "python-33", "prompt": "print('  hi  '.strip())  # prints", "expected": " hi"}
+{"id": "python-34", "prompt": "print(type([]).__name__)  # prints", "expected": " list"}
+{"id": "python-35", "prompt": "print(bool(0))  # prints", "expected": " False"}
+{"id": "python-36", "prompt": "print('ab' * 3)  # prints", "expected": " ababab"}
+{"id": "python-37", "prompt": "nums = [1, 2, 3]\nnums.append(4)\nprint(nums)  # prints", "expected": " [1, 2, 3, 4]"}
+{"id": "python-38", "prompt": "print([x * 2 for x in range(3)])  # prints", "expected": " [0, 2, 4]"}
+{"id": "python-39", "prompt": "print(7 / 2)  # prints", "expected": " 3.5"}
+{"id": "python-40", "prompt": "print('cat' in 'concatenate')  # prints", "expected": " True"}
+{"id": "python-41", "prompt": "print(len({1, 1, 2}))  # prints", "expected": " 2"}
+{"id": "python-42", "prompt": "def square(n):\n    return n * n\n\nprint(square(6))  # prints", "expected": " 36"}
+{"id": "python-43", "prompt": "total = 0\nfor i in range(4):\n    total += i\nprint(total)  # prints", "expected": " 6"}
+{"id": "python-44", "prompt": "squares = {n: n * n for n in range(3)}\nprint(squares)  # prints", "expected": " {0: 0, 1: 1, 2: 4}"}
+{"id": "python-45", "prompt": "def multiply(a, b):\n    return", "expected": " a * b"}
+{"id": "python-46", "prompt": "items = ['a', 'b']\nfor item in", "expected": " items:"}
+{"id": "python-47", "prompt": "def is_empty(items):\n    return len(items) ==", "expected": " 0"}
+{"id": "python-48", "prompt": "class Dog:\n    def __init__(self, name):\n        self.name =", "expected": " name"}
+{"id": "python-49", "prompt": "with open('notes.txt') as f:\n    text = f.", "expected": "read()"}

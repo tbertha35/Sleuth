@@ -5,10 +5,12 @@ while they run (**ANALYZER**), and running controlled experiments to make small
 models faster and better (**LAB**). An optional **ASSISTANT** explains things
 along the way.
 
-> Status: **M0 and M1 done** (M1 trained on an RTX 5060 Ti); **M3 (analyzer core)
-> built** and run on a 10M TinyStories model and Qwen3-0.6B; **M5 (external models)
-> in progress** (Qwen done; Gemma 4 runs and matches llama.cpp, but slowly). M2 (multi-GPU,
-> 125M) waits on the GX10s being set up. Sections marked ❓ still need a decision from you
+> Status (2026-10-25): **M0, M1, M3 done**; **M5 (external models)** mostly done (Qwen, Gemma 4
+> within 1% of llama.cpp's perplexity; decoding still 4.5× slower); **M2a (scaling ladder)** at
+> its third rung (mix-20m, mix-60m done; mix-100m training). **D1 (dashboard Jobs + Playground)**
+> built and CPU-tested, waiting for its first run on the 5060 Ti box. Next: document masking →
+> chat SFT (M11a), see [§8.1 Roadmap after round 4](#81-roadmap-after-round-4-2026-10-25). M2
+> (multi-GPU) waits on the GX10s. Sections marked ❓ still need a decision from you
 > (collected in [Open questions](#10-open-questions-for-you)).
 
 ---
@@ -127,10 +129,11 @@ analyzer you also need:
   "IQ" importance-quantized types are complex, so they come later.
 
 ### 0.9 Hugging Face downloads and Parquet
-Many HF datasets are published only as **Parquet**, and reading Parquet needs
-`pyarrow` (not allowed). The opt-in HF downloader will use plain HTTPS with no
-`huggingface_hub`, and will fetch only `.txt`/`.jsonl`/`.json` files and
-`.safetensors`/`.gguf` weights. Parquet support would need `pyarrow`. ❓
+Many HF datasets are published only as **Parquet**. Reading it needs `pyarrow`,
+**approved 2026-10-23** as an optional extra for reading datasets only (FineWeb-Edu
+and the rest of the general mix are read this way). The opt-in HF downloader (M4)
+will use plain HTTPS with no `huggingface_hub`. Until then the owner downloads data
+on their own machines.
 
 ### 0.10 Smaller notes
 - **RTX 3060 Ti has 8 GB** of VRAM and is Ampere (sm_86): bf16 works, FP8/FP4
@@ -257,11 +260,16 @@ Sleuth/
 │   ├── assistant/
 │   │   ├── backends.py     openai_compat (OpenAI, llama.cpp, vLLM), anthropic
 │   │   └── context.py      feeds run/analysis summaries to the model
+│   ├── runs.py       what's in runs/, which runs are stale (`sleuth runs --prune`)
 │   └── ui/
-│       ├── server.py       stdlib ThreadingHTTPServer, JSON API, binds 127.0.0.1
-│       └── static/         index.html, app.js, charts.js (canvas), style.css
+│       ├── server.py       stdlib ThreadingHTTPServer, JSON API + SSE, binds 127.0.0.1, session token
+│       ├── jobs.py         allow-listed commands → child processes, one-GPU queue, logs
+│       ├── playground.py   models loaded in the server for streaming generation / next-token
+│       ├── data.py         what's in data/ (sizes, shard token counts, source mix)
+│       └── static/         index.html, app.js (Runs), jobs.js, playground.js, data.js,
+│                           common.js, charts.js (canvas), style.css
 ├── tests/            mirrors sleuth/; tiny configs; @pytest.mark.gpu for GPU-only
-├── data/             (git-ignored) raw/, tokenizers/, shards/
+├── data/             (git-ignored) raw/, finetune/, tokenizers/, shards/
 └── runs/             (git-ignored) <run_id>/{config.json, metrics.jsonl, ckpt/, analysis/}
 ```
 
@@ -342,8 +350,10 @@ term). The LAB budget and MFU reporting depend on it.
 
 ### 4.5 Inference
 - Own `generate()`: prefill, then incremental decode with a preallocated KV
-  cache (GQA-aware). Temperature, top-k, top-p, min-p, repetition penalty,
-  stop tokens, seed. Reports prefill and decode tok/s separately (they're
+  cache (GQA-aware). Temperature, top-k, top-p, min-p, repetition penalty (over
+  the last `repeat_last_n` tokens, as in llama.cpp), no-repeat n-grams (a hard ban
+  that breaks greedy loops in small models), stop tokens, seed. Sampling options
+  only change what we *read*; scoring is always teacher-forced. Reports prefill and decode tok/s separately (they're
   bounded by different things: compute vs bandwidth).
 - Later: self-speculative decoding with MTP heads; KV-cache quantization.
 
@@ -364,9 +374,29 @@ measured. Result: Gemma 4 12B decode 0.7 → 7.7 tok/s (llama.cpp: 46). Then a f
 batch-1 decoding and a fused RMSNorm. Next: CUDA graphs for the decode step (~4,000 kernel
 launches per token are now a large part of the time), then K-quants.
 
-### 4.6 Chat SFT (later)
+### 4.6 Chat SFT (M11a, moved earlier after round 4)
 Conversation jsonl → chat template with special tokens → loss only on
-assistant tokens. Reuses the trainer.
+assistant tokens. Reuses the trainer. The data is downloaded (docs/DATA.md, Stage 3):
+Hermes function calling, When2Call, MemGPT traces.
+1. **Document masking first** (§6, item 6). Training windows currently run across
+   document boundaries with no mask (see `loader.py`). For pretraining that's a small
+   loss; for SFT it means one conversation attends into the previous one. The shard
+   index (`.idx.npy`) already records where documents start, so the loader can hand
+   the model per-window document IDs and attention can use a block-diagonal causal
+   mask (SDPA with an explicit mask, or FlexAttention where available).
+2. **Chat format for our tokenizer.** `<|system|>`, `<|user|>`, `<|assistant|>` and
+   `<|end|>` are already reserved specials (`forge/tokenizer/bpe.py`), so the 32k mix
+   tokenizer needs no retraining. A tool role takes one of the 9 `<|reserved_i|>` slots:
+   same ID, new name (the tokenizer fingerprint changes, so shards record which name set
+   they used).
+3. **SFT shards with a loss mask**: a parallel `uint8` array per shard (1 = assistant or
+   tool-call token), written by a `sleuth sft-data` builder.
+4. **`sleuth sft BASE_RUN DATA`**: the trainer with a low LR and a few hundred steps,
+   starting from a base run's last snapshot.
+5. **Eval**: When2Call's 3,652-item MCQ test as a loss-based multiple-choice score (the
+   `score` machinery: compare the loss of each choice; no generation, no judge model).
+Expectation: mix-100m (or ~150M) can learn the *format* of tool calls and when to make
+one; it won't know many facts.
 
 ---
 
@@ -389,7 +419,19 @@ assistant tokens. Reuses the trainer.
   7. SAE features (later phase)
 - **External models** use the same path via `formats/` + `adapters/`.
 - **Dashboard:** vanilla JS, heatmaps/timelines/bar charts drawn on `<canvas>`,
-  no external assets. Pages: Runs (loss curves) → Checkpoint → View.
+  no external assets. Pages:
+  - **Runs**: loss curves (refreshing on their own while a run trains) → checkpoint → view.
+    Stale runs from older versions are hidden (`sleuth runs --prune` deletes them).
+  - **Jobs**: start allow-listed commands (train, resume, eval, score, analyze, generate,
+    next, tokenizer, shard) from forms; one GPU job at a time, the rest queue; live logs
+    (Server-Sent Events); Stop uses the STOP file, so training saves a checkpoint.
+  - **Playground**: streaming generation with sampling controls, tok/s and peak memory,
+    next-token candidates (click one to extend the prompt), side-by-side compare of two
+    models or two snapshots, chat mode for chat models. Shares the GPU lane with Jobs.
+  - **Data**: what's in `data/`: sizes, shard token counts, source mix.
+  Because the page can now start processes, every POST needs a per-session token (printed
+  in `sleuth ui`'s link), and requests whose Host header isn't the loopback address are
+  refused (DNS-rebinding protection).
 
 ---
 
@@ -487,7 +529,7 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 |---|---|---|---|
 | **M0** ✅ | Skeleton, PLAN, hardware probe | probe run on both GX10s, the 5060 Ti and the 3060 Ti (results stay local; summaries in LOG.md) | your machines |
 | **M1** ✅ (CPU) | Tokenizer + 10M model end-to-end | BPE trains on your data; round-trip tests; 10M model trains on 1 GPU; snapshot + resume checkpoints; `generate` prints text + tok/s; **one analyzer view (per-layer activation stats over checkpoints) in the dashboard** | code + CPU tests here; real run on 5060 Ti or GB10 |
-| M2a 🔶 | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them. *Done: mix-20m (3.34 nats on the whole mix), mix-60m (2.99); next: mix-100m.* | 5060 Ti |
+| M2a 🔶 | Scaling ladder (single GPU) | general mix (FineWeb-Edu, Cosmopedia, Wikipedia, Python-Edu, FineMath, sports; Parquet ingest with per-source caps), 32k tokenizer, `mix-20m` / `mix-60m` / `mix-100m` on the same data, `suites/knowledge` + `score` to compare them. *Done: mix-20m (3.322 nats on the whole mix, `sleuth eval`), mix-60m (2.971); mix-100m training. `suites/knowledge` grown from 40 to 220 items, `score` reports answer loss first with standard errors. Next: `mix-150m` on ~3B tokens (re-shard without caps, WSD continuation, activation checkpointing).* | 5060 Ti |
 | M2 | Scale-up plumbing | streaming sharding of GBs; val bits-per-byte; DDP 1-node, then 2-node; MFU logging; 125M run | GB10 ×2 |
 | **M3** ✅ (CPU) | Analyzer core + dashboard | attention, logit lens, ablation, timeline views; suites by category | any GPU |
 | M4 | Assistant + net policy | `net.py` gate + test; OpenAI-compat + Anthropic backends; "explain this" in UI | anywhere |
@@ -497,21 +539,39 @@ Each milestone ends with: tests passing, a `LOG.md` entry, and a stop for your r
 | M8 | MoE | MoE layers, routing analysis, MoE vs dense vs Engram | GB10 |
 | M9 | Looped depth; MTP + speculative decoding | results in LOG.md | GB10 |
 | M10 | Low precision | FP8/FP4 training & inference, QAT | 5060 Ti + GB10 |
-| M11 | Chat SFT; SAEs | chat model; SAE feature browser | GB10 |
+| **D1** ✅ (CPU) | Dashboard: Jobs + Playground | run commands from the UI (allow-list, one-GPU queue, live logs, Stop with checkpoint, history); live training curves; Data page; Playground (streaming, next-token panel, compare, chat for chat models); session token + Host check; stale runs hidden | 5060 Ti (first real run pending) |
+| M11a | Document masking → chat SFT | block-diagonal attention from the shard index; chat format + loss-masked SFT shards; `sleuth sft`; When2Call MCQ score; chat with our own model in the Playground (Phase B) | 5060 Ti |
+| M11b | Memory harness | a local JSON "memory store" exposing the MemGPT trace functions (`core_memory_append`, `archival_memory_insert/search`, `conversation_search`) so tool calls do something in the Playground; LongMemEval `oracle` as the yardstick (`s`/`m` only with retrieval) | 5060 Ti |
+| M11c | SAEs | SAE feature browser | GB10 |
 
 M3–M5 are mostly independent, so they can be reordered to match what you're
 most curious about.
 
+### 8.1 Roadmap after round 4 (2026-10-25)
+From the round-4 review (all tests passing on Windows, ladder at mix-60m). In order:
+1. **Now, while mix-100m trains** ✅: `suites/knowledge` to 220 items with error bars in
+   `score` (one answer used to move exact match by 2.5%); `--no-repeat-ngram` and a
+   windowed `--repetition-penalty` so greedy samples stop looping. Also fixed: stale
+   `runs/ext-hf` (bug 2).
+2. **Dashboard Jobs + Playground (D1)** ✅ built; first real use on the 5060 Ti box is the test.
+3. **Then:** document masking → chat SFT (M11a) → our own chat model in the Playground →
+   the memory harness (M11b).
+4. **In parallel, on the GPU:** finish the ladder (mix-100m), then `mix-150m` on ~3B tokens
+   (~2–2½ days at the measured 62–67% MFU). The trend to watch: does the facts/sports
+   answer loss keep falling with size (20m 4.63 → 60m 4.39 on facts)? That says whether
+   size or data is the limit.
+
+Still open from the review, lower priority: Gemma's raw-prompt first token differs from
+llama.cpp (a 0.34-logit margin in fp32; compare layer by layer), Gemma decode 4.5× slower
+than llama.cpp (CUDA graphs next, §4.5.1), `analyze` progress/ETA, `generate --compare`,
+per-run README cards, the git commit and command line in each run folder, total wall time
+in the training log.
+
 ### About this cloud environment
-This Claude Code session runs in a cloud container with **4 CPUs, 16 GB RAM, no
-GPU, and no PyTorch installed**. So:
-- I can write all the code here and run the CPU tests, **if you allow me to
-  `pip install` CPU-only PyTorch and pytest into this container** ❓. (You
-  asked me not to install packages without asking.)
-- A 10M model can do a few hundred CPU steps here as a smoke test, but the
-  real M1 run (and every GPU/probe number) has to happen on your machines.
-- **When to pull:** now, to run the probe (instructions in `README.md`), and
-  again at the end of M1, to run training on a GPU.
+Claude Code sessions run in a cloud container with a few CPUs and **no GPU**. CPU
+PyTorch, NumPy and pytest are installed there from PyPI (approved 2026-10-22; see
+CLAUDE.md), so all code is written and CPU-tested there. Every GPU number, and the
+first real use of each feature, happens on your machines.
 
 ---
 
@@ -520,4 +580,3 @@ GPU, and no PyTorch installed**. So:
 - Every decision that depends on hardware cites `hardware/<host>.json`.
 - `LOG.md` entries: date, what, why, result (with numbers), surprises.
 - Tests: `pytest -q` runs CPU tests in < 1 min; `pytest -m gpu` runs GPU tests.
-

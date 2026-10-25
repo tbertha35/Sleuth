@@ -8,3 +8,43 @@
 {"id": "math-07", "prompt": "Q: What is the square root of 81?\nA:", "expected": " 9"}
 {"id": "math-08", "prompt": "Q: What is 1000 - 1?\nA:", "expected": " 999"}
 {"id": "math-09", "prompt": "Q: How many sides does a hexagon have?\nA:", "expected": " 6"}
+{"id": "math-10", "prompt": "Q: What is 9 times 8?\nA:", "expected": " 72"}
+{"id": "math-11", "prompt": "Q: What is 56 divided by 7?\nA:", "expected": " 8"}
+{"id": "math-12", "prompt": "Q: What is 123 + 456?\nA:", "expected": " 579"}
+{"id": "math-13", "prompt": "Q: What is 500 - 175?\nA:", "expected": " 325"}
+{"id": "math-14", "prompt": "Q: What is 6 times 7?\nA:", "expected": " 42"}
+{"id": "math-15", "prompt": "Q: What is 3 cubed?\nA:", "expected": " 27"}
+{"id": "math-16", "prompt": "Q: What is 2 to the power of 10?\nA:", "expected": " 1024"}
+{"id": "math-17", "prompt": "Q: What is the square root of 144?\nA:", "expected": " 12"}
+{"id": "math-18", "prompt": "Q: What is 10% of 50?\nA:", "expected": " 5"}
+{"id": "math-19", "prompt": "Q: What is 25% of 200?\nA:", "expected": " 50"}
+{"id": "math-20", "prompt": "Q: What is half of 64?\nA:", "expected": " 32"}
+{"id": "math-21", "prompt": "Q: What is a quarter of 100?\nA:", "expected": " 25"}
+{"id": "math-22", "prompt": "Q: What is 0.5 + 0.25?\nA:", "expected": " 0.75"}
+{"id": "math-23", "prompt": "Q: What is 3/4 written as a decimal?\nA:", "expected": " 0.75"}
+{"id": "math-24", "prompt": "Q: How many degrees are in a right angle?\nA:", "expected": " 90"}
+{"id": "math-25", "prompt": "Q: How many degrees are in a full circle?\nA:", "expected": " 360"}
+{"id": "math-26", "prompt": "Q: How many degrees do the angles of a triangle add up to?\nA:", "expected": " 180"}
+{"id": "math-27", "prompt": "Q: How many sides does a pentagon have?\nA:", "expected": " 5"}
+{"id": "math-28", "prompt": "Q: How many sides does an octagon have?\nA:", "expected": " 8"}
+{"id": "math-29", "prompt": "Q: How many edges does a cube have?\nA:", "expected": " 12"}
+{"id": "math-30", "prompt": "Q: How many faces does a cube have?\nA:", "expected": " 6"}
+{"id": "math-31", "prompt": "Q: What is the next prime number after 7?\nA:", "expected": " 11"}
+{"id": "math-32", "prompt": "Q: What is the smallest prime number?\nA:", "expected": " 2"}
+{"id": "math-33", "prompt": "Q: What is 11 times 11?\nA:", "expected": " 121"}
+{"id": "math-34", "prompt": "Q: What is 1000 divided by 8?\nA:", "expected": " 125"}
+{"id": "math-35", "prompt": "Q: What is 15 times 4?\nA:", "expected": " 60"}
+{"id": "math-36", "prompt": "Q: What is 81 divided by 9?\nA:", "expected": " 9"}
+{"id": "math-37", "prompt": "Q: What is 47 + 38?\nA:", "expected": " 85"}
+{"id": "math-38", "prompt": "Q: What is 90 - 47?\nA:", "expected": " 43"}
+{"id": "math-39", "prompt": "Q: What number does the Roman numeral X stand for?\nA:", "expected": " 10"}
+{"id": "math-40", "prompt": "Q: What is 5 factorial?\nA:", "expected": " 120"}
+{"id": "math-41", "prompt": "Q: A pizza is cut into 8 slices and Sam eats 3. How many slices are left?\nA:", "expected": " 5"}
+{"id": "math-42", "prompt": "Q: A book costs 12 dollars. How many dollars do 3 books cost?\nA:", "expected": " 36"}
+{"id": "math-43", "prompt": "Q: 24 students are split equally into 4 groups. How many students are in each group?\nA:", "expected": " 6"}
+{"id": "math-44", "prompt": "Q: Anna is 9 years old. How old will she be in 6 years?\nA:", "expected": " 15"}
+{"id": "math-45", "prompt": "Q: A rectangle is 5 cm long and 3 cm wide. What is its area in square cm?\nA:", "expected": " 15"}
+{"id": "math-46", "prompt": "Q: A square has sides of 4 cm. What is its perimeter in cm?\nA:", "expected": " 16"}
+{"id": "math-47", "prompt": "Q: A dozen is 12. How many eggs are in 3 dozen?\nA:", "expected": " 36"}
+{"id": "math-48", "prompt": "Q: A car drives at 50 km per hour for 2 hours. How many km does it go?\nA:", "expected": " 100"}
+{"id": "math-49", "prompt": "Q: What is 7 + 8 times 2?\nA:", "expected": " 23"}

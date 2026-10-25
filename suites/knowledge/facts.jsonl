@@ -8,3 +8,63 @@
 {"id": "facts-07", "prompt": "Q: At what temperature in degrees Celsius does water freeze?\nA:", "expected": " 0"}
 {"id": "facts-08", "prompt": "Q: In which country are the pyramids of Giza?\nA:", "expected": " Egypt"}
 {"id": "facts-09", "prompt": "Q: What gas do plants take in from the air to make food?\nA:", "expected": " Carbon dioxide"}
+{"id": "facts-10", "prompt": "Q: What is the capital of Spain?\nA:", "expected": " Madrid"}
+{"id": "facts-11", "prompt": "Q: What is the capital of Canada?\nA:", "expected": " Ottawa"}
+{"id": "facts-12", "prompt": "Q: What is the capital of Australia?\nA:", "expected": " Canberra"}
+{"id": "facts-13", "prompt": "Q: What is the capital of Egypt?\nA:", "expected": " Cairo"}
+{"id": "facts-14", "prompt": "Q: What is the capital of Russia?\nA:", "expected": " Moscow"}
+{"id": "facts-15", "prompt": "Q: What is the capital of China?\nA:", "expected": " Beijing"}
+{"id": "facts-16", "prompt": "Q: What is the capital of the United Kingdom?\nA:", "expected": " London"}
+{"id": "facts-17", "prompt": "Q: What is the capital of Greece?\nA:", "expected": " Athens"}
+{"id": "facts-18", "prompt": "Q: What is the capital of Portugal?\nA:", "expected": " Lisbon"}
+{"id": "facts-19", "prompt": "Q: What is the capital of Kenya?\nA:", "expected": " Nairobi"}
+{"id": "facts-20", "prompt": "Q: What is the capital of Argentina?\nA:", "expected": " Buenos Aires"}
+{"id": "facts-21", "prompt": "Q: What is the capital of Norway?\nA:", "expected": " Oslo"}
+{"id": "facts-22", "prompt": "Q: What is the capital of Ireland?\nA:", "expected": " Dublin"}
+{"id": "facts-23", "prompt": "Q: What is the capital of Sweden?\nA:", "expected": " Stockholm"}
+{"id": "facts-24", "prompt": "Q: Which planet is closest to the Sun?\nA:", "expected": " Mercury"}
+{"id": "facts-25", "prompt": "Q: Which planet is famous for its rings?\nA:", "expected": " Saturn"}
+{"id": "facts-26", "prompt": "Q: How many planets are in our solar system?\nA:", "expected": " 8"}
+{"id": "facts-27", "prompt": "Q: What is the chemical symbol for gold?\nA:", "expected": " Au"}
+{"id": "facts-28", "prompt": "Q: What is the chemical symbol for sodium?\nA:", "expected": " Na"}
+{"id": "facts-29", "prompt": "Q: What is the chemical symbol for iron?\nA:", "expected": " Fe"}
+{"id": "facts-30", "prompt": "Q: Which gas do humans need to breathe in to live?\nA:", "expected": " Oxygen"}
+{"id": "facts-31", "prompt": "Q: What is the hardest natural substance?\nA:", "expected": " Diamond"}
+{"id": "facts-32", "prompt": "Q: At what temperature in degrees Celsius does water boil at sea level?\nA:", "expected": " 100"}
+{"id": "facts-33", "prompt": "Q: How many bones are in the adult human body?\nA:", "expected": " 206"}
+{"id": "facts-34", "prompt": "Q: Which organ pumps blood around the body?\nA:", "expected": " The heart"}
+{"id": "facts-35", "prompt": "Q: How many continents are there?\nA:", "expected": " 7"}
+{"id": "facts-36", "prompt": "Q: What is the largest continent?\nA:", "expected": " Asia"}
+{"id": "facts-37", "prompt": "Q: Who painted the Mona Lisa?\nA:", "expected": " Leonardo da Vinci"}
+{"id": "facts-38", "prompt": "Q: Who developed the theory of relativity?\nA:", "expected": " Albert Einstein"}
+{"id": "facts-39", "prompt": "Q: Who was the first person to walk on the Moon?\nA:", "expected": " Neil Armstrong"}
+{"id": "facts-40", "prompt": "Q: Who was the first president of the United States?\nA:", "expected": " George Washington"}
+{"id": "facts-41", "prompt": "Q: Who discovered penicillin?\nA:", "expected": " Alexander Fleming"}
+{"id": "facts-42", "prompt": "Q: Who proposed the theory of evolution by natural selection?\nA:", "expected": " Charles Darwin"}
+{"id": "facts-43", "prompt": "Q: Who invented the telephone?\nA:", "expected": " Alexander Graham Bell"}
+{"id": "facts-44", "prompt": "Q: In what year did World War II end?\nA:", "expected": " 1945"}
+{"id": "facts-45", "prompt": "Q: In what year did World War I begin?\nA:", "expected": " 1914"}
+{"id": "facts-46", "prompt": "Q: In what year did people first land on the Moon?\nA:", "expected": " 1969"}
+{"id": "facts-47", "prompt": "Q: What language is spoken in Brazil?\nA:", "expected": " Portuguese"}
+{"id": "facts-48", "prompt": "Q: What language is mainly spoken in Mexico?\nA:", "expected": " Spanish"}
+{"id": "facts-49", "prompt": "Q: What is the largest animal on Earth?\nA:", "expected": " The blue whale"}
+{"id": "facts-50", "prompt": "Q: What is the fastest land animal?\nA:", "expected": " The cheetah"}
+{"id": "facts-51", "prompt": "Q: How many legs does a spider have?\nA:", "expected": " 8"}
+{"id": "facts-52", "prompt": "Q: How many legs does an insect have?\nA:", "expected": " 6"}
+{"id": "facts-53", "prompt": "Q: What do bees make?\nA:", "expected": " Honey"}
+{"id": "facts-54", "prompt": "Q: How many hours are in a day?\nA:", "expected": " 24"}
+{"id": "facts-55", "prompt": "Q: How many minutes are in an hour?\nA:", "expected": " 60"}
+{"id": "facts-56", "prompt": "Q: How many months are in a year?\nA:", "expected": " 12"}
+{"id": "facts-57", "prompt": "Q: How many days are in a leap year?\nA:", "expected": " 366"}
+{"id": "facts-58", "prompt": "Q: What is the tallest mountain in the world?\nA:", "expected": " Mount Everest"}
+{"id": "facts-59", "prompt": "Q: What is the largest country in the world by area?\nA:", "expected": " Russia"}
+{"id": "facts-60", "prompt": "Q: What color do you get when you mix blue and yellow?\nA:", "expected": " Green"}
+{"id": "facts-61", "prompt": "Q: Which metal is a liquid at room temperature?\nA:", "expected": " Mercury"}
+{"id": "facts-62", "prompt": "Q: What force pulls objects toward the Earth?\nA:", "expected": " Gravity"}
+{"id": "facts-63", "prompt": "Q: What is the center of an atom called?\nA:", "expected": " The nucleus"}
+{"id": "facts-64", "prompt": "Q: What is the closest star to the Earth?\nA:", "expected": " The Sun"}
+{"id": "facts-65", "prompt": "Q: Which blood cells fight infections?\nA:", "expected": " White blood cells"}
+{"id": "facts-66", "prompt": "Q: What is the freezing point of water in degrees Fahrenheit?\nA:", "expected": " 32"}
+{"id": "facts-67", "prompt": "Q: Which animal is known as the king of the jungle?\nA:", "expected": " The lion"}
+{"id": "facts-68", "prompt": "Q: What is the main language spoken in France?\nA:", "expected": " French"}
+{"id": "facts-69", "prompt": "Q: How many sides does a triangle have?\nA:", "expected": " 3"}
