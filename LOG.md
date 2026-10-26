@@ -784,3 +784,30 @@ Playground (mix-100m; Gemma 4 in chat mode) and the logit-lens note all work.
   and the matmul-kernel test keeps the norm kernels fixed so it compares only the matmul.
 - Lesson for benchmarks: a single cold run (graph capture, Triton compiles) under-reports speed
   by ~25%; always warm up first.
+
+**2026-10-26: Where the MTP pass time goes; a faster few-row kernel (experiment).**
+- Gemma 4 12B MTP + graph pass: draft 3.1 ms, verify (4 rows) 31.5 ms, Python in between 1.5 ms.
+  So moving the decode loop to C or Rust would save at most ~4%. The time is GPU work, and 92%
+  of it is one kernel: the few-row quantized matmul (`_qgemv4_kernel`: 18.2 ms of 19.7 for 1 row,
+  26.9 of 29.1 for 4 rows). The weights-read floor is ~15 ms (6.8 GB at 448 GB/s).
+- Two changes tested in scratch kernels on three Gemma-sized Q4_0 matrices, timed in a CUDA graph
+  over 600 MB of weights (no L2 help), floor 168 us:
+  - current: 1 row 230 us, 4 rows 335 us (4 rows = 1.46x)
+  - same fp32 math on a repacked layout: no better for 4 rows (390+ us)
+  - **llama.cpp's trick, int8 x + dp4a, on a repacked layout: 204 / 255 us (1.24x)**
+  - Repacked = the 18-byte GGUF blocks split once at load time into 16-byte-aligned weight bytes
+    plus a separate scale array (same bits). dp4a = 4 int8 multiply-adds per instruction (inline
+    PTX from Triton, no CUDA compiler needed). x is quantized to int8 per 32 values (~5 us per input).
+- Trade-off: int8 activations change results slightly (rel. error 5.5e-3 vs 3.1e-3 against fp32),
+  which is what llama.cpp does for these matmuls. Rows stay independent, so speculative decoding
+  stays exact. Estimated MTP pass: ~27 ms (~95 tok/s); llama.cpp is ~25 ms.
+- Built in (`triton_kernels._qgemv_q8_kernel`, default for Q4_0 with 1-4 rows of bf16/fp16 x;
+  `SLEUTH_EXACT_ACT=1` turns it off). Kept the GGUF layout: dp4a on the original 18-byte
+  blocks (2-byte-aligned loads) was within 10-15% of the repacked layout on 4 rows and equal on
+  1 row, and repacking would change every reader of the raw bytes. Q8_0 stays on the fp32
+  kernel (already flat in rows; int8 was slower: 482 vs 419 us).
+- One deliberate difference from llama.cpp: Q4_0's +8 offset is corrected with the sum of the
+  *rounded* x (llama.cpp uses the unrounded sum). The offset then cancels the rounding error as
+  well: relative error 5.5e-3 instead of 1.3e-2.
+- Gemma 4 12B, warm, 3 guesses: MTP + graph **84.0 tok/s** (exact activations, same session:
+  78.7), plain graph ~46, identical text in every mode. Run-to-run noise is ~5-10%.

@@ -22,6 +22,13 @@ and it reloaded each block's scale for every weight. The few-row kernel
 handles whole 32-value blocks (one scale load, 16 contiguous bytes) and sums
 in fp32 without rounding the weights to bf16 first (a tiny bit *more* precise).
 
+For Q4_0 with 1-4 rows of bf16/fp16 x (decoding, speculative checks) a third kernel
+is the default: x is rounded to int8 per 32 values first, as llama.cpp does, and
+4 int8 products are done per instruction (dp4a). That makes a 4-row check cost
+1.2x one row instead of 1.5x (Gemma 4 12B with MTP: ~72-79 -> 84 tok/s). The
+price is llama.cpp's activation rounding (relative error ~5e-3 instead of ~3e-3
+against exact math). SLEUTH_EXACT_ACT=1 or set_int8_activations(False) turns it off.
+
 Triton is optional. It ships with PyTorch on Linux; on Windows it's the
 `triton-windows` package (owner-approved 2026-10-24). Without it, or if the
 self-check below fails, QuantLinear silently uses the plain path. Set the
@@ -155,10 +162,147 @@ if triton is not None:
             tl.store(y_ptr + 3 * stride_ym + rn, tl.sum(tl.sum(a3, axis=2), axis=1).to(out), mask=n_ok & (M > 3))
 
 
+    # ------------------------------------------------------------------ int8 activations
+    # llama.cpp's way of doing the few-row case (its CUDA "mmvq" kernels): round each
+    # row of x to int8 once, in blocks of 32 sharing one scale (its q8_1 format), then
+    # multiply 4 int8 pairs per instruction (dp4a) and apply both scales once per
+    # block. Far fewer instructions per weight than unpacking to fp32, which is what
+    # made 4 rows cost 1.46x one row: compute, not memory, was the limit.
+
+    @triton.jit
+    def _quant_q8_kernel(x_ptr, xq_ptr, dx_ptr, sx_ptr, K, stride_xm):
+        """One program per (row, 32-value block), like llama.cpp's quantize_q8_1:
+        d = max|x| / 127 (stored as fp16), q = roundf(x / d). Also the block's sum of q,
+        for the Q4_0 offset. (llama.cpp uses the sum of the unrounded x there; with the
+        rounded one the offset cancels the rounding error too: 2.5x smaller error on
+        Gemma-sized matrices, 5.5e-3 vs 1.3e-2.) The 32 int8 values are packed 4 per int32."""
+        r = tl.program_id(0).to(tl.int64)
+        blk = tl.program_id(1)
+        nb = K // 32
+        i = tl.arange(0, 32)
+        x = tl.load(x_ptr + r * stride_xm + blk * 32 + i).to(tl.float32)
+        amax = tl.max(tl.abs(x), axis=0)
+        d = amax / 127.0
+        v = tl.where(amax > 0, x / d, 0.0)
+        qv = tl.where(v < 0, -tl.floor(-v + 0.5), tl.floor(v + 0.5)).to(tl.int32)   # roundf: halves away from 0
+        tl.store(dx_ptr + r * nb + blk, d.to(tl.float16).to(tl.float32))
+        tl.store(sx_ptr + r * nb + blk, tl.sum(qv, axis=0).to(tl.float32))
+        packed = tl.sum(tl.reshape(qv & 0xFF, (8, 4)) << (tl.arange(0, 4) * 8)[None, :], axis=1)
+        tl.store(xq_ptr + r * (K // 4) + blk * 8 + tl.arange(0, 8), packed)
+
+    @triton.jit
+    def _dp4a(a, b, c, ASM: tl.constexpr):
+        """c + the dot product of the 4 signed bytes in a and in b (int32 each)."""
+        if ASM:
+            return tl.inline_asm_elementwise("dp4a.s32.s32 $0, $1, $2, $3;", "=r,r,r,r", [a, b, c],
+                                             dtype=tl.int32, is_pure=True, pack=1)
+        else:  # Triton's interpreter (CPU tests) can't run PTX: same arithmetic, byte by byte
+            for s in tl.static_range(4):
+                c += ((a << (24 - 8 * s)) >> 24) * ((b << (24 - 8 * s)) >> 24)
+            return c
+
+    @triton.jit
+    def _q8_row(acc, w0, w1, dw, xq_ptr, dx_ptr, sx_ptr, r, K, b, b_ok, i4, live,
+                QTYPE: tl.constexpr, ASM: tl.constexpr):
+        """Add one row of x's contribution for these weight blocks. w0/w1: [BN, BB, 4]
+        int32 words, the block's first and second 16 values as signed bytes."""
+        nb = K // 32
+        xo = r * (K // 4) + (b * 8)[:, None] + i4[None, :]
+        x0 = tl.load(xq_ptr + xo, mask=b_ok[:, None] & live, other=0)
+        x1 = tl.load(xq_ptr + xo + 4, mask=b_ok[:, None] & live, other=0)
+        si = tl.sum(_dp4a(w1, x1[None], _dp4a(w0, x0[None], tl.zeros_like(w0), ASM), ASM), axis=2)
+        dx = tl.load(dx_ptr + r * nb + b, mask=b_ok & live, other=0.0)[None, :]
+        if QTYPE == 0:   # Q4_0 stores q + 8: subtract 8 x sum(q_x) once per block
+            sq = tl.load(sx_ptr + r * nb + b, mask=b_ok & live, other=0.0)[None, :]
+            return acc + dw * dx * (si.to(tl.float32) - 8.0 * sq)
+        else:
+            return acc + dw * dx * si.to(tl.float32)
+
+    @triton.jit
+    def _qgemv_q8_kernel(xq_ptr, dx_ptr, sx_ptr, w_ptr, y_ptr, M, N, K, stride_ym, row_bytes,
+                         QTYPE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCKS: tl.constexpr,
+                         MROWS: tl.constexpr, ASM: tl.constexpr):
+        """1-4 rows of int8 x (from _quant_q8_kernel) times Q4_0/Q8_0 weights, read in
+        place from the GGUF blocks. Their 16 / 32 weight bytes start 2 bytes into an 18 /
+        34-byte block, so they're only 2-byte aligned: loaded as uint16 pairs. As in
+        _qgemv4_kernel, a row's arithmetic doesn't depend on M (speculative checks match
+        one-token decoding bit for bit)."""
+        pid_n = tl.program_id(0)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_ok = rn < N
+        w16 = w_ptr.to(tl.pointer_type(tl.uint16))
+        row16 = rn.to(tl.int64) * (row_bytes // 2)
+        nb = K // 32
+        i4 = tl.arange(0, 4)
+        a0 = tl.zeros((BLOCK_N, BLOCKS), dtype=tl.float32)
+        a1 = tl.zeros((BLOCK_N, BLOCKS), dtype=tl.float32)
+        a2 = tl.zeros((BLOCK_N, BLOCKS), dtype=tl.float32)
+        a3 = tl.zeros((BLOCK_N, BLOCKS), dtype=tl.float32)
+        for b0 in range(0, nb, BLOCKS):
+            b = b0 + tl.arange(0, BLOCKS)
+            b_ok = b < nb
+            ok2 = n_ok[:, None] & b_ok[None, :]
+            if QTYPE == 0:
+                blk = row16[:, None] + (b * 9)[None, :]           # block start, in uint16s (18 bytes)
+            else:
+                blk = row16[:, None] + (b * 17)[None, :]          # 34 bytes
+            dw = tl.load(w16 + blk, mask=ok2, other=0).to(tl.float16, bitcast=True).to(tl.float32)
+            p = w16 + blk[:, :, None] + 1 + 2 * i4[None, None, :]
+            m3 = ok2[:, :, None]
+            if QTYPE == 0:
+                wq = (tl.load(p, mask=m3, other=0).to(tl.uint32)
+                      | (tl.load(p + 1, mask=m3, other=0).to(tl.uint32) << 16)).to(tl.int32, bitcast=True)
+                w0 = wq & 0x0F0F0F0F                       # low nibbles: values 0-15 of the block
+                w1 = (wq >> 4) & 0x0F0F0F0F                # high nibbles: values 16-31
+            else:
+                w0 = (tl.load(p, mask=m3, other=0).to(tl.uint32)
+                      | (tl.load(p + 1, mask=m3, other=0).to(tl.uint32) << 16)).to(tl.int32, bitcast=True)
+                w1 = (tl.load(p + 8, mask=m3, other=0).to(tl.uint32)
+                      | (tl.load(p + 9, mask=m3, other=0).to(tl.uint32) << 16)).to(tl.int32, bitcast=True)
+            a0 = _q8_row(a0, w0, w1, dw, xq_ptr, dx_ptr, sx_ptr, 0, K, b, b_ok, i4, True, QTYPE, ASM)
+            if MROWS > 1:
+                a1 = _q8_row(a1, w0, w1, dw, xq_ptr, dx_ptr, sx_ptr, 1, K, b, b_ok, i4, M > 1, QTYPE, ASM)
+            if MROWS > 2:
+                a2 = _q8_row(a2, w0, w1, dw, xq_ptr, dx_ptr, sx_ptr, 2, K, b, b_ok, i4, M > 2, QTYPE, ASM)
+                a3 = _q8_row(a3, w0, w1, dw, xq_ptr, dx_ptr, sx_ptr, 3, K, b, b_ok, i4, M > 3, QTYPE, ASM)
+        out = y_ptr.dtype.element_ty
+        tl.store(y_ptr + rn, tl.sum(a0, axis=1).to(out), mask=n_ok)
+        if MROWS > 1:
+            tl.store(y_ptr + stride_ym + rn, tl.sum(a1, axis=1).to(out), mask=n_ok & (M > 1))
+        if MROWS > 2:
+            tl.store(y_ptr + 2 * stride_ym + rn, tl.sum(a2, axis=1).to(out), mask=n_ok & (M > 2))
+            tl.store(y_ptr + 3 * stride_ym + rn, tl.sum(a3, axis=1).to(out), mask=n_ok & (M > 3))
+
+
 GEMV_MAX_ROWS = 4  # up to this many rows of x (tokens), the few-row kernel is used
 # (BLOCK_N, BLOCKS, num_warps) for _qgemv4_kernel. Round 7, three Gemma-4-12B-sized matrices:
 # Q4_0 1 row 187 us / 4 rows 305 us (previous kernels: 225 / 707); Q8_0 391 / 371 (378 / 686).
 GEMV4_CONFIG = {q.Q4_0: (8, 8, 2), q.Q8_0: (4, 8, 2)}
+# Same for _qgemv_q8_kernel (int8 activations), measured in CUDA graphs over 600 MB of
+# Gemma-sized weights (round 8): Q4_0 1 row 221 -> 213 us, 4 rows 325 -> 263 us. Not used
+# for Q8_0: its fp32 kernel is already flat in M (406 / 419 us) and int8 was slower (482).
+GEMV_Q8_CONFIG = {q.Q4_0: (16, 16, 4)}
+
+# Few-row matmuls of bf16/fp16 x use int8 activations (llama.cpp's rounding) unless
+# SLEUTH_EXACT_ACT=1. fp32 models always keep exact activations.
+INT8_ACTIVATIONS = os.environ.get("SLEUTH_EXACT_ACT", "") not in ("1", "true", "yes")
+
+
+def set_int8_activations(on: bool) -> None:
+    """Switch the int8-activation few-row kernel on or off (e.g. to compare)."""
+    global INT8_ACTIVATIONS
+    INT8_ACTIVATIONS = on
+
+
+def quantize_q8(x2: torch.Tensor):
+    """Rows of x [M, K] -> (int8 values packed 4 per int32 [M, K/4], scale [M, K/32],
+    block sums [M, K/32]), rounded exactly like llama.cpp's quantize_q8_1."""
+    M, K = x2.shape
+    xq = torch.empty(M, K // 4, dtype=torch.int32, device=x2.device)
+    dx = torch.empty(M, K // 32, dtype=torch.float32, device=x2.device)
+    sx = torch.empty(M, K // 32, dtype=torch.float32, device=x2.device)
+    _quant_q8_kernel[(M, K // 32)](x2, xq, dx, sx, K, x2.stride(0), num_warps=1)
+    return xq, dx, sx
 
 
 def qmatmul(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, out_features: int) -> torch.Tensor:
@@ -168,6 +312,15 @@ def qmatmul(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, out_features: in
     x2 = x.reshape(-1, K).contiguous()
     M, N = x2.shape[0], out_features
     y = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    if M <= GEMV_MAX_ROWS and INT8_ACTIVATIONS and x.dtype != torch.float32 and ggml_type in GEMV_Q8_CONFIG:
+        xq, dx, sx = quantize_q8(x2)
+        block_n, blocks, warps = GEMV_Q8_CONFIG[ggml_type]
+        _qgemv_q8_kernel[(triton.cdiv(N, block_n),)](xq, dx, sx, raw, y, M, N, K, y.stride(0), K // 32 * nb,
+                                                     QTYPE=code, BLOCK_N=block_n, BLOCKS=blocks,
+                                                     MROWS=1 if M == 1 else (2 if M == 2 else 4),
+                                                     ASM=os.environ.get("TRITON_INTERPRET") != "1",
+                                                     num_warps=warps)
+        return y.reshape(*x.shape[:-1], N)
     if M <= GEMV_MAX_ROWS:
         # 1-4 rows (decoding, and speculative checks of up to 3 guesses): one kernel for
         # all of them, so a row's result never depends on how many rows ran together;

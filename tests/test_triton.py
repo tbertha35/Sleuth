@@ -15,22 +15,47 @@ import pytest
 pytest.importorskip("triton")
 
 SCRIPT = r"""
-import sys, torch
+import sys, torch, triton
 sys.path.insert(0, "tests")
 from sleuth.formats import gguf_quants as q
 from sleuth.forge.model import triton_kernels as tk
+from sleuth.forge.model.quant import round_like_q8
 
-# 1. the kernel alone, against dequantize + matmul
-for t in (q.Q4_0, q.Q8_0):
-    for M in (1, 3, 4, 7, 40):
-        for dt, tol in ((torch.float32, 1e-5), (torch.float16, 2e-3)):
-            w = torch.randn(150, 288) * 0.05
-            raw = q.quantize(w, t)
-            x = torch.randn(M, 288).to(dt)
-            ref = x.float() @ q.dequantize(raw, t, w.numel(), torch.float32).to(dt).float().reshape(150, 288).T
-            got = tk.qmatmul(x, raw, t, 150).float()
-            err = ((got - ref).abs().max() / ref.abs().max()).item()
-            assert got.shape == (M, 150) and err < tol, (q.TYPE_NAMES[t], M, dt, err)
+# 1. the kernel alone, against dequantize + matmul. fp16 Q4_0 with 1-4 rows uses int8
+# activations: its reference is x rounded like llama.cpp's q8_1 (round_like_q8), and
+# with exact activations switched off it's the plain reference again.
+for int8 in (True, False):
+    tk.set_int8_activations(int8)
+    for t in (q.Q4_0, q.Q8_0):
+        for M in (1, 3, 4, 7, 40):
+            for dt, tol in ((torch.float32, 1e-5), (torch.float16, 2e-3)):
+                w = torch.randn(150, 288) * 0.05
+                raw = q.quantize(w, t)
+                x = torch.randn(M, 288).to(dt)
+                xr = round_like_q8(x) if int8 and t == q.Q4_0 and M <= 4 and dt != torch.float32 else x
+                ref = xr.float() @ q.dequantize(raw, t, w.numel(), torch.float32).to(dt).float().reshape(150, 288).T
+                got = tk.qmatmul(x, raw, t, 150).float()
+                err = ((got - ref).abs().max() / ref.abs().max()).item()
+                assert got.shape == (M, 150) and err < tol, (int8, q.TYPE_NAMES[t], M, dt, err)
+tk.set_int8_activations(True)
+
+# 1b. the int8 kernel's pieces: quantize_q8 packs bytes as llama.cpp rounds them, the
+# software dp4a (what the interpreter runs instead of PTX) is a signed byte dot product,
+# and the Q8_0 branch (not used by qmatmul: slower than the fp32 one on the RTX 5060 Ti)
+# is right too.
+x = torch.randn(3, 96) * 2
+xq, dx, sx = tk.quantize_q8(x)
+bytes_ = xq.view(torch.int8).reshape(3, 96).float()           # little-endian: byte i = value i
+assert torch.allclose(bytes_ * dx.repeat_interleave(32, 1), round_like_q8(x), atol=1e-6)
+assert torch.equal(sx, bytes_.reshape(3, 3, 32).sum(-1))
+for t, code in ((q.Q4_0, 0), (q.Q8_0, 1)):
+    w = torch.randn(40, 96) * 0.05
+    raw = q.quantize(w, t)
+    y = torch.empty(3, 40)
+    tk._qgemv_q8_kernel[(triton.cdiv(40, 16),)](xq, dx, sx, raw, y, 3, 40, 96, y.stride(0), 96 // 32 * tk.SUPPORTED[t][1],
+                                                QTYPE=code, BLOCK_N=16, BLOCKS=2, MROWS=4, ASM=False)
+    ref = round_like_q8(x) @ q.dequantize(raw, t, w.numel(), torch.float32).reshape(40, 96).T
+    assert ((y - ref).abs().max() / ref.abs().max()).item() < 1e-5, q.TYPE_NAMES[t]
 
 # 2. a whole kept-quantized model: fused path == plain path
 from test_gemma import IDS, make_gemma_gguf
