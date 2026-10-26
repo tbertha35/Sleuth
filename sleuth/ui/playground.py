@@ -47,12 +47,18 @@ class Loaded:
 
         return find_mtp_file(self.key[0])
 
+    def mtp_name(self) -> str | None:
+        """What "MTP drafter" would use: the model's own heads, or an mtp-*.gguf."""
+        if getattr(self.model, "mtp", None) is not None:
+            return f"built-in ({len(self.model.mtp)} heads)"
+        path = self.mtp_file()
+        return path.name if path else None
+
     def public(self) -> dict:
-        mtp = self.mtp_file()
         return {"label": self.label, "device": str(self.device), "format": self.meta.get("format"),
                 "step": self.meta.get("step"), "params": self.model.num_params(),
                 "load_seconds": round(self.load_seconds, 1), "chat_format": self.chat_format,
-                "kept_quantized": self.meta.get("kept_quantized"), "mtp": mtp.name if mtp else None}
+                "kept_quantized": self.meta.get("kept_quantized"), "mtp": self.mtp_name()}
 
 
 def _num(body: dict, key: str, default, kind=float, lo=None, hi=None):
@@ -278,8 +284,10 @@ class Playground:
 
                 if spec == "mtp":
                     if m.drafter is None:
-                        from ..forge.infer.mtp import load_drafter
+                        from ..forge.infer.mtp import builtin_drafter, load_drafter
 
+                        m.drafter = builtin_drafter(m.model)
+                    if m.drafter is None:
                         path = m.mtp_file()
                         if path is None:
                             raise JobError(f"{m.label} has no MTP drafter next to it (mtp-*.gguf in the same folder)")

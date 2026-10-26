@@ -252,6 +252,7 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     completed = start_step
     t_last, tok_last = time.perf_counter(), tokens_seen
     loss_sum = torch.zeros((), device=device)
+    mtp_sum = torch.zeros((), device=device)   # the MTP heads' loss, logged on its own
     loss_count = 0
     try:
         for step in range(start_step, tc.max_steps):
@@ -262,8 +263,12 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
                 x, y = train_ds.batch(tc.micro_batch_size, tc.seq_len, tc.seed, step, micro)
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 with autocast():
-                    loss = fwd(x, y, **masks(x)).loss
-                (loss / tc.grad_accum).backward()
+                    out = fwd(x, y, **masks(x))
+                loss = out.loss       # logged: the next-token loss, comparable with runs without MTP heads
+                total = loss if out.mtp_loss is None else loss + tc.mtp_weight * out.mtp_loss
+                if out.mtp_loss is not None:
+                    mtp_sum += out.mtp_loss.detach()
+                (total / tc.grad_accum).backward()
                 # Accumulate on-device: calling .item() here would force the
                 # CPU to wait for the GPU every micro-step.
                 loss_sum += loss.detach()
@@ -287,15 +292,19 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
                     "step": completed, "tokens": tokens_seen, "loss": (loss_sum / loss_count).item(),
                     "lr": lr, "grad_norm": float(grad_norm), "tok_per_s": round(tps, 1), "time": time.time(),
                 }
+                if cfg.model.mtp_heads:
+                    rec["mtp_loss"] = (mtp_sum / loss_count).item()
                 if tc.peak_tflops > 0:
                     rec["mfu"] = round(tps * flops_per_token / (tc.peak_tflops * 1e12), 4)
                 if device.type == "cuda":
                     rec["mem_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
                 metrics.write(rec)
-                log(f"step {completed:6d} | loss {rec['loss']:.4f} | lr {lr:.2e} | "
+                log(f"step {completed:6d} | loss {rec['loss']:.4f} | "
+                    + (f"mtp {rec['mtp_loss']:.4f} | " if "mtp_loss" in rec else "") + f"lr {lr:.2e} | "
                     f"gnorm {rec['grad_norm']:.2f} | {tps:,.0f} tok/s" + (f" | mfu {rec['mfu']:.1%}" if "mfu" in rec else "")
                     + (f" | mem {rec['mem_gb']:.1f} GB" if "mem_gb" in rec else ""))
                 loss_sum.zero_()
+                mtp_sum.zero_()
                 loss_count = 0
                 t_last, tok_last = time.perf_counter(), tokens_seen
 

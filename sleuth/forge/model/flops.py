@@ -48,14 +48,21 @@ def param_counts(cfg: ModelConfig) -> dict[str, int]:
     norm_params = d if cfg.norm_type == "rmsnorm" else 2 * d
     embedding = cfg.padded_vocab * d
     head = 0 if cfg.tie_embeddings else cfg.padded_vocab * d
-    total = embedding + sum(n for n, _ in layers) + norm_params + head
+    # MTP heads (mtp_heads.py): 4 norms, a 2d -> d projection and an MLP each; each one
+    # also runs the shared output layer again (matmul cost, no extra parameters).
+    n_ffn_in = 2 if cfg.ffn_type in ("swiglu", "geglu") else 1
+    mtp_matmul = 2 * d * d + n_ffn_in * d * cfg.hidden + cfg.hidden * d
+    mtp_bias = (d + n_ffn_in * cfg.hidden + d) if cfg.bias else 0
+    mtp = cfg.mtp_heads * (mtp_matmul + mtp_bias + 4 * norm_params)
+    total = embedding + sum(n for n, _ in layers) + norm_params + head + mtp
     return {
         "total": total,
         "embedding": embedding,
         "non_embedding": total - embedding,
         "per_layer": layers[0][0],
         # weights that take part in matmuls (what the 6N rule counts)
-        "matmul": sum(m for _, m in layers) + cfg.padded_vocab * d,
+        "matmul": sum(m for _, m in layers) + (1 + cfg.mtp_heads) * cfg.padded_vocab * d
+                  + cfg.mtp_heads * mtp_matmul,
     }
 
 

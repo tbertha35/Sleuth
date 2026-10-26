@@ -727,3 +727,60 @@ Playground (mix-100m; Gemma 4 in chat mode) and the logit-lens note all work.
   (~35 h with the SDPA mask). Same LR (6e-4) and cosine schedule as mix-100m, document-masked,
   shards `data/shards/mix-3b`.
 - Tests: 243 → 248 CPU; GPU 8 → 10 cases (FlexAttention; the case without compile skips).
+
+**2026-10-25: MoE layers, and MTP heads for our own models (GPU box, round 7 follow-up).**
+- *MoE* (`forge/model/moe.py`, from llama.cpp's build_moe_ffn): softmax router in fp32, top-k,
+  weights renormalized; experts stay as the file's quantized blocks and only the chosen ones run
+  (a Python loop over experts: exact, not fast). `qwen35moe` (Qwen3.6-35B-A3B: 256 experts, 8 used,
+  plus a sigmoid-gated shared expert; its MTP block is MoE too) and Gemma 4 26B-A4B (128 experts,
+  8 used, router on rms(x)/√d × scale, the dense MLP kept as a shared expert). Checked on tiny
+  GGUFs against loop-by-loop references; the real files wait for offloading (21 GB / 15.8 GB).
+- *MTP heads* (`model.mtp_heads`, `forge/model/mtp_heads.py`): head k guesses the token k+1 ahead
+  from the previous head's state and the embedding of the token before its target (DeepSeek-V3's
+  chain), sharing the output layer. Decision: **no attention in the heads**, so drafting needs no KV
+  cache and no catch-up after each check (Hydra-style); attention is a later experiment. Loss =
+  main + `train.mtp_weight` (0.3) × mean head loss; the logged `loss` stays the next-token loss, so
+  runs compare with older ones, and `mtp_loss` is logged next to it. `--draft mtp` and the
+  Playground use a run's own heads. Cost on mix-150m's shape: +21% FLOPs per head (mostly the
+  32k-vocab output layer again), +8M parameters. Plan: one head on the run after mix-150m.
+- CUDA graphs are refused cleanly for qwen35 and MoE models (`graph_unsupported`); the Playground
+  used to fail loading qwen35 on a GPU because its warm-up always recorded a graph.
+- Tests: 266 → 276 CPU.
+
+**2026-10-25: Fewer kernels per token (fused norms and RoPE).**
+- Baseline from the owner's llama.cpp server on an identical RTX 5060 Ti, same Gemma 4 12B file
+  (the "QAT Q4_K_XL" file is 100% Q4_0) with MTP: 108-112 tok/s, ~25 ms per pass of ~2.8 tokens.
+  Ours: 70 tok/s, ~38 ms per pass. Same hardware and file, so the gap is our engine.
+- Counted on the tiny Gemma's structure (one static decode step): **100 kernels per layer**, 27 of
+  them dtype casts. Each RMSNorm was ~9 kernels (the fp32 casts of x and the gain, square, mean,
+  eps, rsqrt, two multiplies, cast back) and Gemma has 6 per layer, plus RoPE (~7 per tensor) and
+  the value norm. The static attention mask was rebuilt in every layer.
+- New `forge/model/fused_ops.py`: one Triton kernel per RMSNorm, and one per q/k/v tensor for the
+  head norm + RoPE. The static cache builds each mask and the positions once per pass. Now **29
+  kernels per layer**, under 1 cast. For the 12B that is ~4,800 -> ~1,400 kernels per token.
+  Speed is unmeasured until the GPU is free (training).
+- Inference only: used when autograd is off, on CUDA (or the Triton interpreter in tests), outside
+  torch.compile, after a one-time self-check; training and CPU runs keep the eager code. One
+  numeric difference: the fused kernel doesn't round the normalized q/k to bf16 before RoPE (one
+  rounding instead of two, as in llama.cpp). Rows are independent, so speculative checks stay
+  exact.
+- Tests: 276 -> 277 CPU (interpreter: kernels vs eager, whole models vs eager and vs the llama.cpp
+  reference, gradients still flow in training) + 1 GPU test (bf16, graphs = eager).
+
+**2026-10-26: mix-150m finished; fused kernels measured.**
+- mix-150m (154.6M params, 23,000 steps, ~3.0B tokens of mix-3b): **val bpb 0.8813**, against
+  0.9514 for mix-100m (-7.4%). Knowledge suite: answer loss 2.803 -> 2.502 plain, 2.112 -> 1.775
+  few-shot; few-shot exact match 14.1% -> 18.2% (facts 27%: most capitals right). Greedy
+  "12 times 12" now gives 144, the first correct arithmetic in the ladder; fibonacci has both
+  base cases right. It still loops after a sentence.
+- Gemma 4 12B decode, warm runs, fused kernels off -> on: eager 8.7 -> 14.4 tok/s, CUDA graph
+  36.5 -> 42.5 (27.4 -> 23.5 ms per token), MTP + graph 72.1 -> 71.5 (no change: the draft
+  chain and the 4-row verify now dominate, ~36.6 ms per pass against llama.cpp's ~25). All modes
+  give exactly the greedy text at 3 guesses per pass.
+- Surprise: the bf16 GPU tests failed, fused vs eager differing by ~15% of the logits. The kernels
+  were right (fp32: 3e-5). The tiny random test model magnifies the one rounding the two paths
+  do differently ~70x over 6 layers. At Gemma's real head size the fused kernel is closer to exact
+  fp32 math (RMS error 0.0017 vs 0.0024). The tests now check bf16 precision on the kernel itself,
+  and the matmul-kernel test keeps the norm kernels fixed so it compares only the matmul.
+- Lesson for benchmarks: a single cold run (graph capture, Triton compiles) under-reports speed
+  by ~25%; always warm up first.

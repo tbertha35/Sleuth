@@ -94,10 +94,15 @@ def test_triton_kernel_on_gpu(tmp_path, monkeypatch):
     pytest.importorskip("triton")
     from test_gemma import IDS, make_gemma_gguf
 
+    from sleuth.forge.model import fused_ops
     from sleuth.forge.model import triton_kernels as tk
     from sleuth.formats import gguf_quants as q
     from sleuth.formats.gguf_model import load_gguf_model
 
+    # SLEUTH_NO_TRITON also switches off the fused norm/RoPE kernels, whose (better)
+    # rounding this tiny random model magnifies ~70x over 6 layers. Keep them off in
+    # both runs, so the only difference is the matmul kernel under test.
+    monkeypatch.setattr(fused_ops, "usable", lambda x: False)
     path = tmp_path / "tiny-q4.gguf"
     make_gemma_gguf(path, quant=q.Q4_0)
     model, _ = load_gguf_model(path, device="cuda", dtype=torch.bfloat16, keep_quantized=True)
@@ -143,3 +148,58 @@ def test_doc_mask_on_gpu(tiny_data, tmp_path, compile_model, kernel):
         flex = m(both, block_mask=doc_block_mask(doc)).logits[:, 12:].float() if kernel == "flex" else masked
     assert (masked - alone).abs().max().item() < 0.1   # bf16: a loose check
     assert (flex - alone).abs().max().item() < 0.1
+
+
+def test_fused_norm_rope_on_gpu(tmp_path, monkeypatch):
+    """On the GPU (the interpreter test can't do bf16): the fused kernels match the
+    eager path in fp32, are at least as precise as it in bf16, and greedy decoding
+    with CUDA graphs still equals plain decoding.
+
+    Why not compare whole bf16 models, fused vs eager? The eager path rounds q/k to
+    bf16 between norm and RoPE, the fused kernel doesn't, and this tiny random model
+    magnifies that one rounding ~70x over 6 layers: two equally valid bf16 results
+    can differ by 15-45% of the logits. So the bf16 check is on the kernel itself."""
+    import sys
+
+    import torch.nn.functional as F
+
+    sys.path.insert(0, "tests")
+    from test_gemma import IDS, make_gemma_gguf
+
+    from sleuth.forge.model import fused_ops
+    from sleuth.forge.model.rope import apply_rope, rope_tables
+    from sleuth.formats import gguf_quants as q
+    from sleuth.formats.gguf_model import load_gguf_model
+
+    # 1. whole model in fp32: the fused path computes the same thing (seen: 3e-5)
+    make_gemma_gguf(tmp_path / "g.gguf", quant=q.Q4_0)
+    x = torch.tensor([IDS], device="cuda")
+    m32, _ = load_gguf_model(tmp_path / "g.gguf", device="cuda", dtype=torch.float32, keep_quantized=True)
+    with torch.no_grad():
+        fused = m32(x).logits.float()
+        assert fused_ops._checked.get(("cuda", 0, torch.float32)) is True
+        monkeypatch.setenv("SLEUTH_NO_TRITON", "1")
+        eager = m32(x).logits.float()
+        monkeypatch.delenv("SLEUTH_NO_TRITON")
+    assert (fused - eager).abs().max() < 1e-3 * eager.abs().max()
+
+    # 2. bf16 at a real head size (Gemma 4: 256): fused is closer to exact fp32 math
+    # than eager, which rounds twice (seen: RMS error 0.0017 vs 0.0024)
+    torch.manual_seed(0)
+    hd, T = 256, 256
+    cos, sin = (t.cuda() for t in rope_tables(hd, T, 1e6))
+    qh = (3 * torch.randn(1, T, 8, hd, device="cuda")).bfloat16().transpose(1, 2)
+    w = (1 + 0.3 * torch.randn(hd, device="cuda")).bfloat16()
+    exact = apply_rope(F.rms_norm(qh.float(), (hd,), w.float(), 1e-6), cos, sin)
+    eager = apply_rope(F.rms_norm(qh.float(), (hd,), w.float(), 1e-6).bfloat16(), cos, sin).float()
+    fused = fused_ops.head_norm_rope(qh, w, 1e-6, cos, sin).float()
+    assert fused_ops._checked.get(("cuda", 0, torch.bfloat16)) is not False
+    rms = lambda t: (t - exact).pow(2).mean().sqrt().item()  # noqa: E731
+    assert rms(fused) <= rms(eager)
+
+    # 3. bf16 decoding: CUDA graphs (fused kernels captured) give the same text
+    m, _ = load_gguf_model(tmp_path / "g.gguf", device="cuda", dtype=torch.bfloat16, keep_quantized=True)
+    greedy = SamplingConfig(temperature=0)
+    a = generate(m, IDS[:5], 20, greedy)
+    b = generate(m, IDS[:5], 20, greedy, cuda_graph=True)
+    assert a.new_ids == b.new_ids

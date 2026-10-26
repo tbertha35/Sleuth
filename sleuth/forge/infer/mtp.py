@@ -325,3 +325,43 @@ class MTPDrafter:
             out.append(int(t))
             tok = t.view(1)
         return out
+
+
+class HeadsDrafter:
+    """The drafter for our own models' MTP heads (forge/model/mtp_heads.py). Guess j
+    comes from head j (the last head again past the number of heads), chained as in
+    training: h_j = head_j(h_{j-1}, embed(previous guess)). The heads keep no cache,
+    so there is nothing to catch up after a check: only the target's hidden state."""
+
+    needs_hidden = True
+
+    def __init__(self, model):
+        if getattr(model, "mtp", None) is None:
+            raise ValueError("this model has no MTP heads (train it with model.mtp_heads > 0)")
+        self.model, self.h = model, None
+        self.vocab = model.cfg.vocab_size or model.cfg.padded_vocab   # never guess a padding row
+
+    def begin(self, target, cache, h_last: torch.Tensor, **_) -> None:
+        self.h = h_last.view(1, -1)
+
+    def after_verify(self, h_row: torch.Tensor, **_) -> None:
+        self.h = h_row.view(1, -1)
+
+    @torch.no_grad()
+    def __call__(self, ids: list[int], k: int) -> list[int]:
+        if k <= 0:
+            return []
+        m = self.model
+        tok = torch.tensor([ids[-1]], device=self.h.device)
+        h, picks = self.h, []
+        for j in range(k):
+            head = m.mtp[min(j, len(m.mtp) - 1)]
+            h = head(h, m.embed(tok).to(h.dtype))
+            tok = m.lm_head(h)[..., :self.vocab].argmax(-1).view(1)
+            picks.append(tok)
+        return torch.cat(picks).tolist()   # one sync for all k guesses
+
+
+def builtin_drafter(model) -> HeadsDrafter | None:
+    """The drafter a model carries itself (our runs trained with MTP heads), if any."""
+    return HeadsDrafter(model) if getattr(model, "mtp", None) is not None else None

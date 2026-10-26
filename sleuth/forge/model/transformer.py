@@ -37,6 +37,7 @@ from .attention import Attention
 from .config import ModelConfig
 from .mlp import make_mlp
 from .moe import ExpertWeights, MoE
+from .mtp_heads import MTPHead, mtp_loss
 from .norm import make_norm
 from .quant import QuantEmbedding, QuantLinear, quantized_modules
 from .rope import rope_tables
@@ -95,6 +96,7 @@ class ModelOutput:
     logits: torch.Tensor                 # [B, T, padded_vocab]
     loss: torch.Tensor | None = None     # mean cross-entropy over targets (nats/token)
     hidden: torch.Tensor | None = None   # [B, T, d_model] after the final norm (return_hidden=True; MTP drafters)
+    mtp_loss: torch.Tensor | None = None  # mean loss of the MTP heads (with targets, if the model has heads)
 
 
 class Transformer(nn.Module):
@@ -107,6 +109,7 @@ class Transformer(nn.Module):
         self.norm_f = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps)
         self.tap_final_norm = Tap()
         self.lm_head = nn.Linear(cfg.d_model, cfg.padded_vocab, bias=False)
+        self.mtp = nn.ModuleList(MTPHead(cfg) for _ in range(cfg.mtp_heads)) if cfg.mtp_heads else None
         if cfg.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
 
@@ -242,6 +245,7 @@ class Transformer(nn.Module):
         if getattr(cache, "static", False):
             # CUDA-graph decoding (infer/kv_cache.py: StaticKVCache): the position is a
             # GPU tensor, so look the RoPE rows up instead of slicing with a Python int.
+            cache.new_step()   # its attention masks are built once per pass, shared by all layers
             pos = cache.positions
             rope = {kind: (getattr(self, f"rope_cos_{kind}").index_select(0, pos),
                            getattr(self, f"rope_sin_{kind}").index_select(0, pos)) for kind in self._rope_kinds()}
@@ -249,10 +253,7 @@ class Transformer(nn.Module):
             rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
                            getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
 
-        x = self.tok_emb(idx)
-        if self.cfg.embed_scale != 1.0:
-            x = x * self.cfg.embed_scale
-        x = self.tap_embed(x)
+        x = self.tap_embed(self.embed(idx))
         for block in self.blocks:
             x = block(x, *rope[block.kind], cache, same_doc)
         if cache is not None:
@@ -260,11 +261,18 @@ class Transformer(nn.Module):
         h = self.tap_final_norm(self.norm_f(x))
         logits = self._softcap(self.lm_head(h))
 
-        loss = None
+        loss = extra = None
         if targets is not None:
             # float32 for the softmax: bf16 log-probs are too coarse for a good loss.
             loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
-        return ModelOutput(logits, loss, h if return_hidden else None)
+            if self.mtp is not None:
+                extra = mtp_loss(self, idx, h, targets)
+        return ModelOutput(logits, loss, h if return_hidden else None, extra)
+
+    def embed(self, idx: torch.Tensor) -> torch.Tensor:
+        """Token ids -> input vectors (the embedding, times embed_scale)."""
+        x = self.tok_emb(idx)
+        return x * self.cfg.embed_scale if self.cfg.embed_scale != 1.0 else x
 
     def _rope_kinds(self) -> list[str]:
         return sorted({b.kind for b in self.blocks})

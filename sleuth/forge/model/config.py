@@ -67,6 +67,9 @@ class ModelConfig:
     expert_hidden: int = 0        # width of each expert's MLP
     expert_gate_up_merged: bool = False   # file layout: one gate_up tensor instead of two
     expert_down_scale: bool = False       # file has a per-expert scale for the down projection
+    # Multi-token prediction heads (mtp_heads.py): head k learns to guess the token k+1 ahead,
+    # for speculative decoding. 0 = none. The loss weight is TrainConfig.mtp_weight.
+    mtp_heads: int = 0
 
     def __post_init__(self):
         if not self.head_size and self.d_model % self.n_heads:

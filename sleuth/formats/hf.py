@@ -220,12 +220,14 @@ def save_hf_model(model: Transformer, out_dir: str | Path, tokenizer=None, max_s
         "attention_bias": cfg.qkv_bias,
         "torch_dtype": "bfloat16",
     }
+    # MTP heads have no place in the Llama format: the export is the plain model.
+    named = [(n, p) for n, p in model.named_parameters() if not n.startswith("mtp.")]
     reverse = {}
-    for name, _ in model.named_parameters():
+    for name, _ in named:
         reverse[name] = _hf_name(name)
     shards: list[dict[str, torch.Tensor]] = [{}]
     size = 0
-    for name, p in model.named_parameters():
+    for name, p in named:
         t = p.detach().to("cpu", torch.bfloat16).contiguous()
         if size and size + t.numel() * 2 > max_shard_bytes:
             shards.append({})

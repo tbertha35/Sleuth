@@ -84,11 +84,16 @@ class StaticKVCache(KVCache):
         # k guesses in one pass): they go to positions pos_t, pos_t+1, ...
         self.tokens_per_step = tokens_per_step
         self._qoff = torch.arange(tokens_per_step, device=device)
+        self._masks: dict[int, torch.Tensor] = {}
+        self._pos: torch.Tensor | None = None
 
     @property
     def positions(self) -> torch.Tensor:
-        """[tokens_per_step] positions of this static step's tokens."""
-        return self.pos_t + self._qoff
+        """[tokens_per_step] positions of this static step's tokens (computed once per
+        forward pass: every layer's K/V write uses them)."""
+        if self._pos is None:
+            self._pos = self.pos_t + self._qoff
+        return self._pos
 
     def update(self, layer, k_new, v_new):
         if not self.static:
@@ -101,13 +106,21 @@ class StaticKVCache(KVCache):
 
     def attn_mask(self, window: int = 0) -> torch.Tensor:
         """[1, 1, T, length] bool, True = may attend: each query sees keys up to its
-        own position (and, in a sliding layer, only the last `window` of them)."""
-        kpos = self._kpos[:self.length][None, :]
-        qpos = self.positions[:, None]
-        mask = kpos <= qpos
-        if window:
-            mask = mask & (qpos - kpos < window)
-        return mask[None, None]
+        own position (and, in a sliding layer, only the last `window` of them).
+        Built once per forward pass for each window and shared by all layers
+        (Gemma 4: 2 masks per step instead of 48); new_step() starts a new pass."""
+        if window not in self._masks:
+            kpos = self._kpos[:self.length][None, :]
+            qpos = self.positions[:, None]
+            mask = kpos <= qpos
+            if window:
+                mask = mask & (qpos - kpos < window)
+            self._masks[window] = mask[None, None]
+        return self._masks[window]
+
+    def new_step(self) -> None:
+        """Called by the model at the start of each forward pass (positions may have moved)."""
+        self._masks, self._pos = {}, None
 
     def advance(self, n):
         if not self.static:  # in static mode the caller moves pos and pos_t

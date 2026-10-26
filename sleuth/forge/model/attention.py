@@ -47,7 +47,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import ModelConfig
-from .norm import RMSNorm
+from .norm import RMSNorm, use_fused
 from .rope import apply_rope
 from .taps import Tap
 
@@ -105,12 +105,24 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(B, T, self.n_heads, self.hd).transpose(1, 2)  # [B, H, T, hd]
         k = self.k_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)     # [B, K, T, hd]
         v = k if self.v_proj is None else self.v_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)
-        if self.q_norm is not None:
-            q, k = self.q_norm(q), self.k_norm(k)
-        if self.v_norm:
-            v = F.rms_norm(v.float(), (self.hd,), None, self.eps).to(v.dtype)
-        if self.use_rope:
-            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if use_fused(q):
+            # Inference on a GPU: norm + RoPE in one kernel per tensor (fused_ops.py).
+            from .fused_ops import head_norm_rope
+
+            rc, rs = (cos, sin) if self.use_rope else (None, None)
+            qn, kn = self.q_norm is not None, self.k_norm is not None
+            if self.v_norm:
+                v = head_norm_rope(v, None, self.eps)
+            if qn or self.use_rope:
+                q = head_norm_rope(q, self.q_norm.weight if qn else None, self.q_norm.eps if qn else 0.0, rc, rs, qn)
+                k = head_norm_rope(k, self.k_norm.weight if kn else None, self.k_norm.eps if kn else 0.0, rc, rs, kn)
+        else:
+            if self.q_norm is not None:
+                q, k = self.q_norm(q), self.k_norm(k)
+            if self.v_norm:
+                v = F.rms_norm(v.float(), (self.hd,), None, self.eps).to(v.dtype)
+            if self.use_rope:
+                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         q, k = self.tap_q(q), self.tap_k(k)
 
         if cache is not None:

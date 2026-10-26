@@ -42,6 +42,7 @@ class TrainConfig:
     doc_mask: bool = False          # attention stops at document boundaries (<|bos|>); see data/loader.py
     doc_mask_kernel: str = "sdpa"   # "sdpa" (boolean mask) | "flex" (FlexAttention; fast only with compile = true)
     compile: bool = False           # torch.compile the model (faster on GPU after a warm-up)
+    mtp_weight: float = 0.3         # loss weight of the MTP heads (model.mtp_heads > 0); DeepSeek-V3 used 0.3 then 0.1
     peak_tflops: float = 0.0        # hardware peak for MFU (from hardware/<host>.json); 0 = don't report
 
 

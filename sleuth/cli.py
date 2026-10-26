@@ -115,8 +115,12 @@ def cmd_info(a):
 def _mtp_drafter(a, model):
     """The MTP drafter for `generate --draft mtp` (loaded once per command)."""
     if getattr(a, "_drafter", None) is None:
-        from .forge.infer.mtp import find_mtp_file, load_drafter
+        from .forge.infer.mtp import builtin_drafter, find_mtp_file, load_drafter
 
+        if not a.draft_model and (own := builtin_drafter(model)) is not None:
+            print(f"[MTP drafter: the model's own {len(model.mtp)} heads]", file=sys.stderr, flush=True)
+            a._drafter = own
+            return own
         path = a.draft_model or find_mtp_file(a.path)
         if path is None:
             sys.exit("--draft mtp: no drafter found next to the model (mtp-*.gguf); give one with --draft-model")
