@@ -49,13 +49,15 @@ def _sync(device: torch.device):
 @torch.no_grad()
 def generate(model, prompt_ids: list[int], max_new_tokens: int = 200, sampling: SamplingConfig | None = None,
              stop_ids: set[int] | None = None, vocab_limit: int | None = None, seed: int | None = None,
-             on_token: Callable[[int], None] | None = None) -> GenerationResult:
+             on_token: Callable[[int], None] | None = None, cuda_graph: bool = False) -> GenerationResult:
     """Generate up to max_new_tokens after prompt_ids (batch size 1).
 
     vocab_limit: only sample from IDs < this. The model's output layer is
     padded past the tokenizer's vocab, and those padding IDs must never be
     sampled.
     on_token: called with each new token as it's produced (for streaming).
+    cuda_graph: replay each decode step as one CUDA graph (cuda_graph.py): far
+    fewer kernel launches, so much faster for big models on a GPU. Needs CUDA.
     """
     sampling = sampling or SamplingConfig()
     stop_ids = stop_ids or set()
@@ -74,8 +76,23 @@ def generate(model, prompt_ids: list[int], max_new_tokens: int = 200, sampling: 
     autocast = (torch.autocast("cuda", dtype=torch.bfloat16)
                 if device.type == "cuda" and p.dtype == torch.float32 else contextlib.nullcontext())
 
-    cache = KVCache.for_model(model, batch=1, max_len=max_len,
-                              dtype=torch.bfloat16 if device.type == "cuda" else p.dtype)
+    decoder = None
+    if cuda_graph:
+        from .cuda_graph import graph_unsupported
+
+        if why := graph_unsupported(model):
+            raise NotImplementedError(why)
+        if device.type != "cuda":
+            raise ValueError("cuda_graph needs a model on a CUDA device")
+        from .cuda_graph import decoder_for
+
+        decoder = decoder_for(model, max_len, autocast)
+        cache = decoder.cache
+    elif hasattr(model, "new_cache"):  # models with their own cache (Qwen3.5: KV + recurrent states)
+        cache = model.new_cache(1, max_len, torch.bfloat16 if device.type == "cuda" else p.dtype)
+    else:
+        cache = KVCache.for_model(model, batch=1, max_len=max_len,
+                                  dtype=torch.bfloat16 if device.type == "cuda" else p.dtype)
     ctx = torch.tensor([prompt_ids], device=device)
     model.eval()
 
@@ -106,12 +123,17 @@ def generate(model, prompt_ids: list[int], max_new_tokens: int = 200, sampling: 
             stop_reason = "context_full"
             break
         ctx = torch.cat([ctx, nxt.view(1, 1)], dim=1)
-        with autocast:
-            logits = model(nxt.view(1, 1), cache=cache).logits[:, -1]
+        if decoder is not None:
+            logits = decoder.step(nxt)  # the graph's output buffer: used before the next step
+        else:
+            with autocast:
+                logits = model(nxt.view(1, 1), cache=cache).logits[:, -1]
     _sync(device)
     t2 = time.perf_counter()
-    return GenerationResult(prompt_ids, new, stop_reason, t1 - t0, t2 - t1,
-                            {"kv_cache_mb": round(cache.nbytes() / 1e6, 2), "device": str(device)})
+    stats = {"kv_cache_mb": round(cache.nbytes() / 1e6, 2), "device": str(device)}
+    if decoder is not None:
+        stats["cuda_graphs"] = sorted(decoder.graphs)  # the cache lengths recorded
+    return GenerationResult(prompt_ids, new, stop_reason, t1 - t0, t2 - t1, stats)
 
 
 def stream_text(tokenizer, ids: Iterator[int]) -> Iterator[str]:

@@ -19,6 +19,13 @@ Tensor names (llama.cpp's convention) -> ours:
     blk.{i}.post_ffw_norm.weight       -> blocks.{i}.post_mlp_norm.weight
     blk.{i}.layer_output_scale.weight  -> blocks.{i}.scale
     rope_freqs.weight                  -> RoPE frequency factors of the full layers
+  Gemma 4 MoE (26B-A4B) adds:
+    blk.{i}.ffn_gate_inp.weight        -> blocks.{i}.moe.router.weight
+    blk.{i}.ffn_gate_inp.scale         -> blocks.{i}.router_scale
+    blk.{i}.ffn_{gate_up,gate,up,down}_exps.weight -> blocks.{i}.moe.{...}.weight (or .raw)
+    blk.{i}.ffn_down_exps.scale        -> blocks.{i}.moe.down_scale
+    blk.{i}.pre_ffw_norm_2 / post_ffw_norm_1 / post_ffw_norm_2 .weight
+                                       -> blocks.{i}.pre_moe_norm / post_mlp_norm1 / post_moe_norm
 
 RoPE layout: for the "llama" architecture, llama.cpp's converter *reorders*
 the rows of the q and k weights from Hugging Face's "rotate half" layout
@@ -57,7 +64,11 @@ NEOX_ROPE = {"qwen2", "qwen3", "gemma4"}  # rotate-half already; no permutation 
 
 QWEN2_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
                  r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
-PRE_PATTERNS = {"qwen2": QWEN2_PATTERN, "llama-bpe": GPT4_PATTERN, "llama3": GPT4_PATTERN,
+# Qwen3.5/3.6: Qwen2's pattern with combining marks (\p{M}) counted as letters
+# (llama.cpp llama-vocab.cpp, LLAMA_VOCAB_PRE_TYPE_QWEN35).
+QWEN35_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+                  r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+PRE_PATTERNS = {"qwen2": QWEN2_PATTERN, "qwen35": QWEN35_PATTERN, "llama-bpe": GPT4_PATTERN, "llama3": GPT4_PATTERN,
                 "gpt-2": GPT2_PATTERN, "default": GPT2_PATTERN}
 
 _LAYER = [
@@ -70,6 +81,13 @@ _LAYER = [
     (r"post_attention_norm\.weight", "post_attn_norm.weight"),
     (r"post_ffw_norm\.weight", "post_mlp_norm.weight"),
     (r"layer_output_scale\.weight", "scale"),
+    (r"ffn_gate_inp\.weight", "moe.router.weight"),
+    (r"ffn_gate_inp\.scale", "router_scale"),
+    (r"ffn_(gate_up|gate|up|down)_exps\.weight", r"moe.\1.weight"),
+    (r"ffn_down_exps\.scale", "moe.down_scale"),
+    (r"pre_ffw_norm_2\.weight", "pre_moe_norm.weight"),
+    (r"post_ffw_norm_1\.weight", "post_mlp_norm1.weight"),
+    (r"post_ffw_norm_2\.weight", "post_moe_norm.weight"),
 ]
 
 
@@ -179,10 +197,12 @@ def gemma4_config(g: GGUFFile, max_seq_len: int = 4096) -> ModelConfig:
       * full layers: no attn_v in the file means values = keys; RoPE divided
         by the factors in rope_freqs.weight
       * MLP: GELU (tanh) gated, like SwiGLU with another activation
+      * MoE (26B-A4B): the dense MLP plus routed experts in every layer (see
+        forge/model/transformer.py and moe.py)
 
     Parts of the format we don't implement raise an error instead of loading a
     subtly wrong model: per-layer embeddings (E2B/E4B), KV sharing across
-    layers, MoE layers (26B-A4B), partial RoPE.
+    layers, partial RoPE.
     """
     L = int(g.arch_value("block_count"))
     d = int(g.arch_value("embedding_length"))
@@ -190,8 +210,12 @@ def gemma4_config(g: GGUFFile, max_seq_len: int = 4096) -> ModelConfig:
         raise NotImplementedError("Gemma 4 per-layer embeddings (E2B/E4B models) aren't supported yet")
     if int(g.arch_value("attention.shared_kv_layers", 0)):
         raise NotImplementedError("Gemma 4 KV sharing between layers isn't supported yet")
-    if any(n.endswith("ffn_gate_inp.weight") for n in g.tensors):
-        raise NotImplementedError("Gemma 4 MoE layers (26B-A4B) aren't supported yet")
+    moe = [f"blk.{i}.ffn_gate_inp.weight" in g.tensors for i in range(L)]
+    if any(moe) and not all(moe):
+        raise NotImplementedError("Gemma 4 with both MoE and dense layers isn't supported yet")
+    if any(n.endswith(("ffn_gate_exps.scale", "ffn_up_exps.scale", "ffn_gate_up_exps.scale")) for n in g.tensors):
+        raise NotImplementedError("per-expert gate/up scales aren't supported yet (only down)")
+    n_experts = int(g.arch_value("expert_count", 0) or 0) if all(moe) else 0
     pattern = _per_layer(g, "attention.sliding_window_pattern", L)
     kinds = ["sliding" if bool(x) else "full" for x in pattern]
     heads = _one_per_kind([int(x) for x in _per_layer(g, "attention.head_count", L)], ["all"] * L, "head_count")["all"]
@@ -236,6 +260,11 @@ def gemma4_config(g: GGUFFile, max_seq_len: int = 4096) -> ModelConfig:
         swa_kv_heads=int(kv.get("sliding", 0)),
         swa_rope_theta=float(g.arch_value("rope.freq_base_swa", 0.0) or 0.0),
         full_v_from_k=not v_kinds.get("full", True),
+        n_experts=n_experts,
+        n_experts_used=int(g.arch_value("expert_used_count", 0) or 0) if n_experts else 0,
+        expert_hidden=int(g.arch_value("expert_feed_forward_length", 0) or 0) if n_experts else 0,
+        expert_gate_up_merged=n_experts > 0 and "blk.0.ffn_gate_up_exps.weight" in g.tensors,
+        expert_down_scale=n_experts > 0 and "blk.0.ffn_down_exps.scale" in g.tensors,
     )
 
 
@@ -276,7 +305,9 @@ def load_gguf_model(path: str | Path, device: str | torch.device = "cpu", dtype:
         if keep_quantized:
             for name, info in g.tensors.items():
                 ours = our_name(name)
-                if (ours and ours.endswith(".weight") and len(info.shape) == 2 and info.ggml_type not in PLAIN_TYPES
+                expert = "_exps." in name                     # [n_experts, out, in]: moe.ExpertWeights
+                if (ours and ours.endswith(".weight") and len(info.shape) == (3 if expert else 2)
+                        and info.ggml_type not in PLAIN_TYPES
                         and not (ours == "lm_head.weight" and cfg.tie_embeddings)):
                     quantized[ours.removesuffix(".weight")] = info.ggml_type
         model = Transformer.empty(cfg, device=device, dtype=dtype, quantized=quantized)
@@ -308,7 +339,7 @@ def load_gguf_model(path: str | Path, device: str | torch.device = "cpu", dtype:
             if tuple(t.shape) != tuple(p.shape):
                 raise ValueError(f"{name}: file shape {tuple(t.shape)} != model shape {tuple(p.shape)}")
             with torch.no_grad():
-                p.copy_(t.to(dtype))
+                p.copy_(t.to(p.dtype))   # = dtype, except MoE routers (kept fp32)
             loaded.add(ours)
         expected = set(params) | {f"{m}.weight" for m in quantized}
         missing = sorted(expected - loaded)

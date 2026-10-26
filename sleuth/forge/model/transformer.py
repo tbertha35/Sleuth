@@ -19,6 +19,9 @@ Gemma-family extras (all off unless the config turns them on):
   * layer_scale: a learned scalar multiplies the whole stream after the block
   * final_softcap: logits = cap · tanh(logits / cap), so no logit exceeds ±cap
   * sliding and full layers use different RoPE tables (see ModelConfig)
+  * MoE (n_experts > 0, Gemma 4 26B-A4B; llama.cpp gemma4.cpp): the MLP output
+    becomes  post_norm_1(MLP(norm2(x))) + post_norm_2(MoE(pre_norm_2(x)))  before
+    post_mlp_norm. The router sees  rms(x) / sqrt(d) * router_scale  (moe.py)
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from torch import nn
 from .attention import Attention
 from .config import ModelConfig
 from .mlp import make_mlp
+from .moe import ExpertWeights, MoE
 from .norm import make_norm
 from .quant import QuantEmbedding, QuantLinear, quantized_modules
 from .rope import rope_tables
@@ -50,6 +54,16 @@ class Block(nn.Module):
         self.post_attn_norm = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps) if cfg.post_norms else None
         self.post_mlp_norm = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps) if cfg.post_norms else None
         self.scale = nn.Parameter(torch.ones(1)) if cfg.layer_scale else None
+        self.moe = None
+        if cfg.n_experts:
+            self.moe = MoE(cfg.d_model, cfg.n_experts, cfg.n_experts_used, cfg.expert_hidden,
+                           act="gelu" if cfg.ffn_type == "geglu" else "silu",
+                           merged_gate_up=cfg.expert_gate_up_merged, down_scale=cfg.expert_down_scale)
+            self.router_scale = nn.Parameter(torch.ones(cfg.d_model))
+            self.post_mlp_norm1 = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps)
+            self.pre_moe_norm = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps)
+            self.post_moe_norm = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps)
+            self.norm_eps = cfg.norm_eps
         self.tap_attn_out = Tap()
         self.tap_resid_mid = Tap()
         self.tap_mlp_out = Tap()
@@ -63,6 +77,11 @@ class Block(nn.Module):
             a = self.post_attn_norm(a)
         x = self.tap_resid_mid(x + self.tap_attn_out(a))
         m = self.mlp(self.norm2(x))
+        if self.moe is not None:
+            # The router reads the stream RMS-normalized without a gain, then scaled per channel.
+            d = x.shape[-1]
+            r = F.rms_norm(x.float(), (d,), eps=self.norm_eps) * (self.router_scale.float() / math.sqrt(d))
+            m = self.post_mlp_norm1(m) + self.post_moe_norm(self.moe(self.pre_moe_norm(x), router_input=r))
         if self.post_mlp_norm is not None:
             m = self.post_mlp_norm(m)
         x = x + self.tap_mlp_out(m)
@@ -75,6 +94,7 @@ class Block(nn.Module):
 class ModelOutput:
     logits: torch.Tensor                 # [B, T, padded_vocab]
     loss: torch.Tensor | None = None     # mean cross-entropy over targets (nats/token)
+    hidden: torch.Tensor | None = None   # [B, T, d_model] after the final norm (return_hidden=True; MTP drafters)
 
 
 class Transformer(nn.Module):
@@ -156,6 +176,10 @@ class Transformer(nn.Module):
             for path, ggml_type in (quantized or {}).items():
                 model._make_quantized(path, ggml_type)
         model = model.to_empty(device=device).to(dtype)  # .to(dtype) leaves the uint8 blocks alone
+        for m in model.modules():
+            if isinstance(m, MoE):
+                m.router.float()      # routing in fp32, as llama.cpp does: bf16 logits can pick other experts
+                m.reset_counts()      # to_empty left it uninitialized
         if cfg.tie_embeddings:  # to_empty creates separate tensors; re-tie them
             if isinstance(model.tok_emb, QuantEmbedding):
                 model.lm_head.raw = model.tok_emb.raw
@@ -178,6 +202,9 @@ class Transformer(nn.Module):
         parent_path, _, attr = path.rpartition(".")
         parent = self.get_submodule(parent_path) if parent_path else self
         old = getattr(parent, attr)
+        if isinstance(old, ExpertWeights):
+            setattr(parent, attr, ExpertWeights(old.n_experts, old.in_features, old.out_features, ggml_type))
+            return
         if not isinstance(old, nn.Linear) or old.bias is not None:
             raise ValueError(f"{path} isn't a bias-free Linear layer; can't keep it quantized")
         setattr(parent, attr, QuantLinear(old.in_features, old.out_features, ggml_type))
@@ -192,7 +219,7 @@ class Transformer(nn.Module):
 
     # ------------------------------------------------------------------ #
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, cache=None,
-                doc_ids: torch.Tensor | None = None, block_mask=None) -> ModelOutput:
+                doc_ids: torch.Tensor | None = None, block_mask=None, return_hidden: bool = False) -> ModelOutput:
         """doc_ids: [B, T] integers, one per position, equal within a document
         (`document_ids` in data/loader.py). Given, a token attends only to
         earlier tokens of its own document ("document masking"); without it, a
@@ -212,8 +239,15 @@ class Transformer(nn.Module):
             same_doc = (doc_ids[:, :, None] == doc_ids[:, None, :])[:, None]  # [B, 1, T, T], shared by all layers
         if offset + T > self.cfg.max_seq_len:
             raise ValueError(f"sequence length {offset + T} exceeds max_seq_len {self.cfg.max_seq_len}")
-        rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
-                       getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
+        if getattr(cache, "static", False):
+            # CUDA-graph decoding (infer/kv_cache.py: StaticKVCache): the position is a
+            # GPU tensor, so look the RoPE rows up instead of slicing with a Python int.
+            pos = cache.positions
+            rope = {kind: (getattr(self, f"rope_cos_{kind}").index_select(0, pos),
+                           getattr(self, f"rope_sin_{kind}").index_select(0, pos)) for kind in self._rope_kinds()}
+        else:
+            rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
+                           getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
 
         x = self.tok_emb(idx)
         if self.cfg.embed_scale != 1.0:
@@ -223,13 +257,14 @@ class Transformer(nn.Module):
             x = block(x, *rope[block.kind], cache, same_doc)
         if cache is not None:
             cache.advance(T)
-        logits = self._softcap(self.lm_head(self.tap_final_norm(self.norm_f(x))))
+        h = self.tap_final_norm(self.norm_f(x))
+        logits = self._softcap(self.lm_head(h))
 
         loss = None
         if targets is not None:
             # float32 for the softmax: bf16 log-probs are too coarse for a good loss.
             loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
-        return ModelOutput(logits, loss)
+        return ModelOutput(logits, loss, h if return_hidden else None)
 
     def _rope_kinds(self) -> list[str]:
         return sorted({b.kind for b in self.blocks})

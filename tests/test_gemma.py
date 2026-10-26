@@ -5,7 +5,8 @@ direct, plain-tensor transcription of llama.cpp's graph for this architecture
 (src/models/gemma4.cpp) that uses none of our model code. The tiny test file
 has the same structure as the real 12B file (`sleuth inspect` output): 5
 sliding layers per full layer, full layers with wider heads, a single KV head
-and no attn_v, rope_freqs, layer_output_scale, Q4_0/Q8_0 weights.
+and no attn_v, rope_freqs, layer_output_scale, Q4_0/Q8_0 weights. With moe=True
+it has the 26B-A4B's MoE layers too (merged gate_up experts, per-expert down scales).
 """
 
 import heapq
@@ -15,7 +16,7 @@ import random
 import pytest
 import torch
 import torch.nn.functional as F
-from helpers import write_gguf
+from helpers import moe_reference, write_gguf
 
 from sleuth.forge.model.quant import QuantEmbedding, QuantLinear
 from sleuth.formats import gguf_quants as q
@@ -151,11 +152,13 @@ D, H, FFN, WINDOW = 64, 4, 96, 3
 PATTERN = [True, True, False, True, True, False]       # True = sliding (5:1 in the real model; 2:1 here)
 HD_FULL, HD_SWA, KV_FULL, KV_SWA = 32, 16, 1, 2
 BASE, BASE_SWA, CAP = 1e6, 1e4, 30.0
+N_EXP, N_USED, EXP_FF = 6, 2, 32                       # MoE: 128 / 8 / 704 in the real 26B-A4B
 
 
-def make_gemma_gguf(path, quant: int | None = None, seed: int = 0):
+def make_gemma_gguf(path, quant: int | None = None, seed: int = 0, moe: bool = False):
     """Write a random tiny Gemma 4 with real-looking metadata. Norm gains around 1,
-    like real ones; weights scaled so activations stay sensible."""
+    like real ones; weights scaled so activations stay sensible. quant also applies
+    to the experts (not the router: F32 in the real file)."""
     g = torch.Generator().manual_seed(seed)
     tokens, types = tiny_vocab()
     V = len(tokens)
@@ -188,9 +191,17 @@ def make_gemma_gguf(path, quant: int | None = None, seed: int = 0):
         T[b + "ffn_down.weight"] = rnd(D, FFN)
         T[b + "post_ffw_norm.weight"] = gain(D)
         T[b + "layer_output_scale.weight"] = torch.tensor([0.5 + 0.1 * i])
+        if moe:
+            T[b + "ffn_gate_inp.weight"] = rnd(N_EXP, D, std=0.5)
+            T[b + "ffn_gate_inp.scale"] = gain(D)
+            T[b + "ffn_gate_up_exps.weight"] = rnd(N_EXP, 2 * EXP_FF, D)
+            T[b + "ffn_down_exps.weight"] = rnd(N_EXP, D, EXP_FF)
+            T[b + "ffn_down_exps.scale"] = 0.5 + torch.rand(N_EXP, generator=g)
+            for n in ("pre_ffw_norm_2", "post_ffw_norm_1", "post_ffw_norm_2"):
+                T[b + n + ".weight"] = gain(D)
     tensors = {}
     for name, t in T.items():
-        if quant is not None and t.ndim == 2:
+        if quant is not None and t.ndim in (2, 3) and "ffn_gate_inp" not in name:
             tensors[name] = (quant, tuple(t.shape), bytes(q.quantize(t, quant).numpy()))
         else:
             tensors[name] = (q.F32, tuple(t.shape), t.float().numpy().tobytes())
@@ -218,6 +229,8 @@ def make_gemma_gguf(path, quant: int | None = None, seed: int = 0):
         f"{a}.attention.value_length_swa": (4, HD_SWA),
         f"{a}.rope.dimension_count": (4, HD_FULL),
         f"{a}.rope.dimension_count_swa": (4, HD_SWA),
+        **({f"{a}.expert_count": (4, N_EXP), f"{a}.expert_used_count": (4, N_USED),
+            f"{a}.expert_feed_forward_length": (4, EXP_FF)} if moe else {}),
         "tokenizer.ggml.model": (8, "gemma4"),
         "tokenizer.ggml.tokens": (9, (8, tokens)),
         "tokenizer.ggml.token_type": (9, (5, types)),
@@ -289,6 +302,16 @@ def reference_forward(path, ids: list[int]) -> torch.Tensor:
         cur = rms(attn_out, W[b + "ffn_norm.weight"], eps)
         gate = F.gelu(cur @ W[b + "ffn_gate.weight"].T, approximate="tanh")   # LLM_FFN_GELU, LLM_FFN_PAR
         cur = (gate * (cur @ W[b + "ffn_up.weight"].T)) @ W[b + "ffn_down.weight"].T
+        if b + "ffn_gate_inp.weight" in W:            # MoE layer (gemma4.cpp, is_moe_layer)
+            cur = rms(cur, W[b + "post_ffw_norm_1.weight"], eps)          # the dense MLP = shared expert
+            moe_in = rms(attn_out, W[b + "pre_ffw_norm_2.weight"], eps)
+            r = rms(attn_out, None, eps) / math.sqrt(d) * W[b + "ffn_gate_inp.scale"]   # router on attn_out
+            gu = W[b + "ffn_gate_up_exps.weight"]
+            h = gu.shape[1] // 2                                             # gate first, then up
+            routed = moe_reference(moe_in, r @ W[b + "ffn_gate_inp.weight"].T, md[f"{a}.expert_used_count"],
+                                   gu[:, :h], gu[:, h:], W[b + "ffn_down_exps.weight"],
+                                   lambda z: F.gelu(z, approximate="tanh"), W[b + "ffn_down_exps.scale"])
+            cur = cur + rms(routed, W[b + "post_ffw_norm_2.weight"], eps)
         cur = rms(cur, W[b + "post_ffw_norm.weight"], eps) + attn_out
         x = cur * W[b + "layer_output_scale.weight"]
     x = rms(x, W["output_norm.weight"], eps)
@@ -342,6 +365,45 @@ def test_kept_quantized_equals_dequantized(tmp_path, quant):
     # memory: the quantized model holds bytes, not floats
     qbytes = sum(b.numel() * b.element_size() for b in quantized.buffers() if b.dtype == torch.uint8)
     assert qbytes < 0.4 * sum(p.numel() * 4 for p in dense.parameters())
+
+
+@pytest.mark.parametrize("quant", [None, q.Q8_0])
+def test_moe_matches_llama_cpp_graph(tmp_path, quant):
+    """Gemma 4 MoE (26B-A4B layout), plain or with experts kept quantized."""
+    from sleuth.forge.model.moe import MoE
+
+    path = tmp_path / "tiny-moe.gguf"
+    make_gemma_gguf(path, quant=quant, moe=True)
+    model, info = load_gguf_model(path, dtype=torch.float32, keep_quantized=quant is not None)
+    assert info["n_unused"] == 0, info["unused_tensors"]
+    c = model.cfg
+    assert (c.n_experts, c.n_experts_used, c.expert_hidden) == (N_EXP, N_USED, EXP_FF)
+    assert c.expert_gate_up_merged and c.expert_down_scale and not c.llama_compatible
+    moes = [m for m in model.modules() if isinstance(m, MoE)]
+    assert len(moes) == len(PATTERN) and moes[0].router.weight.dtype == torch.float32
+    assert (moes[0].gate_up.ggml_type is None) == (quant is None)
+    ours = model(torch.tensor([IDS])).logits[0].double()
+    torch.testing.assert_close(ours, reference_forward(path, IDS), atol=2e-4, rtol=1e-4)
+    assert int(moes[0].counts.sum()) == len(IDS) * N_USED and (moes[0].counts > 0).sum() > N_USED
+    if quant is not None:
+        dense, _ = load_gguf_model(path, dtype=torch.float32, keep_quantized=False)
+        assert dense.num_params() == model.num_params()
+
+
+def test_moe_generation_with_kv_cache(tmp_path):
+    from sleuth.forge.infer.cuda_graph import graph_unsupported
+    from sleuth.forge.infer.generate import generate
+    from sleuth.forge.infer.sampling import SamplingConfig
+
+    path = tmp_path / "tiny-moe.gguf"
+    make_gemma_gguf(path, quant=q.Q4_0, moe=True)
+    model, _ = load_gguf_model(path, dtype=torch.float32, keep_quantized=True)
+    assert "MoE" in graph_unsupported(model)
+    res = generate(model, IDS[:5], max_new_tokens=10, sampling=SamplingConfig(temperature=0.0))
+    ids = IDS[:5]
+    for t in res.new_ids:
+        assert t == int(model(torch.tensor([ids])).logits[0, -1].argmax())
+        ids = ids + [t]
 
 
 def test_quantized_generation_with_kv_cache(tmp_path):

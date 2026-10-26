@@ -34,7 +34,38 @@ from typing import Iterable
 
 LETTER = r"[^\W\d_]"     # word characters that aren't digits or underscore
 NUMBER = r"\d"
-_CLASS_OF = {"L": LETTER, "N": NUMBER}
+
+
+@lru_cache(maxsize=1)
+def _mark_class() -> str:
+    """\\p{M} (combining marks: Mn, Mc, Me) as an explicit Python re class. Python's
+    re has no Unicode-category syntax, and \\w doesn't cover most marks; Qwen3.5's
+    pre-tokenizer ([\\p{L}\\p{M}]+) needs them, e.g. for Devanagari or accents
+    written as a separate combining character."""
+    ranges, start, prev = [], None, None
+    for cp in range(0x110000):
+        if unicodedata.category(chr(cp)).startswith("M"):
+            if start is None:
+                start = cp
+            prev = cp
+        elif start is not None:
+            ranges.append((start, prev))
+            start = None
+    def esc(cp):
+        return f"\\U{cp:08x}"
+    return "[" + "".join(esc(a) if a == b else f"{esc(a)}-{esc(b)}" for a, b in ranges) + "]"
+
+
+class _Classes(dict):
+    """{"L": ..., "N": ..., "M": ...}; the mark class is built only when a regex uses it."""
+    def __missing__(self, key):
+        if key == "M":
+            self["M"] = _mark_class()
+            return self["M"]
+        raise KeyError(key)
+
+
+_CLASS_OF = _Classes({"L": LETTER, "N": NUMBER})
 _EXCLUDE_ANY = {frozenset("L"): LETTER, frozenset("N"): NUMBER, frozenset("LN"): r"[^\W_]"}
 
 
@@ -62,9 +93,10 @@ def translate_regex(pattern: str) -> str:
 
 
 def _unicode_class(name: str) -> str:
-    if name not in _CLASS_OF:
-        raise ValueError(f"unsupported Unicode class \\p{{{name}}} in tokenizer regex")
-    return _CLASS_OF[name]
+    try:
+        return _CLASS_OF[name]
+    except KeyError:
+        raise ValueError(f"unsupported Unicode class \\p{{{name}}} in tokenizer regex") from None
 
 
 def _read_class(p: str, start: int) -> tuple[int, str, bool]:
@@ -92,7 +124,8 @@ def _rewrite_class(body: str, negated: bool) -> str:
         parts = ([f"[{rest}]"] if rest else []) + [_CLASS_OF[k] for k in sorted(props)]
         return "(?:" + "|".join(parts) + ")"
     # [^ rest \p{...}]: any character that is not in `rest` and not in the classes.
-    excluded = _EXCLUDE_ANY[frozenset(props)]
+    key = frozenset(props)
+    excluded = _EXCLUDE_ANY.get(key) or "(?:" + "|".join(_CLASS_OF[k] for k in sorted(props)) + ")"
     base = f"[^{rest}]" if rest else r"[\s\S]"
     return f"(?:(?!{excluded}){base})"
 

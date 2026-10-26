@@ -40,12 +40,19 @@ class Loaded:
     device: object
     load_seconds: float
     chat_format: str | None
+    drafter: object = None   # the MTP drafter, loaded on first use (speculative = "mtp")
+
+    def mtp_file(self):
+        from ..forge.infer.mtp import find_mtp_file
+
+        return find_mtp_file(self.key[0])
 
     def public(self) -> dict:
+        mtp = self.mtp_file()
         return {"label": self.label, "device": str(self.device), "format": self.meta.get("format"),
                 "step": self.meta.get("step"), "params": self.model.num_params(),
                 "load_seconds": round(self.load_seconds, 1), "chat_format": self.chat_format,
-                "kept_quantized": self.meta.get("kept_quantized")}
+                "kept_quantized": self.meta.get("kept_quantized"), "mtp": mtp.name if mtp else None}
 
 
 def _num(body: dict, key: str, default, kind=float, lo=None, hi=None):
@@ -112,6 +119,7 @@ class Playground:
 
         from ..cli import _dtype
         from ..formats.chat import chat_format
+        from ..forge.infer.cuda_graph import graph_unsupported
         from ..forge.infer.generate import generate
         from ..models import load_any
 
@@ -137,6 +145,8 @@ class Playground:
             # Same warm-up as `sleuth generate`: a throwaway 2-token generation,
             # so the first real request's speed isn't skewed by one-time setup.
             generate(model, [tok.start_id] * 8, 2, seed=0)
+            if torch.device(device).type == "cuda" and graph_unsupported(model) is None:
+                generate(model, [tok.start_id] * 8, 2, seed=0, cuda_graph=True)  # records the first graph
         except Exception:
             if not any(str(k[2]).startswith("cuda") for k in self.models):
                 self.jobs.release_gpu("playground")
@@ -226,6 +236,7 @@ class Playground:
         import torch
 
         from ..cli import _stop_ids
+        from ..forge.infer.cuda_graph import graph_unsupported
         from ..forge.infer.generate import generate
 
         if not self.lock.acquire(timeout=0.1):
@@ -252,14 +263,43 @@ class Playground:
             if m.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(m.device)
             self.busy = f"generating with {m.label}"
-            res = generate(m.model, ids, max_new, sampling, stop_ids=stops, vocab_limit=m.tok.vocab_size,
-                           seed=seed, on_token=on_token)
+            # CUDA graphs (forge/infer/cuda_graph.py): one launch per token, same tokens.
+            use_graph = (m.device.type == "cuda" and body.get("cuda_graph", True) is not False
+                         and graph_unsupported(m.model) is None)   # Qwen3.5, MoE: not yet
+            # Speculative decoding (forge/infer/speculative.py): same text, fewer passes.
+            spec = body.get("speculative") or "off"
+            if spec not in ("off", "ngram", "mtp"):
+                raise JobError("speculative: off, ngram or mtp")
+            if spec == "off":
+                res = generate(m.model, ids, max_new, sampling, stop_ids=stops, vocab_limit=m.tok.vocab_size,
+                               seed=seed, on_token=on_token, cuda_graph=use_graph)
+            else:
+                from ..forge.infer.speculative import ngram_draft, speculative_generate
+
+                if spec == "mtp":
+                    if m.drafter is None:
+                        from ..forge.infer.mtp import load_drafter
+
+                        path = m.mtp_file()
+                        if path is None:
+                            raise JobError(f"{m.label} has no MTP drafter next to it (mtp-*.gguf in the same folder)")
+                        emit("status", {"text": f"loading the MTP drafter {path.name}…"})
+                        m.drafter = load_drafter(path, m.model)
+                    drafter = m.drafter
+                else:
+                    drafter = ngram_draft()
+                res = speculative_generate(m.model, ids, max_new, sampling, draft=drafter,
+                                           k=_num(body, "draft_k", 3, int, 1, 16), stop_ids=stops,
+                                           vocab_limit=m.tok.vocab_size, seed=seed, on_token=on_token,
+                                           cuda_graph=use_graph)
             tail = decoder.decode(b"", final=True)
             if tail:
                 emit("token", {"text": tail})
             stats = {"model": m.label, "tokens": len(res.new_ids), "stop_reason": res.stop_reason,
                      "prompt_tokens": len(ids), "prompt_ms": round(res.prefill_seconds * 1000),
-                     "tok_per_s": round(res.decode_tok_per_s, 1)}
+                     "tok_per_s": round(res.decode_tok_per_s, 1), "cuda_graph": use_graph}
+            if "speculative" in res.stats:
+                stats["speculative"] = {"mode": spec, **res.stats["speculative"]}
             if m.device.type == "cuda":
                 stats["peak_gb"] = round(torch.cuda.max_memory_allocated(m.device) / 2**30, 2)
             emit("done", stats)

@@ -63,8 +63,17 @@ def load_any(path: str | Path, device: str | torch.device = "cpu", dtype: torch.
 
         model, info = load_hf_model(path, device=device, dtype=dtype or default_dtype(device), max_seq_len=max_seq_len)
         return model, HFTokenizer.load(path), info
+    from .formats.gguf import GGUFFile
     from .formats.gguf_model import load_gguf_model, tokenizer_from_gguf
 
+    with GGUFFile(path) as g:
+        arch = g.architecture
+    if arch in ("qwen35", "qwen35moe"):  # hybrid DeltaNet + attention: its own model class (formats/qwen35.py)
+        from .formats.qwen35 import load_qwen35
+
+        model, info = load_qwen35(path, device=device, dtype=dtype or default_dtype(device), max_seq_len=max_seq_len,
+                                  keep_quantized=keep_quantized)
+        return model, tokenizer_from_gguf(path), info
     model, info = load_gguf_model(path, device=device, dtype=dtype or default_dtype(device), max_seq_len=max_seq_len,
                                   keep_quantized=keep_quantized)
     return model, tokenizer_from_gguf(path), info

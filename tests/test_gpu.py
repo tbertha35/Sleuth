@@ -5,6 +5,8 @@ AdamW, CUDA timing, the bf16 KV cache, and the attention kernels this
 PyTorch build picks for your GPU.
 """
 
+import dataclasses
+
 import pytest
 import torch
 from helpers import tiny_run_config
@@ -123,8 +125,11 @@ def test_doc_mask_on_gpu(tiny_data, tmp_path, compile_model, kernel):
 
     if kernel == "flex" and not compile_model:
         pytest.skip("FlexAttention without compile is only the slow reference version (CPU-tested)")
-    train(tiny_run_config(tiny_data, tmp_path, device="cuda", max_steps=4, doc_mask=True, compile=compile_model,
-                          doc_mask_kernel=kernel), log=lambda s: None)
+    cfg = tiny_run_config(tiny_data, tmp_path, device="cuda", max_steps=4, doc_mask=True, compile=compile_model,
+                          doc_mask_kernel=kernel)
+    # Compiled FlexAttention needs heads >= 16 wide; the tiny config has 8.
+    cfg.model = dataclasses.replace(cfg.model, d_model=64)
+    train(cfg, log=lambda s: None)
     torch.manual_seed(0)
     m = Transformer(ModelConfig(vocab_size=300, d_model=128, n_layers=2, n_heads=4, n_kv_heads=2,
                                 max_seq_len=64)).cuda().eval()

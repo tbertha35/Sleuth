@@ -28,6 +28,19 @@ export function initPlayground() {
   for (const [id, label, def, step, help] of SETTINGS) {
     box.append(labeled(label, el("input", { type: "number", id: `ps-${id}`, value: def, step, min: 0 }), help));
   }
+  box.append(el("label", { class: "check", title: "GPU only: replay each decode step as one CUDA graph " +
+    "(far fewer kernel launches, so much faster; the same tokens). Untick to compare." },
+    el("input", { type: "checkbox", id: "ps-cuda_graph", checked: true }), " CUDA graphs"));
+  const spec = el("select", { id: "ps-speculative" },
+    el("option", { value: "off", text: "off" }),
+    el("option", { value: "ngram", text: "n-gram (prompt lookup)" }),
+    el("option", { value: "mtp", text: "MTP drafter" }));
+  box.append(labeled("Speculative", spec, "guess tokens cheaply and check them in one pass: same text, fewer passes. " +
+    "n-gram: copies from earlier in the text (code, quotes, lists). MTP: the model's own drafter " +
+    "(Gemma 4: mtp-*.gguf next to the model file)"));
+  box.append(labeled("Guesses per step", el("input", { type: "number", id: "ps-draft_k", value: 3, step: 1, min: 1, max: 16 }),
+    "speculative decoding: how many tokens to guess per check. 3 keeps quantized models bit-identical to " +
+    "normal decoding; more can flip near-ties"));
   for (const slot of [0, 1]) {
     $(`pm-model-${slot}`).addEventListener("change", guarded(setStatus, () => { syncPick(slot); return loadSteps(slot); }));
     // The text box's suggestion list only shows runs matching what's already
@@ -122,6 +135,9 @@ function settings() {
     const v = $(`ps-${id}`).value;
     if (v !== "") out[id] = Number(v);
   }
+  out.cuda_graph = $("ps-cuda_graph").checked;
+  out.speculative = $("ps-speculative").value;
+  out.draft_k = Number($("ps-draft_k").value) || 3;
   return out;
 }
 
@@ -187,7 +203,10 @@ async function generateInto(slot, ctrl) {
 
 function statsText(d) {
   return `${d.model}: ${d.tokens} tokens (${d.stop_reason.replace(/_/g, " ")}), prompt ${d.prompt_tokens} tokens in ` +
-    `${d.prompt_ms} ms, ${d.tok_per_s} tok/s` + (d.peak_gb !== undefined ? `, peak GPU memory ${d.peak_gb} GiB` : "");
+    `${d.prompt_ms} ms, ${d.tok_per_s} tok/s` + (d.cuda_graph ? " (CUDA graphs)" : "") +
+    (d.speculative ? `, speculative ${d.speculative.mode}: ${d.speculative.accepted}/${d.speculative.drafted} ` +
+      `guesses accepted, ${d.speculative.tokens_per_forward} tokens per pass` : "") +
+    (d.peak_gb !== undefined ? `, peak GPU memory ${d.peak_gb} GiB` : "");
 }
 
 // ------------------------------------------------------------------ output

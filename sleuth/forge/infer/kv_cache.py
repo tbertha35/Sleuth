@@ -59,3 +59,56 @@ class KVCache:
 
     def nbytes(self) -> int:
         return sum(2 * k.numel() * k.element_size() for k in self.k)
+
+
+class StaticKVCache(KVCache):
+    """A KVCache that one-token decode steps can use inside a CUDA graph.
+
+    A CUDA graph replays the exact same kernels on the exact same memory, so
+    nothing a decode step does may depend on a Python number that changes every
+    token. Here the position lives in a GPU tensor (`pos_t`): the new K/V are
+    written at that index, RoPE rows are looked up with it, and attention reads
+    a fixed-length view of the cache (`length`, set per graph) with everything
+    past `pos_t` masked out.
+
+    Outside `static` mode (the prompt's prefill) it behaves like KVCache.
+    """
+
+    def __init__(self, shapes, batch, max_len, device, dtype, tokens_per_step: int = 1):
+        super().__init__(shapes, batch, max_len, device, dtype)
+        self.static = False
+        self.length = max_len                 # how much of the cache attention reads in static mode
+        self.pos_t = torch.zeros(1, dtype=torch.long, device=device)
+        self._kpos = torch.arange(max_len, device=device)
+        # Static steps may take several tokens at once (speculative decoding checks
+        # k guesses in one pass): they go to positions pos_t, pos_t+1, ...
+        self.tokens_per_step = tokens_per_step
+        self._qoff = torch.arange(tokens_per_step, device=device)
+
+    @property
+    def positions(self) -> torch.Tensor:
+        """[tokens_per_step] positions of this static step's tokens."""
+        return self.pos_t + self._qoff
+
+    def update(self, layer, k_new, v_new):
+        if not self.static:
+            return super().update(layer, k_new, v_new)
+        # Write at pos_t (and the positions after it) without leaving the GPU.
+        pos = self.positions
+        self.k[layer].index_copy_(2, pos, k_new.to(self.k[layer].dtype))
+        self.v[layer].index_copy_(2, pos, v_new.to(self.v[layer].dtype))
+        return self.k[layer][:, :, :self.length], self.v[layer][:, :, :self.length]
+
+    def attn_mask(self, window: int = 0) -> torch.Tensor:
+        """[1, 1, T, length] bool, True = may attend: each query sees keys up to its
+        own position (and, in a sliding layer, only the last `window` of them)."""
+        kpos = self._kpos[:self.length][None, :]
+        qpos = self.positions[:, None]
+        mask = kpos <= qpos
+        if window:
+            mask = mask & (qpos - kpos < window)
+        return mask[None, None]
+
+    def advance(self, n):
+        if not self.static:  # in static mode the caller moves pos and pos_t
+            super().advance(n)

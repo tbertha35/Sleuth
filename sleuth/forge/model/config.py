@@ -60,6 +60,13 @@ class ModelConfig:
     swa_kv_heads: int = 0
     swa_rope_theta: float = 0.0
     full_v_from_k: bool = False   # full layers have no v_proj: values are the (unnormalized) keys (Gemma 4)
+    # Mixture of experts, Gemma 4 26B-A4B style (see moe.py and Block): every layer keeps its
+    # dense MLP and adds routed experts next to it. 0 experts = dense.
+    n_experts: int = 0
+    n_experts_used: int = 0       # experts chosen per token
+    expert_hidden: int = 0        # width of each expert's MLP
+    expert_gate_up_merged: bool = False   # file layout: one gate_up tensor instead of two
+    expert_down_scale: bool = False       # file has a per-expert scale for the down projection
 
     def __post_init__(self):
         if not self.head_size and self.d_model % self.n_heads:
@@ -77,6 +84,8 @@ class ModelConfig:
                 raise ValueError(f"n_heads ({self.n_heads}) must be a multiple of the KV heads ({spec.kv_heads})")
             if spec.head_dim % 2 and self.pos_type == "rope":
                 raise ValueError("RoPE needs an even head_dim")
+        if self.n_experts and not (0 < self.n_experts_used <= self.n_experts and self.expert_hidden > 0):
+            raise ValueError("MoE needs 0 < n_experts_used <= n_experts and expert_hidden > 0")
         for name, val, ok in (("ffn_type", self.ffn_type, ("swiglu", "geglu", "gelu")),
                               ("norm_type", self.norm_type, ("rmsnorm", "layernorm")),
                               ("pos_type", self.pos_type, ("rope", "none"))):
@@ -115,7 +124,7 @@ class ModelConfig:
         return (self.ffn_type == "swiglu" and self.norm_type == "rmsnorm" and self.pos_type == "rope"
                 and not self.bias and self.embed_scale == 1.0 and not self.post_norms and not self.v_norm
                 and not self.attn_scale and not self.final_softcap and not self.layer_scale
-                and "sliding" not in self.layer_types and not self.full_v_from_k)
+                and "sliding" not in self.layer_types and not self.full_v_from_k and not self.n_experts)
 
     @property
     def padded_vocab(self) -> int:

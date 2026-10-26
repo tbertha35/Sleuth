@@ -141,6 +141,21 @@ def test_playground_generate_streams_tokens(env):
     assert state["gpu_holder"] is None  # a CPU model doesn't take the GPU lane
 
 
+def test_playground_speculative(env):
+    """speculative = "ngram": the same streamed text as plain decoding, with acceptance stats."""
+    model = {"model": env["run"].name, "device": "cpu"}
+    body = {"model": model, "mode": "text", "prompt": "one two one two one two", "max_new_tokens": 16,
+            "temperature": 0}
+    plain = events(call(env["url"] + "/api/playground/generate", body)[1])
+    spec = events(call(env["url"] + "/api/playground/generate", {**body, "speculative": "ngram", "draft_k": 3})[1])
+    text = lambda ev: "".join(d["text"] for e, d in ev if e == "token")  # noqa: E731
+    assert text(spec) == text(plain)
+    done = spec[-1][1]
+    assert spec[-1][0] == "done" and done["speculative"]["mode"] == "ngram" and "tokens_per_forward" in done["speculative"]
+    bad = events(call(env["url"] + "/api/playground/generate", {**body, "speculative": "mtp"})[1])
+    assert bad[-1][0] == "error" and "MTP drafter" in bad[-1][1]["error"]  # a run has no mtp-*.gguf
+
+
 def test_playground_next_tokens(env):
     _, raw = call(env["url"] + "/api/playground/next",
                   {"model": {"model": env["run"].name, "device": "cpu"}, "prompt": "Once upon a", "top": 5})

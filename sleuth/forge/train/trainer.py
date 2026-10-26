@@ -207,6 +207,12 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     # attention stops at every <|bos|> (see data/loader.py: document_ids).
     mask_bos = tokenizer.bos_id if tc.doc_mask else None
     use_flex = tc.doc_mask and tc.doc_mask_kernel == "flex"
+    if use_flex and compile_model and cfg.model.head_dim < 16:
+        # Compiled FlexAttention needs heads at least 16 wide (Inductor: "NYI: embedding
+        # dimension ... must be at least 16"). Tiny test models have 8.
+        log(f"warning: doc_mask_kernel = 'flex' needs head size >= 16 under torch.compile "
+            f"(this model has {cfg.model.head_dim}); using 'sdpa' instead")
+        use_flex = False
     if use_flex and not compile_model:
         log("warning: doc_mask_kernel = 'flex' without torch.compile runs FlexAttention's slow reference "
             "version; set compile = true (or use 'sdpa')")

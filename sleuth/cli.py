@@ -112,6 +112,19 @@ def cmd_info(a):
           f"non-embedding param, {train_flops_per_token(cfg.model, tc.seq_len) * tokens:.2e} FLOPs")
 
 
+def _mtp_drafter(a, model):
+    """The MTP drafter for `generate --draft mtp` (loaded once per command)."""
+    if getattr(a, "_drafter", None) is None:
+        from .forge.infer.mtp import find_mtp_file, load_drafter
+
+        path = a.draft_model or find_mtp_file(a.path)
+        if path is None:
+            sys.exit("--draft mtp: no drafter found next to the model (mtp-*.gguf); give one with --draft-model")
+        print(f"[MTP drafter: {Path(path).name}]", file=sys.stderr, flush=True)
+        a._drafter = load_drafter(path, model, p_min=a.draft_p_min)
+    return a._drafter
+
+
 def cmd_generate(a):
     import codecs
 
@@ -142,7 +155,17 @@ def cmd_generate(a):
     # thread pools and buffers). A throwaway 2-token generation exercises the
     # whole path, so the first real sample's speed reading isn't distorted.
     # (Warming up only the forward pass, as before, left the sampling path cold.)
-    generate(model, [tok.start_id] * 8, 2, sampling, seed=0)
+    cuda_graph = bool(a.cuda_graph)
+    if cuda_graph and device.type != "cuda":
+        print("note: --cuda-graph needs a GPU; decoding normally", file=sys.stderr)
+        cuda_graph = False
+    if cuda_graph:
+        from .forge.infer.cuda_graph import graph_unsupported
+
+        if why := graph_unsupported(model):
+            print(f"note: {why}; decoding normally", file=sys.stderr)
+            cuda_graph = False
+    generate(model, [tok.start_id] * 8, 2, sampling, seed=0, cuda_graph=cuda_graph)
     stops = _stop_ids(tok)
     for i in range(a.samples):
         prompt_ids = _prompt_ids(tok, a)
@@ -156,15 +179,30 @@ def cmd_generate(a):
             if t not in stops:
                 print(decoder.decode(tok.decode_bytes([t])), end="", flush=True)
 
-        res = generate(model, prompt_ids, a.max_new_tokens, sampling, stop_ids=stops,
-                       vocab_limit=tok.vocab_size, seed=None if a.seed is None else a.seed + i,
-                       on_token=on_token)
+        seed = None if a.seed is None else a.seed + i
+        if a.draft in ("ngram", "mtp"):
+            from .forge.infer.speculative import ngram_draft, speculative_generate
+
+            if a.draft == "mtp":
+                drafter = _mtp_drafter(a, model)
+            else:
+                drafter = ngram_draft()
+            res = speculative_generate(model, prompt_ids, a.max_new_tokens, sampling, draft=drafter,
+                                       k=a.draft_k, stop_ids=stops, vocab_limit=tok.vocab_size, seed=seed,
+                                       on_token=on_token, cuda_graph=cuda_graph)
+        else:
+            res = generate(model, prompt_ids, a.max_new_tokens, sampling, stop_ids=stops,
+                           vocab_limit=tok.vocab_size, seed=seed, on_token=on_token, cuda_graph=cuda_graph)
         print(decoder.decode(b"", final=True), flush=True)
         mem = ""
         if device.type == "cuda":
             import torch
 
             mem = f", peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB"
+        spec = res.stats.get("speculative")
+        if spec:
+            mem += (f", speculative: {spec['accepted']}/{spec['drafted']} guesses accepted, "
+                    f"{spec['tokens_per_forward']} tokens per forward")
         print(f"[{len(res.new_ids)} tokens, stop: {res.stop_reason}, prompt {len(prompt_ids)} tokens in "
               f"{res.prefill_seconds * 1000:.0f} ms, decode {res.decode_tok_per_s:,.1f} tok/s{mem}]",
               file=sys.stderr, flush=True)
@@ -663,6 +701,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--samples", type=int, default=1)
     s.add_argument("--device", default="auto")
     s.add_argument("--tokenizer", default=None)
+    s.add_argument("--cuda-graph", action="store_true",
+                   help="GPU: replay each decode step as one CUDA graph (far fewer kernel launches; "
+                        "much faster decoding, same tokens)")
+    s.add_argument("--draft", choices=["none", "ngram", "mtp"], default="none",
+                   help="speculative decoding: guess tokens cheaply, check the guesses in one forward pass (same "
+                        "output). 'ngram': find the last few tokens earlier in the text (prompt lookup). 'mtp': the "
+                        "model's multi-token-prediction drafter (Gemma 4: mtp-*.gguf next to the model)")
+    s.add_argument("--draft-k", type=int, default=3,
+                   help="guesses per forward pass (speculative decoding). 3 keeps each check at 4 tokens, which "
+                        "quantized models run on the same kernel as normal decoding, so the text is bit-identical; "
+                        "more can flip near-ties (round 7: Gemma 4 12B diverged at a 0.125-logit tie with 4)")
+    s.add_argument("--draft-model", default=None, help="--draft mtp: the drafter file (default: mtp-*.gguf next to the model)")
+    s.add_argument("--draft-p-min", type=float, default=0.0,
+                   help="--draft mtp: stop guessing when the drafter's top probability is below this")
     _add_keep_quantized(s)
     _add_chat_args(s)
     s.set_defaults(fn=cmd_generate)

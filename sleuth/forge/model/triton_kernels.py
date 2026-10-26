@@ -94,48 +94,71 @@ if triton is not None:
 
 
     @triton.jit
-    def _qgemv_kernel(x_ptr, w_ptr, y_ptr, N, K, stride_xm, stride_ym, row_bytes,
-                      QTYPE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCKS: tl.constexpr):
-        """Few-row version (decoding: one token at a time). Program (pid_n, m)
-        computes BLOCK_N outputs of row m. Works block-structured: each 32-value
-        block's scale is loaded once, and its bytes as one contiguous run, then
-        everything is multiplied and summed in fp32 (no tensor cores: with one
-        row of x there is nothing for them to do; memory speed is the limit)."""
+    def _qgemv4_kernel(x_ptr, w_ptr, y_ptr, M, N, K, stride_xm, stride_ym, row_bytes,
+                       QTYPE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCKS: tl.constexpr, MROWS: tl.constexpr):
+        """Few-row version (decoding: 1 token; speculative checks: up to 4). Program
+        pid_n computes BLOCK_N outputs for every row. Each 32-value block's scale and
+        bytes are loaded once and used for all rows, so 4 rows cost little more memory
+        traffic than 1. Each row keeps an elementwise fp32 accumulator
+        [BLOCK_N, BLOCKS, 16] over the whole K loop, reduced once at the end (reducing
+        every chunk was the slow part). A row's arithmetic doesn't depend on M, so a
+        speculative check computes exactly what one-token decoding computes. No tensor
+        cores: with 1-4 rows of x memory speed is the limit."""
         pid_n = tl.program_id(0)
-        m = tl.program_id(1)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         n_ok = rn < N
         row = rn.to(tl.int64) * row_bytes
         n_blocks = K // 32
-        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
         i16 = tl.arange(0, 16)
+        a0 = tl.zeros((BLOCK_N, BLOCKS, 16), dtype=tl.float32)
+        a1 = tl.zeros((BLOCK_N, BLOCKS, 16), dtype=tl.float32)
+        a2 = tl.zeros((BLOCK_N, BLOCKS, 16), dtype=tl.float32)
+        a3 = tl.zeros((BLOCK_N, BLOCKS, 16), dtype=tl.float32)
         for b0 in range(0, n_blocks, BLOCKS):
             b = b0 + tl.arange(0, BLOCKS)
             b_ok = b < n_blocks
-            ok2 = n_ok[:, None] & b_ok[None, :]                                 # [BN, BB]
-            xrow = x_ptr + m * stride_xm + (b * 32)[:, None] + i16[None, :]     # [BB, 16]
-            x_lo = tl.load(xrow, mask=b_ok[:, None], other=0.0).to(tl.float32)        # values 0..15 of each block
-            x_hi = tl.load(xrow + 16, mask=b_ok[:, None], other=0.0).to(tl.float32)   # values 16..31
+            ok2 = n_ok[:, None] & b_ok[None, :]
             if QTYPE == 0:
-                base = w_ptr + row[:, None] + (b * 18)[None, :]                 # Q4_0: [d: f16][16 bytes]
+                base = w_ptr + row[:, None] + (b * 18)[None, :]
                 qs = tl.load(base[:, :, None] + 2 + i16[None, None, :], mask=ok2[:, :, None], other=0).to(tl.int32)
-                lo = (qs & 0xF).to(tl.float32) - 8.0                            # value j (j < 16): low nibble
-                hi = (qs >> 4).to(tl.float32) - 8.0                             # value j + 16: high nibble
+                lo = (qs & 0xF).to(tl.float32) - 8.0
+                hi = (qs >> 4).to(tl.float32) - 8.0
             else:
-                base = w_ptr + row[:, None] + (b * 34)[None, :]                 # Q8_0: [d: f16][32 x int8]
+                base = w_ptr + row[:, None] + (b * 34)[None, :]
                 lo = tl.load(base[:, :, None] + 2 + i16[None, None, :], mask=ok2[:, :, None],
                              other=0).to(tl.int8, bitcast=True).to(tl.float32)
                 hi = tl.load(base[:, :, None] + 18 + i16[None, None, :], mask=ok2[:, :, None],
                              other=0).to(tl.int8, bitcast=True).to(tl.float32)
             d_lo = tl.load(base, mask=ok2, other=0).to(tl.uint16)
             d_hi = tl.load(base + 1, mask=ok2, other=0).to(tl.uint16)
-            d = (d_lo | (d_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)      # [BN, BB]
-            dot = tl.sum(lo * x_lo[None, :, :] + hi * x_hi[None, :, :], axis=2)       # [BN, BB]
-            acc += tl.sum(dot * d, axis=1)
-        tl.store(y_ptr + m * stride_ym + rn, acc.to(y_ptr.dtype.element_ty), mask=n_ok)
+            d = (d_lo | (d_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)[:, :, None]   # [BN, BB, 1]
+            lo = lo * d
+            hi = hi * d
+            xoff = (b * 32)[:, None] + i16[None, :]
+            xm = b_ok[:, None]
+            a0 += lo * tl.load(x_ptr + xoff, mask=xm, other=0.0).to(tl.float32)[None] + \
+                hi * tl.load(x_ptr + xoff + 16, mask=xm, other=0.0).to(tl.float32)[None]
+            if MROWS > 1:
+                a1 += lo * tl.load(x_ptr + stride_xm + xoff, mask=xm & (M > 1), other=0.0).to(tl.float32)[None] + \
+                    hi * tl.load(x_ptr + stride_xm + xoff + 16, mask=xm & (M > 1), other=0.0).to(tl.float32)[None]
+            if MROWS > 2:
+                a2 += lo * tl.load(x_ptr + 2 * stride_xm + xoff, mask=xm & (M > 2), other=0.0).to(tl.float32)[None] + \
+                    hi * tl.load(x_ptr + 2 * stride_xm + xoff + 16, mask=xm & (M > 2), other=0.0).to(tl.float32)[None]
+                a3 += lo * tl.load(x_ptr + 3 * stride_xm + xoff, mask=xm & (M > 3), other=0.0).to(tl.float32)[None] + \
+                    hi * tl.load(x_ptr + 3 * stride_xm + xoff + 16, mask=xm & (M > 3), other=0.0).to(tl.float32)[None]
+        out = y_ptr.dtype.element_ty
+        tl.store(y_ptr + rn, tl.sum(tl.sum(a0, axis=2), axis=1).to(out), mask=n_ok)
+        if MROWS > 1:
+            tl.store(y_ptr + stride_ym + rn, tl.sum(tl.sum(a1, axis=2), axis=1).to(out), mask=n_ok & (M > 1))
+        if MROWS > 2:
+            tl.store(y_ptr + 2 * stride_ym + rn, tl.sum(tl.sum(a2, axis=2), axis=1).to(out), mask=n_ok & (M > 2))
+            tl.store(y_ptr + 3 * stride_ym + rn, tl.sum(tl.sum(a3, axis=2), axis=1).to(out), mask=n_ok & (M > 3))
 
 
 GEMV_MAX_ROWS = 4  # up to this many rows of x (tokens), the few-row kernel is used
+# (BLOCK_N, BLOCKS, num_warps) for _qgemv4_kernel. Round 7, three Gemma-4-12B-sized matrices:
+# Q4_0 1 row 187 us / 4 rows 305 us (previous kernels: 225 / 707); Q8_0 391 / 371 (378 / 686).
+GEMV4_CONFIG = {q.Q4_0: (8, 8, 2), q.Q8_0: (4, 8, 2)}
 
 
 def qmatmul(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, out_features: int) -> torch.Tensor:
@@ -146,9 +169,14 @@ def qmatmul(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, out_features: in
     M, N = x2.shape[0], out_features
     y = torch.empty(M, N, dtype=x.dtype, device=x.device)
     if M <= GEMV_MAX_ROWS:
-        block_n, blocks = 16, 8
-        _qgemv_kernel[(triton.cdiv(N, block_n), M)](x2, raw, y, N, K, x2.stride(0), y.stride(0), K // 32 * nb,
-                                                    QTYPE=code, BLOCK_N=block_n, BLOCKS=blocks)
+        # 1-4 rows (decoding, and speculative checks of up to 3 guesses): one kernel for
+        # all of them, so a row's result never depends on how many rows ran together;
+        # checked tokens then match normal decoding bit for bit. Configs measured on the
+        # RTX 5060 Ti (round 7) and checked for that row independence.
+        block_n, blocks, warps = GEMV4_CONFIG[ggml_type]
+        _qgemv4_kernel[(triton.cdiv(N, block_n),)](x2, raw, y, M, N, K, x2.stride(0), y.stride(0), K // 32 * nb,
+                                                   QTYPE=code, BLOCK_N=block_n, BLOCKS=blocks,
+                                                   MROWS=1 if M == 1 else (2 if M == 2 else 4), num_warps=warps)
         return y.reshape(*x.shape[:-1], N)
     block_m = 16 if M <= 16 else 64        # decoding (M = 1) wastes some tensor-core rows; memory is the limit
     block_n, block_k = 64, 64

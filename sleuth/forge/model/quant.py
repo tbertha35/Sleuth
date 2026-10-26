@@ -58,6 +58,22 @@ def dequantize_rows(raw: torch.Tensor, ggml_type: int, row_len: int, start: int,
     return w.reshape(stop - start, row_len)
 
 
+def quant_linear(x: torch.Tensor, raw: torch.Tensor, ggml_type: int, in_features: int,
+                 out_features: int) -> torch.Tensor:
+    """x @ W.T for a row-major quantized W [out_features, in_features] held as raw
+    blocks (QuantLinear's matmul; MoE experts use it on one expert's slice)."""
+    from . import triton_kernels  # imported on first use: loading Triton takes a moment
+
+    if triton_kernels.usable(x, ggml_type):
+        return triton_kernels.qmatmul(x, raw, ggml_type, out_features)
+    rows = max(1, CHUNK_ELEMENTS // in_features)
+    if rows >= out_features:
+        return F.linear(x, dequantize_rows(raw, ggml_type, in_features, 0, out_features, x.dtype))
+    parts = [F.linear(x, dequantize_rows(raw, ggml_type, in_features, i, min(i + rows, out_features), x.dtype))
+             for i in range(0, out_features, rows)]
+    return torch.cat(parts, dim=-1)
+
+
 def round_like_q8(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     """x after llama.cpp's activation quantization (CUDA's quantize_q8_1):
     per block of 32 values along the last dimension, d = max|x| / 127,
@@ -96,18 +112,9 @@ class QuantLinear(nn.Module):
         return self.dequantize_rows(0, self.out_features, torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from . import triton_kernels  # imported on first use: loading Triton takes a moment
-
         if self.emulate_q8_activations:
             x = round_like_q8(x)
-        if triton_kernels.usable(x, self.ggml_type):
-            return triton_kernels.qmatmul(x, self.raw, self.ggml_type, self.out_features)
-        rows = max(1, CHUNK_ELEMENTS // self.in_features)
-        if rows >= self.out_features:
-            return F.linear(x, self.dequantize_rows(0, self.out_features, x.dtype))
-        parts = [F.linear(x, self.dequantize_rows(i, min(i + rows, self.out_features), x.dtype))
-                 for i in range(0, self.out_features, rows)]
-        return torch.cat(parts, dim=-1)
+        return quant_linear(x, self.raw, self.ggml_type, self.in_features, self.out_features)
 
     def extra_repr(self) -> str:
         return f"in={self.in_features}, out={self.out_features}, {q.TYPE_NAMES[self.ggml_type]}"
@@ -150,7 +157,11 @@ class QuantEmbedding(nn.Module):
 
 
 def quantized_modules(model: nn.Module):
-    return [m for m in model.modules() if isinstance(m, (QuantLinear, QuantEmbedding))]
+    """Layers holding quantized blocks (QuantLinear, QuantEmbedding, quantized MoE experts)."""
+    from .moe import ExpertWeights
+
+    return [m for m in model.modules() if isinstance(m, (QuantLinear, QuantEmbedding))
+            or isinstance(m, ExpertWeights) and m.ggml_type is not None]
 
 
 def set_q8_activations(model: nn.Module, on: bool = True) -> int:

@@ -100,6 +100,18 @@ def sample_next(logits: torch.Tensor, cfg: SamplingConfig, context: torch.Tensor
                 generator: torch.Generator | None = None, banned: list[int] | None = None) -> torch.Tensor:
     """logits: [B, V] float. context: [B, S] token IDs so far. banned: token IDs
     that must not be chosen (from NgramBlocker; batch size 1). Returns [B] token IDs."""
+    logits = final_logits(logits, cfg, context, banned)
+    if cfg.temperature <= 0:
+        return logits.argmax(-1)
+    probs = logits.softmax(-1)
+    return torch.multinomial(probs, 1, generator=generator).squeeze(-1)
+
+
+def final_logits(logits: torch.Tensor, cfg: SamplingConfig, context: torch.Tensor | None = None,
+                 banned: list[int] | None = None) -> torch.Tensor:
+    """Steps 0-5 above: the logits sample_next actually samples from (softmax
+    them for the probabilities; with temperature 0, argmax them). Speculative
+    decoding checks draft tokens against exactly this distribution."""
     logits = logits.float()
     if banned:
         ban = torch.tensor([b for b in banned if b < logits.size(-1)], dtype=torch.long, device=logits.device)
@@ -111,7 +123,5 @@ def sample_next(logits: torch.Tensor, cfg: SamplingConfig, context: torch.Tensor
             context = context[..., -cfg.repeat_last_n:]
         logits = apply_repetition_penalty(logits, context, cfg.repetition_penalty)
     if cfg.temperature <= 0:
-        return logits.argmax(-1)
-    logits = filter_logits(logits / cfg.temperature, cfg)
-    probs = logits.softmax(-1)
-    return torch.multinomial(probs, 1, generator=generator).squeeze(-1)
+        return logits
+    return filter_logits(logits / cfg.temperature, cfg)

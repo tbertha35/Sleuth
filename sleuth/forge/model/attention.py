@@ -118,7 +118,15 @@ class Attention(nn.Module):
         S = k.shape[2]
         offset = S - T  # how many earlier tokens are in the cache
 
-        if _is_block_mask(same_doc):
+        if getattr(cache, "static", False) and not self.tap_pattern.active:
+            # CUDA-graph decoding: a fixed-length cache view, the position in the mask.
+            kwargs = {"enable_gqa": True} if self.n_kv != self.n_heads and _SDPA_HAS_GQA else {}
+            if self.n_kv != self.n_heads and not _SDPA_HAS_GQA:
+                k = k.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+                v = v.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=cache.attn_mask(self.window),
+                                               scale=self.scale, **kwargs)
+        elif _is_block_mask(same_doc):
             if self.tap_pattern.active or self.window or offset:
                 raise NotImplementedError("FlexAttention document masks are for training: no attention "
                                           "taps, sliding windows or KV cache")

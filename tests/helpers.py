@@ -67,3 +67,24 @@ def add_gguf_tensor_copy(src, dst, name, new_name):
         else:
             meta[k] = (kinds[type(v)], v)
     write_gguf(dst, meta, tensors)
+
+
+def moe_reference(x, router_logits, n_used, gate, up, down, act, down_scale=None, weights_scale=0.0):
+    """llama.cpp's build_moe_ffn for one layer, token by token and expert by expert,
+    with plain tensors (the check for forge/model/moe.py). x [n, d]; router_logits
+    [n, E]; gate/up [E, h, d]; down [E, d, h]; act: a function (silu or gelu-tanh)."""
+    import torch
+
+    out = torch.zeros_like(x)
+    for t in range(x.shape[0]):
+        p = router_logits[t].softmax(-1)
+        top = sorted(range(p.numel()), key=lambda e: -float(p[e]))[:n_used]
+        w = p[top] / max(float(p[top].sum()), 6.103515625e-5)        # norm_w
+        if weights_scale not in (0.0, 1.0):
+            w = w * weights_scale
+        for j, e in enumerate(top):
+            y = down[e] @ (act(gate[e] @ x[t]) * (up[e] @ x[t]))
+            if down_scale is not None:
+                y = y * down_scale[e]
+            out[t] += w[j] * y
+    return out
