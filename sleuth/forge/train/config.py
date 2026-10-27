@@ -43,6 +43,11 @@ class TrainConfig:
     doc_mask_kernel: str = "sdpa"   # "sdpa" (boolean mask) | "flex" (FlexAttention; fast only with compile = true)
     compile: bool = False           # torch.compile the model (faster on GPU after a warm-up)
     mtp_weight: float = 0.3         # loss weight of the MTP heads (model.mtp_heads > 0); DeepSeek-V3 used 0.3 then 0.1
+    exit_weight: float = 0.3        # loss weight of the early exit (model.exit_layer > 0)
+    # Distillation from a teacher's top-k probabilities (forge/distill.py: `sleuth teach logits`).
+    teacher: str = ""               # folder of scored windows; "" = off
+    distill_weight: float = 0.5     # on teacher batches: loss = (1-w) next-token + w teacher-matching
+    distill_fraction: float = 1.0   # share of micro-batches taken from the teacher's windows
     peak_tflops: float = 0.0        # hardware peak for MFU (from hardware/<host>.json); 0 = don't report
 
 

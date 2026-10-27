@@ -183,6 +183,8 @@ def speculative_generate(model, prompt_ids: list[int], max_new_tokens: int = 200
     logits = pre.logits[0, -1]
     if wants_h:
         draft.begin(model, cache, pre.hidden[0, -1], prompt_ids=list(prompt_ids), hidden_rows=pre.hidden[0])
+    elif getattr(draft, "needs_cache", False):  # self-speculation (early exit) drafts in the target's cache
+        draft.begin(model, cache)
     stop_reason = "max_new_tokens"
     done = emit(choose(dist(logits)))
     if new[-1] in stop_ids:

@@ -35,6 +35,16 @@ def cmd_synth(a):
 
 
 def cmd_tokenizer(a):
+    if a.from_model:
+        from .models import load_tokenizer
+
+        tok = load_tokenizer(a.from_model)
+        if not hasattr(tok, "save") or not hasattr(tok, "data"):
+            sys.exit(f"{a.from_model}: only byte-level BPE tokenizers can be exported (this is {type(tok).__name__})")
+        out = Path(a.out or data_root() / "tokenizers" / Path(a.from_model).stem)
+        f = tok.save(out)
+        print(f"{f}: {tok.vocab_size:,} tokens, bos {tok.bos_id}, eos {tok.eos_id}, documents start with {tok.start_id}")
+        return
     from .forge.tokenizer.train_bpe import train_tokenizer
 
     train_tokenizer(a.input, a.vocab_size, a.out, workers=a.workers,
@@ -86,6 +96,30 @@ def cmd_train(a):
             sys.exit("give a config file, or --resume RUN_DIR")
         cfg = load_config(RunConfig, a.config, a.set)
         train(cfg, stop_at_step=a.stop_at_step)
+
+
+def cmd_experiment(a):
+    from .forge.experiment import run_experiment
+
+    out = run_experiment(a.file, only=a.only or None)
+    print(f"results: {out / 'results.md'}")
+
+
+def cmd_teach(a):
+    from .forge.distill import make_prompts, score_logits, teach_text
+
+    if a.what == "logits":
+        if not a.shards:
+            sys.exit("teach logits needs --shards (made with the teacher's tokenizer)")
+        score_logits(a.server, a.model, a.shards, a.out, a.windows, a.seq_len, a.k, seed=a.seed,
+                     workers=a.workers, api_key_env=a.api_key_env)
+        return
+    if not a.inputs:
+        sys.exit("teach text needs --from (corpus folders to take snippets from)")
+    prompts = make_prompts(a.inputs, a.n, seed=a.seed)
+    print(f"{len(prompts)} prompts from {', '.join(a.inputs)}")
+    teach_text(a.server, a.model, prompts, a.out, max_tokens=a.max_tokens, temperature=a.temperature,
+               workers=a.workers, api_key_env=a.api_key_env)
 
 
 def cmd_info(a):
@@ -316,6 +350,7 @@ def cmd_eval(a):
     import torch
 
     from .forge.data.loader import ShardDataset
+    from .forge.data.shard import doc_start_id
     from .forge.tokenizer.bpe import Tokenizer
     from .forge.train.checkpoint import load_model
     from .forge.train.trainer import evaluate, resolve_device
@@ -337,7 +372,7 @@ def cmd_eval(a):
     # without it shows how much the model leans on text from the previous document.
     masked = cfg["train"].get("doc_mask", False) if a.doc_mask == "run" else a.doc_mask == "yes"
     ev = evaluate(model, ds, a.batch_size, seq_len, a.windows, byte_lens, device, autocast,
-                  tok.bos_id if masked else None)
+                  doc_start_id(tok) if masked else None)
     print(f"{run.name} step {meta['step']}: {a.windows} windows of {seq_len} tokens from {shards}"
           + (", document-masked attention" if masked else ""))
     print(f"val loss {ev['val_loss']:.4f} nats/token, {ev['val_bpb']:.4f} bits/byte")
@@ -652,6 +687,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--workers", type=int, default=cpus)
     s.add_argument("--max-mb", type=float, default=None, help="only read this much text (faster on huge corpora)")
     s.add_argument("--text-field", default="text", help="JSON field holding the text in .jsonl files")
+    s.add_argument("--from-model", default=None, metavar="PATH", help="instead of training one: export the "
+                   "tokenizer of a .gguf file or HF folder (a teacher's, for distillation) to --out (a folder)")
     s.set_defaults(fn=cmd_tokenizer)
 
     s = sub.add_parser("tokenize", help="show how a tokenizer splits some text")
@@ -678,6 +715,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--resume", metavar="RUN_DIR")
     s.add_argument("--stop-at-step", type=int, default=None, help="pause after this step (resumable)")
     s.set_defaults(fn=cmd_train)
+
+    s = sub.add_parser("experiment", help="train several variants of a config and compare them in one table")
+    s.add_argument("file", help="experiment file (see configs/experiments/)")
+    s.add_argument("--only", action="append", default=[], metavar="VARIANT", help="run just these variants")
+    s.set_defaults(fn=cmd_experiment)
+
+    s = sub.add_parser("teach", help="learning from a bigger model: have a teacher server write training text")
+    s.add_argument("what", choices=["text", "logits"], help="text: teacher-written explanations and Q&A; "
+                   "logits: the teacher's top-k probabilities on windows of --shards (forge/distill.py)")
+    s.add_argument("--server", required=True, help="OpenAI-compatible server (vLLM, llama-server) on this "
+                   "machine or the local network, e.g. http://<gx10 address>:8000")
+    s.add_argument("--model", required=True, help="the model name the server serves")
+    s.add_argument("--from", dest="inputs", nargs="+", help="text: corpus folders/files to take snippets from")
+    s.add_argument("--n", type=int, default=1000, help="text: how many prompts")
+    s.add_argument("--shards", help="logits: shards made with the teacher's tokenizer")
+    s.add_argument("--windows", type=int, default=1000, help="logits: how many windows to score")
+    s.add_argument("--seq-len", type=int, default=1024, help="logits: window length (= the student's train.seq_len)")
+    s.add_argument("--k", type=int, default=20, help="logits: top-k per position (vLLM's --max-logprobs caps it)")
+    s.add_argument("--out", required=True, help="text: JSONL file to append to; logits: output folder "
+                   "(re-running resumes either)")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--max-tokens", type=int, default=700)
+    s.add_argument("--temperature", type=float, default=0.7)
+    s.add_argument("--workers", type=int, default=32, help="requests in flight (vLLM batches them)")
+    s.add_argument("--api-key-env", default=None, help="environment variable holding an API key, if needed")
+    s.set_defaults(fn=cmd_teach)
 
     s = sub.add_parser("info", help="parameter count, FLOPs and token budget of a config")
     s.add_argument("config")
@@ -851,7 +914,7 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
-    if args.cmd == "tokenizer" and args.out is None:
+    if args.cmd == "tokenizer" and args.out is None and not args.from_model:
         name = Path(args.input[0]).name or "corpus"
         args.out = str(data_root() / "tokenizers" / f"{name}-{args.vocab_size}.json")
     try:

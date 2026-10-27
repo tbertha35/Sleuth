@@ -31,6 +31,8 @@ hardware/sleuth_disk_probe_*
 .env
 .env.*
 sleuth.local.toml
+# The network policy (net.py) lists LAN hosts: machine-specific, never committed
+sleuth.toml
 
 # Editors / OS
 .vscode/

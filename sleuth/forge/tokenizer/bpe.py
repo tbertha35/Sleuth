@@ -181,7 +181,14 @@ class Tokenizer:
 
     @classmethod
     def load(cls, path: str | Path) -> "Tokenizer":
+        """Our tokenizer file, or a Hugging Face tokenizer.json (e.g. a teacher model's,
+        for students that share the teacher's vocabulary: forge/distill.py). Both have
+        the same interface; the HF one reads tokenizer_config.json next to the file."""
         d = json.loads(Path(path).read_text(encoding="utf-8"))
+        if d.get("format") != FORMAT_NAME and isinstance(d.get("model"), dict):
+            from ...formats.hf_tokenizer import HFTokenizer
+
+            return HFTokenizer.load(path)
         if d.get("format") != FORMAT_NAME:
             raise ValueError(f"{path} is not a {FORMAT_NAME} tokenizer file")
         if d.get("version") != FORMAT_VERSION:

@@ -37,6 +37,7 @@ from .attention import Attention
 from .config import ModelConfig
 from .mlp import make_mlp
 from .moe import ExpertWeights, MoE
+from .memory import NgramMemory
 from .mtp_heads import MTPHead, mtp_loss
 from .norm import make_norm
 from .quant import QuantEmbedding, QuantLinear, quantized_modules
@@ -97,6 +98,7 @@ class ModelOutput:
     loss: torch.Tensor | None = None     # mean cross-entropy over targets (nats/token)
     hidden: torch.Tensor | None = None   # [B, T, d_model] after the final norm (return_hidden=True; MTP drafters)
     mtp_loss: torch.Tensor | None = None  # mean loss of the MTP heads (with targets, if the model has heads)
+    exit_loss: torch.Tensor | None = None  # next-token loss of the early exit (with targets, cfg.exit_layer > 0)
 
 
 class Transformer(nn.Module):
@@ -110,8 +112,14 @@ class Transformer(nn.Module):
         self.tap_final_norm = Tap()
         self.lm_head = nn.Linear(cfg.d_model, cfg.padded_vocab, bias=False)
         self.mtp = nn.ModuleList(MTPHead(cfg) for _ in range(cfg.mtp_heads)) if cfg.mtp_heads else None
+        # Early exit: its own norm (the residual stream mid-way has another scale than
+        # at the end), then the shared output layer.
+        self.exit_norm = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps) if cfg.exit_layer else None
+        self.memory = (NgramMemory(cfg.d_model, cfg.mem_rows, cfg.mem_dim, cfg.mem_orders, cfg.mem_heads,
+                                   cfg.mem_layers) if cfg.mem_rows else None)
         if cfg.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
+        self._tie_shared_layers()
 
         # persistent=False: derived from the config, so not saved in checkpoints.
         # One cos/sin table per layer kind ("full", and "sliding" if used).
@@ -190,9 +198,25 @@ class Transformer(nn.Module):
                 model.lm_head.weight = model.tok_emb.weight
         if isinstance(model.tok_emb, QuantEmbedding):
             model.tok_emb.out_dtype = dtype
+        model._tie_shared_layers()  # same for shared (looped) layers
         model._refresh_rope()  # buffers are derived, not loaded: recompute them
         assign_tap_names(model)
         return model
+
+    def _tie_shared_layers(self) -> None:
+        """cfg.shared_layers: layer i's Linear weights (and biases) become layer j's, the
+        same Parameter objects, so they're stored, trained and counted once and get
+        the gradients of every application. Norms stay per layer: a few hundred
+        numbers each, and they let each application rescale its input differently."""
+        for i, j in enumerate(self.cfg.shared_layers):
+            if i == j:
+                continue
+            src = dict(self.blocks[j].named_modules())
+            for name, mod in self.blocks[i].named_modules():
+                if isinstance(mod, nn.Linear):
+                    mod.weight = src[name].weight
+                    if mod.bias is not None:
+                        mod.bias = src[name].bias
 
     def _make_quantized(self, path: str, ggml_type: int) -> None:
         if path == "tok_emb":
@@ -254,20 +278,58 @@ class Transformer(nn.Module):
                            getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
 
         x = self.tap_embed(self.embed(idx))
-        for block in self.blocks:
+        mem = self.memory.lookup(idx, cache, doc_ids) if self.memory is not None else None
+        early = None
+        for i, block in enumerate(self.blocks):
+            if mem is not None and i in self.cfg.mem_layers:
+                x = self.memory.inject(x, mem, self.cfg.mem_layers.index(i))
             x = block(x, *rope[block.kind], cache, same_doc)
+            if i + 1 == self.cfg.exit_layer and targets is not None:
+                early = x
         if cache is not None:
             cache.advance(T)
         h = self.tap_final_norm(self.norm_f(x))
         logits = self._softcap(self.lm_head(h))
 
-        loss = extra = None
+        loss = extra = exit_loss = None
         if targets is not None:
             # float32 for the softmax: bf16 log-probs are too coarse for a good loss.
             loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
             if self.mtp is not None:
                 extra = mtp_loss(self, idx, h, targets)
-        return ModelOutput(logits, loss, h if return_hidden else None, extra)
+            if early is not None:
+                el = self._softcap(self.lm_head(self.exit_norm(early)))
+                exit_loss = F.cross_entropy(el.float().reshape(-1, el.size(-1)), targets.reshape(-1), ignore_index=-100)
+        return ModelOutput(logits, loss, h if return_hidden else None, extra, exit_loss)
+
+    def early_logits(self, idx: torch.Tensor, cache, positions: torch.Tensor | None = None) -> torch.Tensor:
+        """Logits of the early exit: only the first cfg.exit_layer blocks run (they read
+        and write the cache's first layers, at cache.pos, which this advances). The
+        self-speculative drafter's step. A later full pass over the same positions
+        recomputes those layers' K/V with the same values and overwrites them.
+
+        In CUDA-graph (static) mode the tokens go to `positions` (a GPU tensor; default
+        pos_t, pos_t+1, ...) and the cache doesn't move: the caller keeps track."""
+        if not self.cfg.exit_layer:
+            raise ValueError("this model has no early exit (model.exit_layer = 0)")
+        T = idx.shape[1]
+        if getattr(cache, "static", False):
+            cache.new_step(positions)
+            pos = cache.positions
+            rope = {kind: (getattr(self, f"rope_cos_{kind}").index_select(0, pos),
+                           getattr(self, f"rope_sin_{kind}").index_select(0, pos)) for kind in self._rope_kinds()}
+        else:
+            offset = cache.pos
+            rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
+                           getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
+        x = self.embed(idx)
+        mem = self.memory.lookup(idx, cache) if self.memory is not None else None
+        for i, block in enumerate(self.blocks[:self.cfg.exit_layer]):
+            if mem is not None and i in self.cfg.mem_layers:
+                x = self.memory.inject(x, mem, self.cfg.mem_layers.index(i))
+            x = block(x, *rope[block.kind], cache, None)
+        cache.advance(T)   # a no-op in static mode
+        return self._softcap(self.lm_head(self.exit_norm(x)))
 
     def embed(self, idx: torch.Tensor) -> torch.Tensor:
         """Token ids -> input vectors (the embedding, times embed_scale)."""

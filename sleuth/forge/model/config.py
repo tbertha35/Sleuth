@@ -70,8 +70,45 @@ class ModelConfig:
     # Multi-token prediction heads (mtp_heads.py): head k learns to guess the token k+1 ahead,
     # for speculative decoding. 0 = none. The loss weight is TrainConfig.mtp_weight.
     mtp_heads: int = 0
+    # Early exit (LayerSkip-style self-speculation): after this many blocks, an extra norm
+    # + the shared output layer also predict the next token, trained with weight
+    # TrainConfig.exit_weight. The first exit_layer blocks then draft guesses that the
+    # whole model checks, reusing its own KV cache: no separate drafter. 0 = off.
+    exit_layer: int = 0
+    # Shared (looped) layers: entry i = the layer whose weights layer i uses (its matmul
+    # weights; norms stay per layer). [] = every layer has its own. Examples for 8 layers:
+    #   [0, 1, 2, 3, 2, 3, 2, 3]  layers 2-3 run three times (a looped middle, like a
+    #                             recurrent-depth model: depth 8 from 4 layers' weights)
+    #   [0, 0, 0, 0, 0, 0, 0, 0]  one layer applied 8 times (ALBERT / Universal Transformer)
+    # Each application keeps its own KV cache slot (different inputs, different K/V).
+    shared_layers: list[int] = field(default_factory=list)
+    # N-gram memory (memory.py): hashed lookup tables of the last 2..n tokens, added to the
+    # residual stream before the listed layers through a gate. mem_rows = rows per table
+    # (one table per order and hash head); 0 = off.
+    mem_rows: int = 0
+    mem_dim: int = 32
+    mem_orders: list[int] = field(default_factory=lambda: [2, 3])
+    mem_heads: int = 2
+    mem_layers: list[int] = field(default_factory=lambda: [1])
 
     def __post_init__(self):
+        if self.mem_rows:
+            if not self.mem_orders or min(self.mem_orders) < 1 or self.mem_heads < 1 or self.mem_dim < 1:
+                raise ValueError("n-gram memory needs mem_orders >= 1, mem_heads >= 1 and mem_dim >= 1")
+            if not self.mem_layers or not all(0 <= i < self.n_layers for i in self.mem_layers):
+                raise ValueError(f"mem_layers must be layer indices in 0..{self.n_layers - 1}")
+        if self.shared_layers:
+            sl = self.shared_layers
+            if len(sl) != self.n_layers:
+                raise ValueError(f"shared_layers has {len(sl)} entries for {self.n_layers} layers")
+            for i, j in enumerate(sl):
+                if not 0 <= j <= i or sl[j] != j:
+                    raise ValueError(f"shared_layers[{i}] = {j}: must name an earlier (or the same) layer "
+                                     "that has its own weights")
+                if self.attn_spec(i) != self.attn_spec(j) or self.layer_type(i) != self.layer_type(j):
+                    raise ValueError(f"layers {i} and {j} differ in shape; they can't share weights")
+        if not 0 <= self.exit_layer < self.n_layers:
+            raise ValueError(f"exit_layer must be in 0..{self.n_layers - 1} (0 = off), got {self.exit_layer}")
         if not self.head_size and self.d_model % self.n_heads:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.kv_heads <= 0 or self.n_heads % self.kv_heads:
@@ -127,7 +164,8 @@ class ModelConfig:
         return (self.ffn_type == "swiglu" and self.norm_type == "rmsnorm" and self.pos_type == "rope"
                 and not self.bias and self.embed_scale == 1.0 and not self.post_norms and not self.v_norm
                 and not self.attn_scale and not self.final_softcap and not self.layer_scale
-                and "sliding" not in self.layer_types and not self.full_v_from_k and not self.n_experts)
+                and "sliding" not in self.layer_types and not self.full_v_from_k and not self.n_experts
+                and not self.mem_rows)   # shared layers export fine (as copies); the memory doesn't
 
     @property
     def padded_vocab(self) -> int:

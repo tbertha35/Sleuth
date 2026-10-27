@@ -24,7 +24,8 @@ from .config import ModelConfig
 
 
 def _layer_params(cfg: ModelConfig, i: int) -> tuple[int, int]:
-    """(all parameters, matmul weights) of block i."""
+    """(parameters, matmul weights) of block i. A layer that shares another's weights
+    (cfg.shared_layers) owns only its norms, but its matmuls still run."""
     spec = cfg.attn_spec(i)
     d, hd, H, K = cfg.d_model, spec.head_dim, cfg.n_heads, spec.kv_heads
     b = 1 if cfg.bias else 0
@@ -39,7 +40,10 @@ def _layer_params(cfg: ModelConfig, i: int) -> tuple[int, int]:
     n_norms = 4 if cfg.post_norms else 2
     qk_norm = 2 * hd if cfg.qk_norm else 0
     scale = 1 if cfg.layer_scale else 0
-    return attn + attn_bias + mlp + mlp_bias + n_norms * norm_params + qk_norm + scale, attn + mlp
+    own = n_norms * norm_params + qk_norm + scale
+    if cfg.shared_layers and cfg.shared_layers[i] != i:
+        return own, attn + mlp
+    return attn + attn_bias + mlp + mlp_bias + own, attn + mlp
 
 
 def param_counts(cfg: ModelConfig) -> dict[str, int]:
@@ -54,15 +58,26 @@ def param_counts(cfg: ModelConfig) -> dict[str, int]:
     mtp_matmul = 2 * d * d + n_ffn_in * d * cfg.hidden + cfg.hidden * d
     mtp_bias = (d + n_ffn_in * cfg.hidden + d) if cfg.bias else 0
     mtp = cfg.mtp_heads * (mtp_matmul + mtp_bias + 4 * norm_params)
-    total = embedding + sum(n for n, _ in layers) + norm_params + head + mtp
+    # The early exit adds a norm and runs the shared output layer once more.
+    exit_ = 1 if cfg.exit_layer else 0
+    # The n-gram memory: its tables are lookups (no matmul, like the embedding); each
+    # injection layer has a key and a value projection from the looked-up rows.
+    mem_table = mem_matmul = 0
+    if cfg.mem_rows:
+        n_tables = len(cfg.mem_orders) * cfg.mem_heads
+        mem_table = n_tables * cfg.mem_rows * cfg.mem_dim
+        mem_matmul = len(cfg.mem_layers) * 2 * n_tables * cfg.mem_dim * d
+    total = (embedding + sum(n for n, _ in layers) + norm_params + head + mtp + exit_ * norm_params
+             + mem_table + mem_matmul)
     return {
         "total": total,
         "embedding": embedding,
-        "non_embedding": total - embedding,
+        "non_embedding": total - embedding - mem_table,
+        "memory_table": mem_table,
         "per_layer": layers[0][0],
         # weights that take part in matmuls (what the 6N rule counts)
-        "matmul": sum(m for _, m in layers) + (1 + cfg.mtp_heads) * cfg.padded_vocab * d
-                  + cfg.mtp_heads * mtp_matmul,
+        "matmul": sum(m for _, m in layers) + (1 + cfg.mtp_heads + exit_) * cfg.padded_vocab * d
+                  + cfg.mtp_heads * mtp_matmul + mem_matmul,
     }
 
 

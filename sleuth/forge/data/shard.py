@@ -52,9 +52,23 @@ def _encode_batch(texts: list[str]) -> list[np.ndarray]:
     assert tok is not None
     out = []
     for t in texts:
-        ids = [tok.bos_id] + tok.encode_ordinary(t) + [tok.eos_id]
-        out.append(np.asarray(ids, dtype=np.uint32))
+        out.append(np.asarray(document_tokens(tok, t), dtype=np.uint32))
     return out
+
+
+def doc_start_id(tok) -> int:
+    """The token that starts every document in our shards (what document masking
+    splits on): BOS, or for tokenizers without one (Qwen) the separator the model
+    was pretrained with, <|endoftext|> (tok.start_id)."""
+    return tok.bos_id if tok.bos_id is not None else tok.start_id
+
+
+def document_tokens(tok, text: str) -> list[int]:
+    """[start] + text + [end]. Without a BOS the start token is <|endoftext|>, which is
+    also Qwen's end of text, so no separate end token: documents are separated by one."""
+    start = doc_start_id(tok)
+    end = [tok.eos_id] if tok.eos_id is not None and tok.eos_id != start else []
+    return [start] + tok.encode_ordinary(text) + end
 
 
 class _ShardWriter:
@@ -121,6 +135,9 @@ def build_shards(inputs: list[str | Path], tokenizer_path: str | Path, out_dir: 
     writers = {s: _ShardWriter(out, s, dtype, shard_tokens) for s in ("train", "val")}
     files = find_files(inputs)
     shutil.copy(tokenizer_path, out / "tokenizer.json")
+    cfg = Path(tokenizer_path).parent / "tokenizer_config.json"   # a Hugging Face tokenizer's bos/eos names
+    if cfg.exists():
+        shutil.copy(cfg, out / "tokenizer_config.json")
     log(f"sharding {len(files)} files -> {out} ({dtype.name}, val_fraction={val_fraction})")
 
     def batches(docs: Iterable[Document], size: int = 512):

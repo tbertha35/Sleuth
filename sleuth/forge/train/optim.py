@@ -21,7 +21,9 @@ def build_optimizer(model: nn.Module, cfg: TrainConfig, device_type: str) -> tor
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
-        (decay if p.dim() >= 2 else no_decay).append(p)
+        # no_weight_decay: lookup tables most of whose rows get no gradient on a given
+        # step (the n-gram memory); decay would keep shrinking the rarely-seen ones.
+        (decay if p.dim() >= 2 and not getattr(p, "no_weight_decay", False) else no_decay).append(p)
     groups = [
         {"params": decay, "weight_decay": cfg.weight_decay},
         {"params": no_decay, "weight_decay": 0.0},

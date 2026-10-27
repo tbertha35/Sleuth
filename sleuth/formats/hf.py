@@ -221,7 +221,7 @@ def save_hf_model(model: Transformer, out_dir: str | Path, tokenizer=None, max_s
         "torch_dtype": "bfloat16",
     }
     # MTP heads have no place in the Llama format: the export is the plain model.
-    named = [(n, p) for n, p in model.named_parameters() if not n.startswith("mtp.")]
+    named = [(n, p) for n, p in model.named_parameters() if not n.startswith(("mtp.", "exit_norm."))]
     reverse = {}
     for name, _ in named:
         reverse[name] = _hf_name(name)

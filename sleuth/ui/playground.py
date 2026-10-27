@@ -51,6 +51,8 @@ class Loaded:
         """What "MTP drafter" would use: the model's own heads, or an mtp-*.gguf."""
         if getattr(self.model, "mtp", None) is not None:
             return f"built-in ({len(self.model.mtp)} heads)"
+        if getattr(getattr(self.model, "cfg", None), "exit_layer", 0):
+            return f"built-in (early exit after layer {self.model.cfg.exit_layer})"
         path = self.mtp_file()
         return path.name if path else None
 

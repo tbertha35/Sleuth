@@ -1,0 +1,42 @@
+# Experiment 1: drafters trained into the model (MTP heads, early exit), on the
+# mix-20m shape (d=384, 6 layers, ~22M params) with a short budget.
+#
+# 2500 steps x 16 x 4 x 1024 = 164M tokens per variant (~20 min each on the
+# RTX 5060 Ti with torch.compile), on the same mix-3b shards and settings as
+# mix-150m (document-masked FlexAttention). Questions:
+#   * what does each extra loss cost in next-token quality (val bpb)?
+#   * how many guesses does each drafter get accepted, and how fast is decoding?
+#   * does an early exit at 2 of 6 layers or 3 of 6 draft better?
+#
+#   python -m sleuth experiment configs/experiments/ideas-1.toml
+name = "ideas-1"
+base = "configs/mix-20m.toml"
+set = [
+    "data.shards=data/shards/mix-3b",
+    "train.max_steps=2500",
+    "train.warmup_steps=200",
+    "train.doc_mask=true",
+    "train.doc_mask_kernel='flex'",
+    "train.eval_every=500",
+    "train.snapshot_every=2500",
+    "train.snapshot_log_spaced=false",
+]
+
+[[variant]]
+name = "baseline"
+
+[[variant]]
+name = "mtp1"
+set = ["model.mtp_heads=1"]
+
+[[variant]]
+name = "exit2"
+set = ["model.exit_layer=2"]
+
+[[variant]]
+name = "exit3"
+set = ["model.exit_layer=3"]
+
+[[variant]]
+name = "mtp1-exit2"
+set = ["model.mtp_heads=1", "model.exit_layer=2"]

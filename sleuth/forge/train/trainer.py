@@ -31,6 +31,7 @@ import torch
 from ...config import to_dict
 from ...env import env_info, runs_root
 from ..data.loader import ShardDataset, document_ids
+from ..data.shard import doc_start_id
 from ..model.attention import doc_block_mask
 from ..model.flops import describe, train_flops_per_token
 from ..model.transformer import Transformer
@@ -169,6 +170,15 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
         raise ValueError("tokenizer file changed since the shards were made; re-shard or restore it")
     byte_lens = torch.tensor(tokenizer.token_byte_lengths() + [0] * (cfg.model.padded_vocab - tokenizer.vocab_size),
                              device=device)
+    teacher = None
+    if tc.teacher:   # distillation (forge/distill.py): checked before anything is written
+        from ..distill import TeacherSet, distill_loss
+
+        teacher = TeacherSet(tc.teacher)
+        if teacher.meta["tokenizer_fingerprint"] != train_ds.meta["tokenizer_fingerprint"]:
+            raise ValueError(f"{tc.teacher} was scored on text from another tokenizer than {cfg.data.shards}")
+        if teacher.seq_len != tc.seq_len:
+            raise ValueError(f"{tc.teacher} has windows of {teacher.seq_len} tokens; train.seq_len is {tc.seq_len}")
 
     # ---- model + optimizer ------------------------------------------------
     model = Transformer(cfg.model).to(device)
@@ -188,6 +198,9 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
         (run_dir / "config.json").write_text(json.dumps(to_dict(cfg), indent=2) + "\n")
         (run_dir / "env.json").write_text(json.dumps(env_info(), indent=2) + "\n")
         shutil.copy(train_ds.tokenizer_path, run_dir / "tokenizer.json")
+        hf_cfg = Path(train_ds.tokenizer_path).parent / "tokenizer_config.json"   # a Hugging Face tokenizer's
+        if hf_cfg.exists():                                                       # bos/eos names
+            shutil.copy(hf_cfg, run_dir / "tokenizer_config.json")
         save_snapshot(run_dir, 0, model, 0, tc.snapshot_dtype)  # untrained baseline for the timeline
 
     compile_model = tc.compile
@@ -205,7 +218,7 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
 
     # Document masking: the model gets each window's document numbers, so
     # attention stops at every <|bos|> (see data/loader.py: document_ids).
-    mask_bos = tokenizer.bos_id if tc.doc_mask else None
+    mask_bos = doc_start_id(tokenizer) if tc.doc_mask else None
     use_flex = tc.doc_mask and tc.doc_mask_kernel == "flex"
     if use_flex and compile_model and cfg.model.head_dim < 16:
         # Compiled FlexAttention needs heads at least 16 wide (Inductor: "NYI: embedding
@@ -223,7 +236,11 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
             return {}
         doc = document_ids(x, mask_bos)
         # The BlockMask is built here, outside the compiled model, once per micro-batch.
-        return {"block_mask": doc_block_mask(doc)} if use_flex else {"doc_ids": doc}
+        if not use_flex:
+            return {"doc_ids": doc}
+        # The n-gram memory also needs doc_ids, so its n-grams stop at document starts
+        # (attention uses the block mask when both are given).
+        return {"block_mask": doc_block_mask(doc), **({"doc_ids": doc} if cfg.model.mem_rows else {})}
 
     tokens_per_step = tc.micro_batch_size * tc.seq_len * tc.grad_accum
     flops_per_token = train_flops_per_token(cfg.model, tc.seq_len)
@@ -252,7 +269,22 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
     completed = start_step
     t_last, tok_last = time.perf_counter(), tokens_seen
     loss_sum = torch.zeros((), device=device)
-    mtp_sum = torch.zeros((), device=device)   # the MTP heads' loss, logged on its own
+    # Extra training losses (each logged on its own, added with its weight): the MTP
+    # heads', the early exit's. (ModelOutput field, TrainConfig weight, log name.)
+    aux = []
+    if cfg.model.mtp_heads:
+        aux.append(("mtp_loss", tc.mtp_weight, "mtp"))
+    if cfg.model.exit_layer:
+        aux.append(("exit_loss", tc.exit_weight, "exit"))
+    aux_sum = {name: torch.zeros((), device=device) for _, _, name in aux}
+    # Distillation (forge/distill.py): the first round(distill_fraction x grad_accum)
+    # micro-batches of each step come from the teacher's scored windows.
+    n_teacher = 0
+    if teacher is not None:
+        n_teacher = max(1, round(tc.distill_fraction * tc.grad_accum))
+        aux_sum["distill"] = torch.zeros((), device=device)
+        log(f"distillation: {int(teacher.done.sum())} scored windows (top {teacher.k}) from {teacher.meta['model']}, "
+            f"{n_teacher} of {tc.grad_accum} micro-batches, weight {tc.distill_weight}")
     loss_count = 0
     try:
         for step in range(start_step, tc.max_steps):
@@ -260,14 +292,25 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
             for group in optimizer.param_groups:
                 group["lr"] = lr
             for micro in range(tc.grad_accum):
-                x, y = train_ds.batch(tc.micro_batch_size, tc.seq_len, tc.seed, step, micro)
+                from_teacher = micro < n_teacher
+                if from_teacher:
+                    x, y, top_ids, top_lp = teacher.batch(tc.micro_batch_size, tc.seed, step, micro)
+                    top_ids, top_lp = top_ids.to(device, non_blocking=True), top_lp.to(device, non_blocking=True)
+                else:
+                    x, y = train_ds.batch(tc.micro_batch_size, tc.seq_len, tc.seed, step, micro)
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 with autocast():
                     out = fwd(x, y, **masks(x))
-                loss = out.loss       # logged: the next-token loss, comparable with runs without MTP heads
-                total = loss if out.mtp_loss is None else loss + tc.mtp_weight * out.mtp_loss
-                if out.mtp_loss is not None:
-                    mtp_sum += out.mtp_loss.detach()
+                loss = out.loss       # logged: the next-token loss, comparable with runs without extra losses
+                total = loss
+                if from_teacher:
+                    kd = distill_loss(out.logits, top_ids, top_lp)
+                    total = (1 - tc.distill_weight) * loss + tc.distill_weight * kd
+                    aux_sum["distill"] += kd.detach() * tc.grad_accum / n_teacher   # logged per teacher batch
+                for field_, weight, name in aux:
+                    extra = getattr(out, field_)
+                    total = total + weight * extra
+                    aux_sum[name] += extra.detach()
                 (total / tc.grad_accum).backward()
                 # Accumulate on-device: calling .item() here would force the
                 # CPU to wait for the GPU every micro-step.
@@ -292,19 +335,20 @@ def _train(cfg: RunConfig, device: torch.device, run_dir: Path | None, resume: b
                     "step": completed, "tokens": tokens_seen, "loss": (loss_sum / loss_count).item(),
                     "lr": lr, "grad_norm": float(grad_norm), "tok_per_s": round(tps, 1), "time": time.time(),
                 }
-                if cfg.model.mtp_heads:
-                    rec["mtp_loss"] = (mtp_sum / loss_count).item()
+                for name, s in aux_sum.items():
+                    rec[f"{name}_loss"] = (s / loss_count).item()
                 if tc.peak_tflops > 0:
                     rec["mfu"] = round(tps * flops_per_token / (tc.peak_tflops * 1e12), 4)
                 if device.type == "cuda":
                     rec["mem_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
                 metrics.write(rec)
                 log(f"step {completed:6d} | loss {rec['loss']:.4f} | "
-                    + (f"mtp {rec['mtp_loss']:.4f} | " if "mtp_loss" in rec else "") + f"lr {lr:.2e} | "
+                    + "".join(f"{name} {rec[f'{name}_loss']:.4f} | " for name in aux_sum) + f"lr {lr:.2e} | "
                     f"gnorm {rec['grad_norm']:.2f} | {tps:,.0f} tok/s" + (f" | mfu {rec['mfu']:.1%}" if "mfu" in rec else "")
                     + (f" | mem {rec['mem_gb']:.1f} GB" if "mem_gb" in rec else ""))
                 loss_sum.zero_()
-                mtp_sum.zero_()
+                for s in aux_sum.values():
+                    s.zero_()
                 loss_count = 0
                 t_last, tok_last = time.perf_counter(), tokens_seen
 

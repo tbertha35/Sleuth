@@ -1,0 +1,37 @@
+# Experiment 3: learning from a bigger model (option B, logit distillation).
+# Students use the teacher's tokenizer (Qwen3.8 Flash Next, 248k vocab: the embedding alone
+# is 95M of the student's parameters at d_model 384), on shards made with it (qwen-mix), and
+# train on the same tokens with and without the teacher's top-20 probabilities
+# (`sleuth teach logits` -> data/teacher/qwen-mix, ~100k scored windows of 1024).
+#
+#   distill      half of the micro-batches are teacher windows, loss 0.5 CE + 0.5 teacher-matching
+#   distill-all  every micro-batch is a teacher window (~1.6 passes over them)
+#
+# bpb is per byte of text, so it compares across tokenizers; the baseline here is the reference.
+#
+#   python -m sleuth experiment configs/experiments/distill-1.toml
+name = "distill-1"
+base = "configs/mix-20m.toml"
+set = [
+    "data.shards=data/shards/qwen-mix",
+    "train.max_steps=2500",
+    "train.warmup_steps=200",
+    "train.micro_batch_size=4",     # 4 x 1024 x 248k logits in fp32 = 4 GB per copy
+    "train.grad_accum=16",          # same 64k tokens per step as ideas-1/2
+    "train.doc_mask=true",
+    "train.doc_mask_kernel='flex'",
+    "train.eval_every=500",
+    "train.snapshot_every=2500",
+    "train.snapshot_log_spaced=false",
+]
+
+[[variant]]
+name = "baseline"
+
+[[variant]]
+name = "distill"
+set = ["train.teacher='data/teacher/qwen-mix'", "train.distill_fraction=0.5", "train.distill_weight=0.5"]
+
+[[variant]]
+name = "distill-all"
+set = ["train.teacher='data/teacher/qwen-mix'", "train.distill_fraction=1.0", "train.distill_weight=0.5"]

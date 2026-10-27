@@ -26,6 +26,7 @@ Guesses are greedy; drafting stops early when the top probability is below p_min
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import torch
@@ -362,6 +363,107 @@ class HeadsDrafter:
         return torch.cat(picks).tolist()   # one sync for all k guesses
 
 
-def builtin_drafter(model) -> HeadsDrafter | None:
-    """The drafter a model carries itself (our runs trained with MTP heads), if any."""
-    return HeadsDrafter(model) if getattr(model, "mtp", None) is not None else None
+class EarlyExitDrafter:
+    """Self-speculation (LayerSkip, Elhoushi et al. 2024) for models trained with an
+    early exit (model.exit_layer): guesses come from the first exit_layer blocks
+    alone, one token at a time, through the exit's norm and the shared output layer.
+    They use the target's own KV cache: drafting writes the first layers' K/V at the
+    guess positions, the check then recomputes every layer there (same values for
+    those layers) and the cache is rewound as usual. Nothing else to keep in sync."""
+
+    needs_cache = True
+
+    def __init__(self, model):
+        if not model.cfg.exit_layer:
+            raise ValueError("this model has no early exit (train it with model.exit_layer > 0)")
+        self.model, self.cache = model, None
+        self.vocab = model.cfg.vocab_size or model.cfg.padded_vocab
+        p = next(model.parameters())
+        self.autocast = (torch.autocast("cuda", dtype=torch.bfloat16) if p.is_cuda and p.dtype == torch.float32
+                         else contextlib.nullcontext())
+
+    def begin(self, target, cache, *_, **__) -> None:
+        self.cache = cache
+
+    @torch.no_grad()
+    def __call__(self, ids: list[int], k: int) -> list[int]:
+        if k <= 0:
+            return []
+        from .kv_cache import StaticKVCache
+
+        if isinstance(self.cache, StaticKVCache) and self.cache.k[0].is_cuda:
+            # The check runs as a CUDA graph (speculative_generate(cuda_graph=True)), so its
+            # cache is a static one: draft in a graph too, in that same cache.
+            key = (self.cache.k[0].data_ptr(), k)
+            if getattr(self, "_graphs_key", None) != key:
+                self._graphs, self._graphs_key = _ExitDraftGraphs(self.model, self.cache, k, self.vocab,
+                                                                  self.autocast), key
+            return self._graphs(ids[-1])
+        start = self.cache.pos
+        tok = torch.tensor([[ids[-1]]], device=next(self.model.parameters()).device)
+        picks = []
+        with self.autocast:
+            for _ in range(k):
+                tok = self.model.early_logits(tok, self.cache)[0, -1, :self.vocab].argmax(-1).view(1, 1)
+                picks.append(tok.view(1))
+        self.cache.pos = start       # the check starts where drafting started
+        return torch.cat(picks).tolist()   # one sync for all k guesses
+
+
+class _ExitDraftGraphs:
+    """EarlyExitDrafter's k guesses as one CUDA graph per cache length, in the
+    target's StaticKVCache: guess j runs the first layers at position pos_t + j
+    and its argmax feeds guess j+1 on the GPU. Without it, drafting is ~10 small
+    launches per layer per guess from Python, slower than the full model's graph."""
+
+    def __init__(self, model, cache, k: int, vocab: int, autocast):
+        from .cuda_graph import _buckets
+
+        self.model, self.cache, self.k, self.vocab, self.autocast = model, cache, k, vocab, autocast
+        self.token = torch.zeros(1, 1, dtype=torch.long, device=cache.k[0].device)
+        self.buckets = _buckets(cache.max_len)
+        self.graphs: dict[int, tuple] = {}
+        self.pool = torch.cuda.graph_pool_handle()
+
+    def _chain(self) -> torch.Tensor:
+        tok, picks = self.token, []
+        with self.autocast:
+            for j in range(self.k):
+                logits = self.model.early_logits(tok, self.cache, self.cache.pos_t + j)
+                tok = logits[0, -1, :self.vocab].argmax(-1).view(1, 1)
+                picks.append(tok.view(1))
+        return torch.cat(picks)
+
+    def __call__(self, token: int) -> list[int]:
+        c = self.cache
+        start = c.pos
+        length = next(b for b in self.buckets if b >= start + self.k)
+        self.token.fill_(token)
+        c.pos_t.fill_(start)
+        c.static, c.length = True, length
+        try:
+            if length not in self.graphs:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        self._chain()   # warm-up: writes the same K/V the replay writes
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=self.pool):
+                    out = self._chain()
+                self.graphs[length] = (g, out)
+            g, out = self.graphs[length]
+            g.replay()
+        finally:
+            c.static = False
+        return out.tolist()
+
+
+def builtin_drafter(model) -> HeadsDrafter | EarlyExitDrafter | None:
+    """The drafter a model carries itself, if any: its MTP heads, else its early exit."""
+    if getattr(model, "mtp", None) is not None:
+        return HeadsDrafter(model)
+    if getattr(getattr(model, "cfg", None), "exit_layer", 0):
+        return EarlyExitDrafter(model)
+    return None

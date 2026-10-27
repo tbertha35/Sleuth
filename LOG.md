@@ -811,3 +811,90 @@ Playground (mix-100m; Gemma 4 in chat mode) and the logit-lens note all work.
   well: relative error 5.5e-3 instead of 1.3e-2.
 - Gemma 4 12B, warm, 3 guesses: MTP + graph **84.0 tok/s** (exact activations, same session:
   78.7), plain graph ~46, identical text in every mode. Run-to-run noise is ~5-10%.
+
+**2026-10-26: Research switches, an experiment runner, and teacher tools.**
+- `sleuth experiment FILE`: trains the variants of one config one after another and measures each the
+  same way (val bpb, knowledge few-shot, warm decode tok/s, drafter tok/s and acceptance, train
+  speed) into one table (runs/experiments/<name>/results.md). Resumable. Experiment files live in
+  configs/experiments/.
+- New model switches, all off by default and combinable:
+  - `exit_layer` (+ `train.exit_weight`): an early exit (own norm + the shared output layer) after
+    that many blocks, trained alongside; `EarlyExitDrafter` drafts with the first blocks in the
+    target's own KV cache (LayerSkip-style self-speculation). The check recomputes those layers'
+    K/V with the same values, so greedy text stays exact.
+  - `shared_layers`: layer i reuses layer j's matmul weights (norms stay per layer): looped middles,
+    ALBERT-style sharing. Each application has its own KV cache slot. HF export writes copies.
+  - `mem_rows` / `mem_dim` / `mem_orders` / `mem_heads` / `mem_layers`: an n-gram memory (DeepSeek
+    Engram-like): hashed 2- and 3-gram lookup tables added to the residual stream through a
+    context gate. Lookups cost ~no FLOPs; the tables get no weight decay. N-grams stop at document
+    starts. Cached decoding keeps the token history on the GPU (works with CUDA graphs).
+- The trainer's extra losses are now a list (MTP, early exit, distillation), each logged on its own.
+- `sleuth/net.py` (the M4 network gate, early): the only module that makes outbound requests;
+  allows this machine and the private network by default (a vLLM server on the GX10s), blocks
+  the internet; every request logged to runs/net.log without payloads. A test fails if any other
+  module imports an outbound network library. Correction from the owner: the teacher runs on
+  another machine on the LAN, so the gate must allow pointing at it directly (my first version
+  only allowed loopback unless configured).
+- Distillation (`sleuth teach`, forge/distill.py), both options:
+  - **text**: the teacher rewrites corpus snippets as Q&A, textbook sections and worked examples.
+    Pilot with Qwen3.8 Flash Next on the GX10s: 200 texts (69k of our tokens) in 10 min at 32
+    requests in flight; accurate Q&A and clean explanations.
+  - **logits**: the teacher's top-20 next-token log-probs for every position of windows from shards
+    made with the teacher's tokenizer (vLLM `prompt_logprobs`), stored as numpy memmaps; training
+    mixes them in with a soft-target loss (`train.teacher`, `distill_weight`, `distill_fraction`).
+    Pilot: 20 windows of 1024 in 15 s (~1.6k tok/s at 8 in flight). The teacher's top-1 is the
+    actual next token 63% of the time, the actual token is in its top 20 at 93% of positions,
+    and the top 20 hold 94.5% of the probability.
+  - Runs can now use a Hugging Face tokenizer.json (Tokenizer.load detects it); `sleuth tokenizer
+    --from-model` exports one from a GGUF. The Qwen3.8 Flash Next GGUF's tokenizer gives
+    identical ids to the vLLM server's /tokenize (4/4 test texts). Vocab 248,320, no BOS:
+    documents start with <|endoftext|>.
+- Tests: 277 -> 302 CPU.
+
+**2026-10-27: ideas-1 and ideas-2 (mix-20m, 2,500 steps of mix-3b, 164M tokens each).**
+Base: val bpb 1.2334 (ideas-1) and 1.2331 (ideas-2). The same config run twice gives the same bpb to
+0.0003, but its few-shot answer loss came out 4.009 vs 3.789 and its exact match 2.3% vs 1.8%:
+**the knowledge few-shot is ~0.2 loss noisy at this size**, so only changes larger than that count.
+At 22M, bpb is the reliable signal.
+
+| variant | params | Δ bpb | few-shot loss | exact | train speed |
+|---|---|---|---|---|---|
+| mtp1 | 23.5M | +0.003 | 3.793 | 3.6% | -29% |
+| exit2 | 22.0M | +0.002 | 3.602 | 3.2% | -26% |
+| exit3 | 22.0M | +0.006 | 3.743 | 2.7% | -24% |
+| mtp1-exit2 | 23.5M | +0.004 | 3.769 | 5.0% | -43% |
+| loop8 (layers 2-3 twice) | 22.0M | -0.007 | 3.923 | 2.3% | -14% |
+| deep8 | 25.2M | -0.016 | 3.803 | 2.7% | -14% |
+| share4 | 18.9M | +0.016 | 3.845 | 3.2% | 0% |
+| mem (262k rows) | 55.7M | -0.018 | 3.635 | 2.3% | -3% |
+| mem-big (1M rows) | 156.3M | -0.026 | 3.478 | 3.2% | -85% |
+
+- The extra losses (MTP, early exit) cost very little bpb. Their few-shot gains are within the noise.
+- Looping recovers ~40% of what two real extra layers give, for no extra weights. Sharing four
+  layers' weights across six costs about as much as deep8 gains.
+- **The n-gram memory is the winner:** 262k rows beat deep8 at ~no extra compute (decode speed
+  unchanged), and 1M rows is the best bpb of all. But mem-big trains 6x slower: the tables'
+  gradients are dense (134M parameters through AdamW every step, plus the embedding backward).
+  Sparse gradients/a separate sparse optimizer for the table should fix it; next to try.
+- Drafters (MTP head, early exit) don't speed up a 22M model: decoding is launch-bound, and the
+  early-exit draft isn't graph-captured yet. Decode tok/s at this size is noisy (the ideas-1
+  baseline was measured during a CPU test run: 913 vs ~1,200).
+- GPU tests after the run: 16 passed, 1 skipped (memory + early exit under CUDA graphs included).
+- Teacher data, stopped 2026-10-27 05:20: 84,427 of 160,000 windows scored (86M tokens with
+  top-20 log-probs, ~163 windows/min with the server to itself), plus 233 teacher texts. Both resume.
+
+**2026-10-27 (later): the mem-big slowdown, a graphed early-exit drafter, steadier decode numbers.**
+- mem-big's 6x slower training wasn't the table: the run peaked at 12.5 GB on the 16 GB card and ran
+  out of headroom (the memory pieces alone take 11 ms per micro-batch at 1M rows). With micro-batches
+  of 8 (grad_accum 8, the same tokens per step) it peaks at 4.9 GB and trains at 154k tok/s (vs 28.6k):
+  `mem-big-mb8` val bpb 1.2093 (-0.024) in 18 min instead of 96. No sparse-update code needed.
+- The early-exit drafter now drafts as one CUDA graph in the target's static KV cache
+  (`early_logits(..., positions)` in static mode; `_ExitDraftGraphs`). exit2: 277 -> 1,186 tok/s,
+  same text as plain greedy. Still no faster than plain decoding (~1,200) at 22M: each round is a
+  fixed number of launches either way. MTP heads' drafter isn't graphed yet (714 tok/s).
+- Decode speed is now the best of 3 warm runs (`experiment.decode_speed`). Re-timed on an idle GPU,
+  plain decode is 1,180-1,200 tok/s for every 6-layer variant (the 913 was noise); 8 layers ~1,030-1,080;
+  memory ~1,070-1,095 (the lookup's few extra launches matter at this size).
+- Next on the GPU: mix-150m + 1M-row memory + 1 MTP head for 4,000 steps, compared step for step
+  with mix-150m's own val curve (val bpb 1.0294 at step 4000); then distill-1 (Qwen-tokenized
+  student with and without the teacher's probabilities).

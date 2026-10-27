@@ -32,6 +32,15 @@ class KVCache:
         self.v = [torch.zeros_like(k) for k in self.k]
         self.max_len = max_len
         self.pos = 0  # tokens already stored (same for every layer)
+        self._tokens: torch.Tensor | None = None
+
+    def token_history(self, batch: int, device) -> torch.Tensor:
+        """[batch, max_len] token ids by position (-1 = none yet), for layers that look
+        at earlier tokens themselves (the n-gram memory, memory.py). Made on first use;
+        the caller writes the new tokens before reading back."""
+        if self._tokens is None:
+            self._tokens = torch.full((batch, self.max_len), -1, dtype=torch.long, device=device)
+        return self._tokens
 
     @classmethod
     def for_model(cls, model, batch: int, max_len: int | None = None, dtype: torch.dtype | None = None) -> "KVCache":
@@ -118,9 +127,11 @@ class StaticKVCache(KVCache):
             self._masks[window] = mask[None, None]
         return self._masks[window]
 
-    def new_step(self) -> None:
-        """Called by the model at the start of each forward pass (positions may have moved)."""
-        self._masks, self._pos = {}, None
+    def new_step(self, positions: torch.Tensor | None = None) -> None:
+        """Called by the model at the start of each forward pass (positions may have moved).
+        positions: this pass's positions, if not pos_t, pos_t+1, ... (the early-exit
+        drafter's graph runs one token at a time at pos_t + j)."""
+        self._masks, self._pos = {}, positions
 
     def advance(self, n):
         if not self.static:  # in static mode the caller moves pos and pos_t

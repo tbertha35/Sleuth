@@ -21,6 +21,7 @@ equivalent `re` syntax, including inside negated classes like [^\\s\\p{L}\\p{N}]
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -160,6 +161,7 @@ class HFTokenizer:
     """Same interface as our own Tokenizer (encode/decode/bos_id/...)."""
 
     def __init__(self, data: dict, config: dict | None = None):
+        self.data = data       # kept for save()
         model = data.get("model") or {}
         if model.get("type") != "BPE":
             raise ValueError(f"only BPE tokenizer.json files are supported (got {model.get('type')!r})")
@@ -214,6 +216,26 @@ class HFTokenizer:
         cfg_path = d / "tokenizer_config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
         return cls(json.loads(f.read_text(encoding="utf-8")), cfg)
+
+    def save(self, out_dir: str | Path) -> Path:
+        """Write tokenizer.json + tokenizer_config.json (bos/eos names) to out_dir, e.g.
+        to use a model's tokenizer for our own shards and runs (`sleuth tokenizer
+        --from-model`). Returns the tokenizer.json path."""
+        d = Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "tokenizer.json").write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+        name = lambda i: self.id_to_token[i] if i is not None else None  # noqa: E731
+        (d / "tokenizer_config.json").write_text(json.dumps({"bos_token": name(self.bos_id),
+                                                             "eos_token": name(self.eos_id)}, ensure_ascii=False),
+                                                 encoding="utf-8")
+        return d / "tokenizer.json"
+
+    def fingerprint(self) -> str:
+        """Short hash of what defines the encoding (vocabulary, merges, added tokens),
+        as Tokenizer.fingerprint: shards and runs check they use the same one."""
+        core = json.dumps([sorted(self.vocab.items()), sorted(self.ranks.items(), key=lambda kv: kv[1]),
+                           sorted(self.added_tokens.items())], sort_keys=True, default=list)
+        return hashlib.sha256(core.encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------ #
     @property
