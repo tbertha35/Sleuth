@@ -23,6 +23,7 @@ Token types (tokenizer.ggml.token_type): 1 normal, 2 unknown, 3 control,
 
 from __future__ import annotations
 
+import heapq
 import re
 from typing import Iterable
 
@@ -59,6 +60,7 @@ class GemmaTokenizer:
         self.eos_id = eos_id
         self._cache: dict[str, list[int]] = {}
         self._splitters: dict[frozenset, re.Pattern | None] = {}
+        self.split_lines = True   # llama.cpp's Gemma 4 pre-tokenizer; from_hf (Gemma 3) turns it off
 
     # ------------------------------------------------------------------ #
     @property
@@ -98,7 +100,7 @@ class GemmaTokenizer:
     def encode_ordinary(self, text: str) -> list[int]:
         text = text.replace(" ", SPACE)
         out: list[int] = []
-        for piece in re.findall(r"[^\n]+|\n+", text):
+        for piece in (re.findall(r"[^\n]+|\n+", text) if self.split_lines else [text]):
             out.extend(self._bpe(piece))
         return out
 
@@ -106,28 +108,10 @@ class GemmaTokenizer:
         cached = self._cache.get(piece)
         if cached is not None:
             return cached
-        if piece.startswith("\n") and piece in self.token_to_id:
+        if self.split_lines and piece.startswith("\n") and piece in self.token_to_id:
             ids = [self.token_to_id[piece]]  # a run of newlines that is one token (llama.cpp's Gemma 4 fix)
         else:
-            parts = list(piece)
-            while len(parts) > 1:
-                best, best_rank = None, None
-                for i in range(len(parts) - 1):
-                    r = self.ranks.get((parts[i], parts[i + 1]))
-                    if r is not None and (best_rank is None or r < best_rank):
-                        best, best_rank = i, r
-                if best is None:
-                    break
-                a, b = parts[best], parts[best + 1]
-                merged, i = [], 0
-                while i < len(parts):  # merge every occurrence of this pair, left to right
-                    if i < len(parts) - 1 and parts[i] == a and parts[i + 1] == b:
-                        merged.append(a + b)
-                        i += 2
-                    else:
-                        merged.append(parts[i])
-                        i += 1
-                parts = merged
+            parts = self._merge(piece)
             ids = []
             for p in parts:
                 tid = self.token_to_id.get(p)
@@ -139,6 +123,73 @@ class GemmaTokenizer:
             self._cache.clear()
         self._cache[piece] = ids
         return ids
+
+    def _merge(self, piece: str) -> list[str]:
+        """BPE: repeatedly merge the adjacent pair with the lowest rank (leftmost first).
+
+        A heap of candidate pairs over a linked list of symbols, as Hugging Face's
+        tokenizers and SentencePiece do it: O(n log n). Re-scanning the whole piece
+        after every merge is O(n^2), fine for words but not for Gemma 3's pieces,
+        which are whole lines or even whole documents."""
+        sym = list(piece)
+        n = len(sym)
+        if n < 2:
+            return sym
+        nxt = list(range(1, n)) + [-1]
+        prv = list(range(-1, n - 1))
+        heap = []
+        for i in range(n - 1):
+            r = self.ranks.get((sym[i], sym[i + 1]))
+            if r is not None:
+                heap.append((r, i, sym[i], sym[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            r, i, a, b = heapq.heappop(heap)
+            j = nxt[i]
+            if sym[i] != a or j < 0 or sym[j] != b:
+                continue          # stale: one side was merged into something else since
+            sym[i], sym[j] = a + b, ""
+            nxt[i] = nxt[j]
+            if nxt[j] >= 0:
+                prv[nxt[j]] = i
+            for left, right in ((prv[i], i), (i, nxt[i])):
+                if left >= 0 and right >= 0:
+                    r2 = self.ranks.get((sym[left], sym[right]))
+                    if r2 is not None:
+                        heapq.heappush(heap, (r2, left, sym[left], sym[right]))
+        out, i = [], 0
+        while i >= 0:
+            out.append(sym[i])
+            i = nxt[i]
+        return out
+
+    @classmethod
+    def from_hf(cls, data: dict, config: dict | None = None) -> "GemmaTokenizer":
+        """A SentencePiece-style tokenizer.json (Gemma 3's: spaces -> "▁", BPE over
+        characters, byte fallback). Hugging Face doesn't split the text into lines
+        first, so neither do we (split_lines=False)."""
+        model, config = data["model"], config or {}
+        added = {t["content"]: t for t in data.get("added_tokens") or []}
+        size = max(list(model["vocab"].values()) + [t["id"] for t in added.values()]) + 1
+        tokens, types = [""] * size, [UNUSED] * size
+        for t, i in model["vocab"].items():
+            tokens[i] = t
+            types[i] = BYTE if _BYTE_TOKEN.fullmatch(t) else NORMAL
+        for t, a in added.items():
+            tokens[a["id"]] = t
+            types[a["id"]] = CONTROL if a.get("special") else USER_DEFINED
+        if model.get("unk_token") in model["vocab"]:
+            types[model["vocab"][model["unk_token"]]] = UNKNOWN
+
+        def tid(name):
+            name = name.get("content") if isinstance(name, dict) else name
+            return tokens.index(name) if name in tokens else None
+
+        merges = [m if isinstance(m, str) else f"{m[0]} {m[1]}" for m in model.get("merges", [])]
+        tok = cls(tokens, types, merges, tid(config.get("bos_token", "<bos>")), tid(config.get("eos_token", "<eos>")),
+                  add_bos=config.get("add_bos_token", True))
+        tok.split_lines = False
+        return tok
 
     # ------------------------------------------------------------------ #
     def decode_bytes(self, ids: Iterable[int]) -> bytes:

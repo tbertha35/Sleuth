@@ -157,13 +157,23 @@ GPT2_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
 # Tokenizer
 # --------------------------------------------------------------------------- #
 
+def is_sentencepiece_style(data: dict) -> bool:
+    """A tokenizer.json that works on characters with "▁" for spaces and byte
+    fallback (Gemma 3, Llama 2), not on GPT-2-style bytes: GemmaTokenizer.from_hf."""
+    norm = data.get("normalizer") or {}
+    steps = norm.get("normalizers", [norm]) if norm.get("type") == "Sequence" else [norm]
+    replaces_spaces = any(s.get("type") == "Replace" and s.get("content") == "▁" for s in steps)
+    return bool((data.get("model") or {}).get("byte_fallback")) and replaces_spaces
+
+
 class HFTokenizer:
     """Same interface as our own Tokenizer (encode/decode/bos_id/...)."""
 
     def __init__(self, data: dict, config: dict | None = None):
         self.data = data       # kept for save()
         model = data.get("model") or {}
-        if model.get("type") != "BPE":
+        # Older files (GPT-2's) don't name the type; vocab + merges is BPE.
+        if model.get("type", "BPE" if "merges" in model else None) != "BPE":
             raise ValueError(f"only BPE tokenizer.json files are supported (got {model.get('type')!r})")
         self.vocab: dict[str, int] = model["vocab"]
         merges = model.get("merges", [])
@@ -215,7 +225,12 @@ class HFTokenizer:
         f = p / "tokenizer.json" if p.is_dir() else p
         cfg_path = d / "tokenizer_config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-        return cls(json.loads(f.read_text(encoding="utf-8")), cfg)
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if is_sentencepiece_style(data):
+            from .gemma_tokenizer import GemmaTokenizer
+
+            return GemmaTokenizer.from_hf(data, cfg)
+        return cls(data, cfg)
 
     def save(self, out_dir: str | Path) -> Path:
         """Write tokenizer.json + tokenizer_config.json (bos/eos names) to out_dir, e.g.

@@ -105,6 +105,14 @@ def cmd_experiment(a):
     print(f"results: {out / 'results.md'}")
 
 
+def cmd_bench(a):
+    from .analyzer.bench import run_bench, table
+
+    for path in a.models:
+        run_bench(path, tasks=a.tasks, limit=a.limit, shards=a.shards, out_dir=a.out, device=a.device)
+    print(table(a.out))
+
+
 def cmd_teach(a):
     from .forge.distill import make_prompts, score_logits, teach_text
 
@@ -720,6 +728,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("file", help="experiment file (see configs/experiments/)")
     s.add_argument("--only", action="append", default=[], metavar="VARIANT", help="run just these variants")
     s.set_defaults(fn=cmd_experiment)
+
+    s = sub.add_parser("bench", help="standard benchmarks (bpb, HellaSwag, ARC-Easy, knowledge), the same "
+                       "way for our runs and downloaded models (analyzer/bench.py)")
+    s.add_argument("models", nargs="+", help="run directories, Hugging Face model folders or .gguf files")
+    s.add_argument("--tasks", nargs="+", default=["bpb", "hellaswag", "arc_easy", "knowledge"],
+                   choices=["bpb", "hellaswag", "arc_easy", "knowledge"])
+    s.add_argument("--limit", type=int, default=0, help="only the first N items of each task (quick check)")
+    s.add_argument("--shards", default="data/shards/mix-3b", help="whose validation documents bpb uses")
+    s.add_argument("--out", default="runs/bench", help="results folder (one JSON per model, merged)")
+    s.add_argument("--device", default="auto")
+    s.set_defaults(fn=cmd_bench)
 
     s = sub.add_parser("teach", help="learning from a bigger model: have a teacher server write training text")
     s.add_argument("what", choices=["text", "logits"], help="text: teacher-written explanations and Q&A; "

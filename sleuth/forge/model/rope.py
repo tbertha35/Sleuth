@@ -45,5 +45,11 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """x: [B, H, T, head_dim]; cos/sin: [T, head_dim] for the positions of x.
-    Per channel pair (a, b): (a, b) -> (a·cos - b·sin, b·cos + a·sin)."""
+    Per channel pair (a, b): (a, b) -> (a·cos - b·sin, b·cos + a·sin).
+
+    Narrower tables ([T, rope_dim], partial RoPE as in GPT-NeoX/Pythia) rotate only the
+    first rope_dim channels, paired within them; the rest pass through unchanged."""
+    rd = cos.shape[-1]
+    if rd < x.shape[-1]:
+        return torch.cat([apply_rope(x[..., :rd], cos, sin), x[..., rd:]], dim=-1)
     return (x.float() * cos + _rotate_half(x.float()) * sin).to(x.dtype)

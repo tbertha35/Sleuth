@@ -50,7 +50,7 @@ def param_counts(cfg: ModelConfig) -> dict[str, int]:
     layers = [_layer_params(cfg, i) for i in range(cfg.n_layers)]
     d = cfg.d_model
     norm_params = d if cfg.norm_type == "rmsnorm" else 2 * d
-    embedding = cfg.padded_vocab * d
+    embedding = cfg.padded_vocab * d + (cfg.max_seq_len * d if cfg.pos_type == "learned" else 0)
     head = 0 if cfg.tie_embeddings else cfg.padded_vocab * d
     # MTP heads (mtp_heads.py): 4 norms, a 2d -> d projection and an MLP each; each one
     # also runs the shared output layer again (matmul cost, no extra parameters).

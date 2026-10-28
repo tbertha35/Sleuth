@@ -42,14 +42,18 @@ class SwiGLU(nn.Module):
 
 
 class GeluMLP(nn.Module):
+    """ffn_type "gelu": exact GELU (Pythia); "gelu_tanh": the tanh approximation
+    (GPT-2's "gelu_new")."""
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.up = nn.Linear(cfg.d_model, cfg.hidden, bias=cfg.bias)
         self.down = nn.Linear(cfg.hidden, cfg.d_model, bias=cfg.bias)
         self.tap_act = Tap()
+        self.approximate = "tanh" if cfg.ffn_type == "gelu_tanh" else "none"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(self.tap_act(F.gelu(self.up(x))))
+        return self.down(self.tap_act(F.gelu(self.up(x), approximate=self.approximate)))
 
 
 def make_mlp(cfg: ModelConfig) -> nn.Module:

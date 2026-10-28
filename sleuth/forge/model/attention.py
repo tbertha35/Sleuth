@@ -84,6 +84,7 @@ class Attention(nn.Module):
         self.scale = cfg.attn_scale or 1.0 / math.sqrt(self.hd)
         self.eps = cfg.norm_eps
         self.use_rope = cfg.pos_type == "rope"
+        self.partial_rope = bool(cfg.rope_dim) and cfg.rope_dim < self.hd
         qkv_bias = cfg.bias or cfg.qkv_bias
         self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.hd, bias=qkv_bias)
         self.k_proj = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=qkv_bias)
@@ -105,7 +106,7 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(B, T, self.n_heads, self.hd).transpose(1, 2)  # [B, H, T, hd]
         k = self.k_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)     # [B, K, T, hd]
         v = k if self.v_proj is None else self.v_proj(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)
-        if use_fused(q):
+        if use_fused(q) and not self.partial_rope:
             # Inference on a GPU: norm + RoPE in one kernel per tensor (fused_ops.py).
             from .fused_ops import head_norm_rope
 

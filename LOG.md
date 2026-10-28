@@ -898,3 +898,65 @@ At 22M, bpb is the reliable signal.
 - Next on the GPU: mix-150m + 1M-row memory + 1 MTP head for 4,000 steps, compared step for step
   with mix-150m's own val curve (val bpb 1.0294 at step 4000); then distill-1 (Qwen-tokenized
   student with and without the teacher's probabilities).
+
+**2026-10-27 (evening): `sleuth bench` and the models to beat.**
+- Downloaded (owner-approved) for comparison: GPT-2 124M, Pythia-160M, SmolLM2-135M, Gemma 3 270M
+  (Unsloth's ungated copy of Google's weights; Google's repo needs a Hugging Face login), plus
+  HellaSwag validation and ARC-Easy test (Parquet). Qwen3-0.6B was already here.
+- Loaders (formats/hf.py FAMILIES) for gpt2, gpt_neox and gemma3_text, with three new model
+  features: learned position embeddings (pos_type "learned"), partial RoPE (rope_dim: Pythia
+  rotates 16 of 64 channels), parallel attention + MLP (parallel_residual), and ffn_type
+  "gelu_tanh". Each is tested against an independent implementation of the architecture on a
+  tiny random checkpoint (tests/test_hf_families.py).
+- Gemma 3's tokenizer.json is SentencePiece-style (spaces -> "▁", characters, byte fallback):
+  GemmaTokenizer.from_hf. HF doesn't split it into lines first, so BPE runs on whole documents;
+  the merge loop is now a heap over a linked list (O(n log n), the same order HF and llama.cpp
+  merge in) instead of re-scanning after every merge (O(n^2)).
+- `sleuth bench MODEL...`: bpb on the same ~2 MB of our mix-3b validation documents re-encoded
+  with each model's tokenizer (per byte, so tokenizers compare fairly), HellaSwag (acc_norm),
+  ARC-Easy, and our knowledge few-shot. One JSON per model in runs/bench, one table.
+  30-item smoke test on CPU: GPT-2 bpb 1.011, Gemma 3 270M 0.947. Full runs queued after distill-1.
+- Tests: 302 -> 309 CPU.
+
+**2026-10-28: the combined run, distill-1 and the first benchmark table.**
+- mix-150m + 1M-row memory (layer 1) + 1 MTP head, 4,000 steps: val bpb 1.0190 vs mix-150m's 1.0294
+  at the same step (-0.010; the gap was -0.009 / -0.010 / -0.010 at steps 2000 / 2500 / 3000, so it
+  holds at this size, smaller than the -0.018 at 22M). 27.6k tok/s, 10.7 GB.
+- distill-1 (mix-20m-sized students on the teacher's 248k-vocab tokenizer: 105M params, 95M of
+  them embedding), 2,500 steps each:
+
+  | variant | val bpb | Δ | train tok/s | min |
+  |---|---|---|---|---|
+  | baseline | 1.2513 | | 38,871 | 88 |
+  | distill (half the micro-batches teacher windows) | 1.2411 | -0.010 | 8,645 | 313 |
+  | distill-all | 1.2386 | -0.013 | 4,539 | 594 |
+
+  The teacher's top-20 probabilities help, and more of them help more. But training slows in
+  proportion to the share of teacher batches (half -> 4.5x slower, all -> 8.6x), so the cost is on
+  the teacher path (reading the stored top-20 or the matching loss), not the model: fix that next.
+  The few-shot knowledge numbers didn't move beyond their noise.
+- Surprise: the experiment's measuring step ran out of memory after the baseline trained. The
+  fp32 copy of a batch of 8 x 1024 x 248k logits in `evaluate` is 8 GB. It now takes the cross-entropy
+  one window at a time, and `measure` frees what training left behind first.
+- Benchmarks (`sleuth bench`, full HellaSwag val and ARC-Easy test, on the GPU; each finishes in
+  seconds to ~3 minutes). GPT-2's 31.4% / 44.0% and Pythia's 30.3% HellaSwag match published figures,
+  which checks the scoring. Ours are mix-3b-trained; mem-mtp is only 4,000 of 23,000 steps.
+
+  | model | params | train tokens | bpb | HellaSwag acc_norm | ARC-Easy |
+  |---|---|---|---|---|---|
+  | mix-20m | 22M | | 1.229 | 27.4% | 39.6% |
+  | mix-60m | 64M | | 1.122 | 27.7% | 41.3% |
+  | mix-100m | 101M | | 1.062 | 28.8% | 44.8% |
+  | mix-150m | 155M | 3B | 0.999 | 31.6% | 50.0% |
+  | mix-150m-mem-mtp (step 4000) | 155M + table | 0.5B | 1.122 | 28.3% | 43.1% |
+  | Pythia-160M | 162M | 300B | 1.167 | 30.3% | 38.3% |
+  | GPT-2 | 124M | ~10B | 1.011 | 31.4% | 44.0% |
+  | Gemma 3 270M | 268M | 6T | 1.003 | 41.4% | 58.7% |
+  | SmolLM2-135M | 135M | 2T | 0.874 | 43.6% | 64.3% |
+  | Qwen3-0.6B | 596M | 36T | 0.963 | 47.0% | 59.6% |
+
+  mix-150m beats Pythia-160M everywhere and GPT-2 on bpb and ARC-Easy (HellaSwag a tie), on 3B
+  tokens. The models it doesn't beat saw 700-10,000x more tokens; at the same size, SmolLM2 is the
+  bar (+12 HellaSwag, +14 ARC). bench bpb runs ~0.11 above the training val bpb for both mix-150m
+  runs (different documents), so the two agree. bench counts the memory table as non-embedding
+  parameters (297M), which overstates the model.

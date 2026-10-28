@@ -70,6 +70,7 @@ class Block(nn.Module):
         self.tap_resid_mid = Tap()
         self.tap_mlp_out = Tap()
         self.tap_resid_post = Tap()
+        self.parallel = cfg.parallel_residual
 
     def forward(self, x, cos, sin, cache=None, same_doc=None):
         # attn_out / mlp_out tap exactly what gets added to the stream (after
@@ -77,6 +78,12 @@ class Block(nn.Module):
         a = self.attn(self.norm1(x), cos, sin, cache, same_doc)
         if self.post_attn_norm is not None:
             a = self.post_attn_norm(a)
+        if self.parallel:
+            # GPT-NeoX: the MLP reads the block's input, not the stream after attention.
+            # resid_mid then is only a view (input + attention), nothing reads it.
+            m = self.mlp(self.norm2(x))
+            x = self.tap_resid_mid(x + self.tap_attn_out(a))
+            return self.tap_resid_post(x + self.tap_mlp_out(m))
         x = self.tap_resid_mid(x + self.tap_attn_out(a))
         m = self.mlp(self.norm2(x))
         if self.moe is not None:
@@ -106,6 +113,8 @@ class Transformer(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.padded_vocab, cfg.d_model)
+        # GPT-2: a learned vector per position, added to the token embedding (no RoPE).
+        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model) if cfg.pos_type == "learned" else None
         self.tap_embed = Tap()
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.n_layers))
         self.norm_f = make_norm(cfg.norm_type, cfg.d_model, cfg.norm_eps)
@@ -147,8 +156,8 @@ class Transformer(nn.Module):
             if spec.kind in out:
                 continue
             if cfg.pos_type == "rope":
-                out[spec.kind] = rope_tables(spec.head_dim, cfg.max_seq_len, spec.rope_theta,
-                                             self.rope_freq_factors.get(spec.kind))
+                out[spec.kind] = rope_tables(min(cfg.rope_dim or spec.head_dim, spec.head_dim), cfg.max_seq_len,
+                                             spec.rope_theta, self.rope_freq_factors.get(spec.kind))
             else:
                 z = torch.zeros(cfg.max_seq_len, spec.head_dim)
                 out[spec.kind] = (z, z)
@@ -274,10 +283,11 @@ class Transformer(nn.Module):
             rope = {kind: (getattr(self, f"rope_cos_{kind}").index_select(0, pos),
                            getattr(self, f"rope_sin_{kind}").index_select(0, pos)) for kind in self._rope_kinds()}
         else:
+            pos = None
             rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
                            getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
 
-        x = self.tap_embed(self.embed(idx))
+        x = self.tap_embed(self._add_positions(self.embed(idx), offset, pos))
         mem = self.memory.lookup(idx, cache, doc_ids) if self.memory is not None else None
         early = None
         for i, block in enumerate(self.blocks):
@@ -313,16 +323,17 @@ class Transformer(nn.Module):
         if not self.cfg.exit_layer:
             raise ValueError("this model has no early exit (model.exit_layer = 0)")
         T = idx.shape[1]
+        offset = cache.pos
         if getattr(cache, "static", False):
             cache.new_step(positions)
             pos = cache.positions
             rope = {kind: (getattr(self, f"rope_cos_{kind}").index_select(0, pos),
                            getattr(self, f"rope_sin_{kind}").index_select(0, pos)) for kind in self._rope_kinds()}
         else:
-            offset = cache.pos
+            pos = None
             rope = {kind: (getattr(self, f"rope_cos_{kind}")[offset: offset + T],
                            getattr(self, f"rope_sin_{kind}")[offset: offset + T]) for kind in self._rope_kinds()}
-        x = self.embed(idx)
+        x = self._add_positions(self.embed(idx), offset, pos)
         mem = self.memory.lookup(idx, cache) if self.memory is not None else None
         for i, block in enumerate(self.blocks[:self.cfg.exit_layer]):
             if mem is not None and i in self.cfg.mem_layers:
@@ -335,6 +346,15 @@ class Transformer(nn.Module):
         """Token ids -> input vectors (the embedding, times embed_scale)."""
         x = self.tok_emb(idx)
         return x * self.cfg.embed_scale if self.cfg.embed_scale != 1.0 else x
+
+    def _add_positions(self, x: torch.Tensor, offset: int, pos: torch.Tensor | None) -> torch.Tensor:
+        """+ the learned position embedding (pos_type "learned"), at `pos` (a GPU tensor,
+        CUDA-graph decoding) or at offset, offset+1, ..."""
+        if self.pos_emb is None:
+            return x
+        if pos is None:
+            pos = torch.arange(offset, offset + x.shape[1], device=x.device)
+        return x + self.pos_emb(pos).to(x.dtype)
 
     def _rope_kinds(self) -> list[str]:
         return sorted({b.kind for b in self.blocks})
@@ -357,4 +377,6 @@ class Transformer(nn.Module):
         n += sum({id(m.raw): m.n_weights for m in quantized_modules(self)}.values())
         if exclude_embedding:
             n -= self.tok_emb.n_weights if isinstance(self.tok_emb, QuantEmbedding) else self.tok_emb.weight.numel()
+            if self.pos_emb is not None:
+                n -= self.pos_emb.weight.numel()
         return n

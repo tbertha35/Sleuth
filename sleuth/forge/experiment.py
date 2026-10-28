@@ -135,6 +135,9 @@ def measure(run_dir: Path, exp: Experiment, log: Callable[[str], None] = print) 
 
     cfg = json.loads((run_dir / "config.json").read_text())
     device = resolve_device("auto")
+    gc.collect()                       # free what training left behind before loading the model again
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     model, meta = load_model(run_dir, device=device, nearest=True)
     tok = Tokenizer.load(run_dir / "tokenizer.json")
     out: dict = {"run": run_dir.name, "step": int(meta["step"]), "params": model.num_params()}

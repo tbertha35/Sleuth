@@ -31,12 +31,13 @@ class ModelConfig:
     head_size: int = 0            # per-head width; 0 = d_model / n_heads (some models, e.g. Qwen3, use more)
     n_kv_heads: int = 0           # 0 = n_heads (plain multi-head). Fewer = GQA: heads share K/V,
                                   #   which shrinks the KV cache (faster decoding) at little quality cost.
-    ffn_type: str = "swiglu"      # "swiglu" | "geglu" (gated, GELU-tanh: Gemma) | "gelu"
+    ffn_type: str = "swiglu"      # "swiglu" | "geglu" (gated, GELU-tanh: Gemma) | "gelu" | "gelu_tanh" (GPT-2)
     ffn_hidden: int = 0           # 0 = auto: 8/3·d for SwiGLU (keeps params ≈ a 4·d GELU MLP), 4·d for GELU
     norm_type: str = "rmsnorm"    # "rmsnorm" | "layernorm"
     norm_eps: float = 1e-5
-    pos_type: str = "rope"        # "rope" | "none"
+    pos_type: str = "rope"        # "rope" | "none" | "learned" (a position embedding added to the input: GPT-2)
     rope_theta: float = 10000.0   # RoPE base; larger = slower rotation = better for long contexts
+    rope_dim: int = 0             # channels per head that RoPE rotates; 0 = all (Pythia rotates 25%)
     max_seq_len: int = 1024
     qk_norm: bool = False         # normalize q and k per head: stabilizes training, esp. low precision
     tie_embeddings: bool = True   # share input embedding and output projection (saves vocab·d params)
@@ -60,6 +61,7 @@ class ModelConfig:
     swa_kv_heads: int = 0
     swa_rope_theta: float = 0.0
     full_v_from_k: bool = False   # full layers have no v_proj: values are the (unnormalized) keys (Gemma 4)
+    parallel_residual: bool = False  # x + Attn(Norm1(x)) + MLP(Norm2(x)): both read the block's input (GPT-NeoX/Pythia)
     # Mixture of experts, Gemma 4 26B-A4B style (see moe.py and Block): every layer keeps its
     # dense MLP and adds routed experts next to it. 0 experts = dense.
     n_experts: int = 0
@@ -124,11 +126,13 @@ class ModelConfig:
                 raise ValueError(f"n_heads ({self.n_heads}) must be a multiple of the KV heads ({spec.kv_heads})")
             if spec.head_dim % 2 and self.pos_type == "rope":
                 raise ValueError("RoPE needs an even head_dim")
+            if self.rope_dim and (self.rope_dim % 2 or self.rope_dim > spec.head_dim):
+                raise ValueError(f"rope_dim ({self.rope_dim}) must be even and at most the head size")
         if self.n_experts and not (0 < self.n_experts_used <= self.n_experts and self.expert_hidden > 0):
             raise ValueError("MoE needs 0 < n_experts_used <= n_experts and expert_hidden > 0")
-        for name, val, ok in (("ffn_type", self.ffn_type, ("swiglu", "geglu", "gelu")),
+        for name, val, ok in (("ffn_type", self.ffn_type, ("swiglu", "geglu", "gelu", "gelu_tanh")),
                               ("norm_type", self.norm_type, ("rmsnorm", "layernorm")),
-                              ("pos_type", self.pos_type, ("rope", "none"))):
+                              ("pos_type", self.pos_type, ("rope", "none", "learned"))):
             if val not in ok:
                 raise ValueError(f"{name} must be one of {ok}, got {val!r}")
 
@@ -165,7 +169,8 @@ class ModelConfig:
                 and not self.bias and self.embed_scale == 1.0 and not self.post_norms and not self.v_norm
                 and not self.attn_scale and not self.final_softcap and not self.layer_scale
                 and "sliding" not in self.layer_types and not self.full_v_from_k and not self.n_experts
-                and not self.mem_rows)   # shared layers export fine (as copies); the memory doesn't
+                and not self.mem_rows    # shared layers export fine (as copies); the memory doesn't
+                and not self.rope_dim and not self.parallel_residual)
 
     @property
     def padded_vocab(self) -> int:

@@ -2,8 +2,9 @@
 *.safetensors) into our own Transformer, with no `transformers` library.
 
 Supported architectures ("model_type" in config.json): llama, mistral, qwen2,
-qwen3. All of them are pre-norm decoders with RoPE + RMSNorm + SwiGLU + GQA,
-which is exactly what forge/model implements, so loading them is mostly
+qwen3, and (for benchmarking against, see FAMILIES below) gpt2, gpt_neox and
+gemma3_text. The first four are pre-norm decoders with RoPE + RMSNorm + SwiGLU
++ GQA, which is exactly what forge/model implements, so loading them is mostly
 *renaming tensors*:
 
     model.embed_tokens.weight                     -> tok_emb.weight
@@ -144,29 +145,153 @@ def our_name(hf_name: str) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Older / other families, for benchmarking against (sleuth bench). Their layouts
+# differ from Llama's in more than names, so each gets a converter that yields
+# (our name, tensor) pairs.
+#
+#   gpt2         learned positions, LayerNorm, GELU-tanh MLP, biases everywhere; its
+#                "Conv1D" layers store weights transposed ([in, out]); q/k/v in one c_attn
+#   gpt_neox     (Pythia) parallel attention + MLP, RoPE on the first 25% of each head,
+#                LayerNorm, exact GELU; query_key_value is laid out per head [H, 3, hd]
+#   gemma3_text  Gemma's sandwich norms, q/k norms, GeGLU, embedding x sqrt(d), sliding
+#                layers (local RoPE base) between full ones; norms store w with y = x·(1+w)
+# --------------------------------------------------------------------------- #
+
+FAMILIES = {"gpt2", "gpt_neox", "gemma3_text"}
+
+
+def family_config(hf: dict, max_seq_len: int = 4096) -> ModelConfig:
+    mt = hf["model_type"]
+    if mt == "gpt2":
+        d = hf["n_embd"]
+        if hf.get("activation_function", "gelu_new") != "gelu_new":
+            raise NotImplementedError(f"GPT-2 activation {hf['activation_function']!r}")
+        return ModelConfig(vocab_size=hf["vocab_size"], d_model=d, n_layers=hf["n_layer"], n_heads=hf["n_head"],
+                           ffn_type="gelu_tanh", ffn_hidden=hf.get("n_inner") or 4 * d, norm_type="layernorm",
+                           norm_eps=hf.get("layer_norm_epsilon", 1e-5), pos_type="learned",
+                           max_seq_len=min(max_seq_len, hf["n_positions"]), tie_embeddings=True, bias=True,
+                           pad_vocab_to=1)
+    if mt == "gpt_neox":
+        d, H = hf["hidden_size"], hf["num_attention_heads"]
+        if not hf.get("use_parallel_residual", True) or hf.get("hidden_act", "gelu") != "gelu":
+            raise NotImplementedError("GPT-NeoX without parallel residual / exact GELU")
+        return ModelConfig(vocab_size=hf["vocab_size"], d_model=d, n_layers=hf["num_hidden_layers"], n_heads=H,
+                           ffn_type="gelu", ffn_hidden=hf["intermediate_size"], norm_type="layernorm",
+                           norm_eps=hf.get("layer_norm_eps", 1e-5), pos_type="rope",
+                           rope_theta=float(hf.get("rotary_emb_base", 10000)),
+                           rope_dim=int(d // H * hf.get("rotary_pct", 1.0)),
+                           max_seq_len=min(max_seq_len, hf["max_position_embeddings"]),
+                           tie_embeddings=bool(hf.get("tie_word_embeddings", False)), bias=True,
+                           parallel_residual=True, pad_vocab_to=1)
+    if mt == "gemma3_text":
+        d, H, L = hf["hidden_size"], hf["num_attention_heads"], hf["num_hidden_layers"]
+        hd = hf["head_dim"]
+        if hf.get("rope_scaling") or hf.get("final_logit_softcapping") or hf.get("attn_logit_softcapping"):
+            raise NotImplementedError("Gemma 3 with rope_scaling or soft-capping (the larger sizes)")
+        types = hf.get("layer_types") or ["full_attention" if (i + 1) % hf["_sliding_window_pattern"] == 0
+                                          else "sliding_attention" for i in range(L)]
+        scalar = hf.get("query_pre_attn_scalar", hd)
+        return ModelConfig(vocab_size=hf["vocab_size"], d_model=d, n_layers=L, n_heads=H,
+                           n_kv_heads=hf["num_key_value_heads"], head_size=hd if hd * H != d else 0,
+                           ffn_type="geglu", ffn_hidden=hf["intermediate_size"], norm_eps=hf.get("rms_norm_eps", 1e-6),
+                           rope_theta=float(hf.get("rope_theta", 1e6)),
+                           swa_rope_theta=float(hf.get("rope_local_base_freq", 1e4)),
+                           max_seq_len=min(max_seq_len, hf["max_position_embeddings"]), qk_norm=True,
+                           tie_embeddings=True, embed_scale=d ** 0.5, post_norms=True,
+                           attn_scale=0.0 if scalar == hd else scalar ** -0.5,
+                           layer_types=["sliding" if t == "sliding_attention" else "full" for t in types],
+                           sliding_window=hf["sliding_window"], pad_vocab_to=1)
+    raise NotImplementedError(mt)
+
+
+def family_tensors(hf: dict, ckpt: Checkpoint, cfg: ModelConfig):
+    """(our name, tensor) for every weight; checkpoint keys not used are skipped."""
+    mt = hf["model_type"]
+    if mt == "gpt2":
+        pre = "transformer." if "transformer.wte.weight" in ckpt else ""
+        yield "tok_emb.weight", ckpt.get(pre + "wte.weight")
+        yield "pos_emb.weight", ckpt.get(pre + "wpe.weight")[:cfg.max_seq_len]
+        yield "norm_f.weight", ckpt.get(pre + "ln_f.weight")
+        yield "norm_f.bias", ckpt.get(pre + "ln_f.bias")
+        for i in range(cfg.n_layers):
+            h, b = f"{pre}h.{i}.", f"blocks.{i}."
+            for ln, ours in (("ln_1", "norm1"), ("ln_2", "norm2")):
+                yield b + ours + ".weight", ckpt.get(h + ln + ".weight")
+                yield b + ours + ".bias", ckpt.get(h + ln + ".bias")
+            w, bias = ckpt.get(h + "attn.c_attn.weight").t(), ckpt.get(h + "attn.c_attn.bias")
+            for part, wq, bq in zip("qkv", w.chunk(3, 0), bias.chunk(3, 0)):
+                yield b + f"attn.{part}_proj.weight", wq
+                yield b + f"attn.{part}_proj.bias", bq
+            for hfn, ours in (("attn.c_proj", "attn.o_proj"), ("mlp.c_fc", "mlp.up"), ("mlp.c_proj", "mlp.down")):
+                yield b + ours + ".weight", ckpt.get(h + hfn + ".weight").t()
+                yield b + ours + ".bias", ckpt.get(h + hfn + ".bias")
+    elif mt == "gpt_neox":
+        yield "tok_emb.weight", ckpt.get("gpt_neox.embed_in.weight")
+        if not cfg.tie_embeddings:
+            yield "lm_head.weight", ckpt.get("embed_out.weight")
+        yield "norm_f.weight", ckpt.get("gpt_neox.final_layer_norm.weight")
+        yield "norm_f.bias", ckpt.get("gpt_neox.final_layer_norm.bias")
+        H, hd, d = cfg.n_heads, cfg.head_dim, cfg.d_model
+        for i in range(cfg.n_layers):
+            h, b = f"gpt_neox.layers.{i}.", f"blocks.{i}."
+            for ln, ours in (("input_layernorm", "norm1"), ("post_attention_layernorm", "norm2")):
+                yield b + ours + ".weight", ckpt.get(h + ln + ".weight")
+                yield b + ours + ".bias", ckpt.get(h + ln + ".bias")
+            w = ckpt.get(h + "attention.query_key_value.weight").view(H, 3, hd, d)
+            bias = ckpt.get(h + "attention.query_key_value.bias").view(H, 3, hd)
+            for j, part in enumerate("qkv"):
+                yield b + f"attn.{part}_proj.weight", w[:, j].reshape(H * hd, d)
+                yield b + f"attn.{part}_proj.bias", bias[:, j].reshape(H * hd)
+            for hfn, ours in (("attention.dense", "attn.o_proj"), ("mlp.dense_h_to_4h", "mlp.up"),
+                              ("mlp.dense_4h_to_h", "mlp.down")):
+                yield b + ours + ".weight", ckpt.get(h + hfn + ".weight")
+                yield b + ours + ".bias", ckpt.get(h + hfn + ".bias")
+    elif mt == "gemma3_text":
+        def norm(k):   # Gemma's RMSNorm multiplies by (1 + w): ours multiplies by its weight
+            return ckpt.get(k).float() + 1.0
+
+        yield "tok_emb.weight", ckpt.get("model.embed_tokens.weight")
+        yield "norm_f.weight", norm("model.norm.weight")
+        for i in range(cfg.n_layers):
+            h, b = f"model.layers.{i}.", f"blocks.{i}."
+            for hfn, ours in (("input_layernorm", "norm1"), ("post_attention_layernorm", "post_attn_norm"),
+                              ("pre_feedforward_layernorm", "norm2"), ("post_feedforward_layernorm", "post_mlp_norm"),
+                              ("self_attn.q_norm", "attn.q_norm"), ("self_attn.k_norm", "attn.k_norm")):
+                yield b + ours + ".weight", norm(h + hfn + ".weight")
+            for p in "qkvo":
+                yield b + f"attn.{p}_proj.weight", ckpt.get(h + f"self_attn.{p}_proj.weight")
+            for p in ("gate", "up", "down"):
+                yield b + f"mlp.{p}.weight", ckpt.get(h + f"mlp.{p}_proj.weight")
+
+
 def load_hf_model(path: str | Path, device: str | torch.device = "cpu", dtype: torch.dtype = torch.bfloat16,
                   max_seq_len: int = 4096) -> tuple[Transformer, dict]:
     d = Path(path)
     hf = json.loads((d / "config.json").read_text())
     ckpt = Checkpoint(d)
     try:
-        cfg = model_config(hf, ckpt, max_seq_len)
+        family = hf.get("model_type") in FAMILIES
+        cfg = family_config(hf, max_seq_len) if family else model_config(hf, ckpt, max_seq_len)
         model = Transformer.empty(cfg, device=device, dtype=dtype)
         params = dict(model.named_parameters())  # tied weights appear once (as tok_emb.weight)
         loaded: set[str] = set()
         unused: list[str] = []
-        for k in ckpt.keys():
-            name = our_name(k)
-            if name is None or (name == "lm_head.weight" and cfg.tie_embeddings):
-                if not _IGNORED.search(k):
-                    unused.append(k)
+        if family:   # the converter picks the tensors itself: (our name, tensor)
+            pairs = ((name, name, t) for name, t in family_tensors(hf, ckpt, cfg))
+        else:        # Llama-style: one checkpoint tensor per parameter, renamed
+            pairs = ((k, our_name(k), None) for k in ckpt.keys())
+        for label, name, t in pairs:
+            if name is None or (name == "lm_head.weight" and cfg.tie_embeddings and not family):
+                if not _IGNORED.search(label):
+                    unused.append(label)
                 continue
             if name not in params:
-                raise KeyError(f"{k} -> {name}: no such parameter in the model we built")
-            t = ckpt.get(k)
+                raise KeyError(f"{label} -> {name}: no such parameter in the model we built")
+            t = ckpt.get(label) if t is None else t
             p = params[name]
             if tuple(t.shape) != tuple(p.shape):
-                raise ValueError(f"{k}: checkpoint shape {tuple(t.shape)} != model shape {tuple(p.shape)}")
+                raise ValueError(f"{label}: checkpoint shape {tuple(t.shape)} != model shape {tuple(p.shape)}")
             with torch.no_grad():
                 p.copy_(t.to(dtype))
             loaded.add(name)

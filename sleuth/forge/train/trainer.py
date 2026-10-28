@@ -86,7 +86,10 @@ def evaluate(model, ds: ShardDataset, batch_size: int, seq_len: int, n_windows: 
         doc = document_ids(x, bos_id) if bos_id is not None else None
         with autocast():
             logits = model(x, doc_ids=doc).logits
-        loss = torch.nn.functional.cross_entropy(logits.float().transpose(1, 2), y, reduction="none")  # [B, T]
+        # one window at a time: an fp32 copy of the whole batch's logits is 8 GB with a 248k vocab
+        loss = torch.stack([torch.nn.functional.cross_entropy(logits[i].float(), y[i], reduction="none")
+                            for i in range(y.shape[0])])                                           # [B, T]
+        del logits
         per_window = loss.sum(1).tolist()
         loss_sum += sum(per_window)
         n_tok += y.numel()
